@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next"
 import { Link } from "react-router-dom"
 
 import ConfirmDialog from "@/components/ConfirmDialog"
+import RecordingPlayer from "@/components/RecordingPlayer"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import api, {
@@ -171,6 +172,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // другой администратор в этот момент разбирает инцидент, и его работа прекращается
   // без предупреждения. Свой сеанс оператор обрывает себе же и тут же начинает заново.
   const [confirmStop, setConfirmStop] = useState<ScreenSession | null>(null)
+  const [watchRec, setWatchRec] = useState<string | null>(null)
   const [confirmDelRec, setConfirmDelRec] = useState<ScreenSession | null>(null)
 
   // Запрошено ли управление ДО начала сеанса. Отдельный флаг от `live.control`: первый —
@@ -992,10 +994,15 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                       </span>
                     )}
                     {affordance === "download" ? (
-                      <Button size="sm" variant="outline" onClick={() => void download(s.id)}>
-                        {t("screenSession.recording")}
-                        {s.recording_bytes ? ` · ${formatBytes(s.recording_bytes)}` : ""}
-                      </Button>
+                      <>
+                        <Button size="sm" variant="outline" onClick={() => setWatchRec(s.id)}>
+                          {t("screenSession.recordingWatch")}
+                        </Button>
+                        <Button size="sm" variant="outline" onClick={() => void download(s.id)}>
+                          {t("screenSession.recording")}
+                          {s.recording_bytes ? ` · ${formatBytes(s.recording_bytes)}` : ""}
+                        </Button>
+                      </>
                     ) : (
                       // Запись есть, права на неё нет. Показываем ФАКТ записи, но не
                       // предлагаем действие: сама строка журнала — тоже сведение, и
@@ -1059,6 +1066,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           setConfirmStop(null)
         }}
       />
+      {watchRec && <RecordingPlayer sessionId={watchRec} onClose={() => setWatchRec(null)} />}
       <ConfirmDialog
         open={confirmDelRec !== null}
         onOpenChange={(open) => !open && setConfirmDelRec(null)}
