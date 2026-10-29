@@ -6,12 +6,22 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+
+	pb "github.com/Floodww/RoutineOps/proto"
 )
+
+// primaryDisplay — идентификатор основного экрана. Пустой список displays в приглашении
+// означает «только основной», а не «все» (см. ScreenSessionCommand.displays в proto).
+// В M1 экран один, поэтому основной — 0.
+const primaryDisplay int32 = 0
 
 // loopDown читает SessionDown с сервера и переводит команды захватчику (ключевой кадр,
 // стоп). Область сеанса сервер может только СУЗИТЬ: проверяет агент сам, по приглашению,
 // и попытка расширения игнорируется как событие безопасности, а не применяется.
 func loopDown(ctx context.Context, s *session, st *sessionStream, ctl *ctlWriter, log *slog.Logger) {
+	// SessionInput в M1 не бывает вовсе (сеанс только на просмотр). Ввод идёт десятками
+	// событий в секунду, поэтому предупреждение — один раз на сеанс, а не на событие.
+	inputWarned := false
 	for {
 		m, err := st.Recv()
 		if err != nil {
@@ -25,21 +35,106 @@ func loopDown(ctx context.Context, s *session, st *sessionStream, ctl *ctlWriter
 		if ctx.Err() != nil {
 			return
 		}
+		if m.GetInput() != nil {
+			if !inputWarned {
+				inputWarned = true
+				log.Warn("screen: SessionInput ignored, view-only session", "session_id", s.id)
+			}
+			continue
+		}
 		c := m.GetControl()
-		switch {
-		case c.GetStop():
-			// stop важнее request_keyframe в том же сообщении: кадр останавливаемому сеансу не нужен.
+		handled := false
+		if c.GetStop() {
+			// stop важнее narrow и request_keyframe в том же сообщении: останавливаемому
+			// сеансу кадр и сужение области не нужны.
 			s.end(stopReason(c.GetStopReason()))
 			return
-		case c.GetRequestKeyframe():
+		}
+		if n := c.GetNarrow(); n != nil {
+			handled = true
+			if !handleNarrow(s, n, log) {
+				return
+			}
+		}
+		if c.GetRequestKeyframe() {
+			handled = true
 			if err := ctl.send(msgKeyframe, nil); err != nil {
 				// Канал к захватчику умер — это заметит readPipe по EOF и закроет сеанс.
 				log.Warn("screen: keyframe request not delivered to worker", "session_id", s.id, "err", err)
 			}
-		default:
+		}
+		if !handled {
 			log.Debug("screen: server message ignored", "type", fmt.Sprintf("%T", m.GetMsg()), "session_id", s.id)
 		}
 	}
+}
+
+// narrowVerdict — вердикт по запросу SessionControl.narrow.
+type narrowVerdict int
+
+const (
+	narrowOK     narrowVerdict = iota // подмножество приглашения, остаётся хотя бы один экран
+	narrowEmpty                       // не оставляет ни одного экрана
+	narrowExpand                      // просит больше, чем дало приглашение
+)
+
+// invitedDisplays — экраны, разрешённые приглашением. Пустой список — только основной.
+func invitedDisplays(cmd *pb.ScreenSessionCommand) map[int32]bool {
+	set := make(map[int32]bool)
+	for _, d := range cmd.GetDisplays() {
+		set[d] = true
+	}
+	if len(set) == 0 {
+		set[primaryDisplay] = true
+	}
+	return set
+}
+
+// checkNarrow сверяет запрос сервера с приглашением. Чистая функция: решает только, что это
+// за запрос, и ничего не применяет.
+//
+// Расширение проверяется РАНЬШЕ пустоты: запрос, который и просит лишнего, и ничего не
+// оставляет, — попытка расширения, а не штатное закрытие сеанса.
+//
+// Пустой список displays в narrow читается как «не остаётся ни одного экрана» (а не как
+// «основной», как в приглашении): сужение до основного выражается явным списком [0].
+// Сервер сегодня narrow не шлёт; когда начнёт (возврат управления в Ф3), этот смысл надо
+// сверить с тем, что он кладёт в displays.
+func checkNarrow(cmd *pb.ScreenSessionCommand, req *pb.ScreenScope) narrowVerdict {
+	if req.GetAllowInput() && !cmd.GetAllowInput() {
+		return narrowExpand
+	}
+	invited := invitedDisplays(cmd)
+	for _, d := range req.GetDisplays() {
+		if !invited[d] {
+			return narrowExpand
+		}
+	}
+	if len(req.GetDisplays()) == 0 {
+		return narrowEmpty
+	}
+	return narrowOK
+}
+
+// handleNarrow применяет вердикт. Ложь — сеанс закрыт, цикл должен выйти.
+//
+// TODO: попытку расширения стоит отправлять событием безопасности (outbox.KindSecurity,
+// pb.SecurityEvent). Сюда оно пока не проведено: у loopDown нет доступа к очереди, а
+// пробрасывать её надо вместе с session_end.go, одним решением. До тех пор — только лог.
+func handleNarrow(s *session, req *pb.ScreenScope, log *slog.Logger) bool {
+	switch checkNarrow(s.cmd, req) {
+	case narrowExpand:
+		log.Warn("screen: expansion attempt rejected", "session_id", s.id,
+			"displays", req.GetDisplays(), "allow_input", req.GetAllowInput())
+		return true
+	case narrowEmpty:
+		s.end(ReasonOperatorRevoked, "narrow left no displays")
+		return false
+	}
+	// В M1 экран один, так что допустимое сужение ничего не меняет.
+	log.Debug("screen: narrow accepted", "session_id", s.id,
+		"displays", req.GetDisplays(), "allow_input", req.GetAllowInput())
+	return true
 }
 
 // maxStopDetail — потолок текста чужой причины в detail (в символах, не в байтах).
