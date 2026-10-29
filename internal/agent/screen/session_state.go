@@ -39,11 +39,17 @@ type session struct {
 	endReason EndReason
 	endDetail string    // техническая причина (текст ошибки), без повода/e-mail оператора и экрана
 	stats     wireStats // счётчики для SessionStats, приходят от захватчика
+
+	// ready закрывается, когда исход старта известен: захват пошёл (run зовёт signalReady)
+	// либо сеанс закрыт раньше (end). На нём ждёт StartSession, который обязан ответить
+	// приглашению кодом отказа синхронно.
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
 func newSession(parent context.Context, cmd *pb.ScreenSessionCommand) *session {
 	ctx, cancel := context.WithCancel(parent)
-	return &session{id: cmd.GetSessionId(), cmd: cmd, ctx: ctx, cancel: cancel}
+	return &session{id: cmd.GetSessionId(), cmd: cmd, ctx: ctx, cancel: cancel, ready: make(chan struct{})}
 }
 
 // activate — requested → active. Ложь, если сеанс уже не ждёт старта.
@@ -67,7 +73,18 @@ func (s *session) end(reason EndReason, detail string) (EndReason, bool) {
 	}
 	s.state, s.endReason, s.endDetail = StateEnded, reason, detail
 	s.cancel()
+	s.signalReady()
 	return reason, true
+}
+
+// signalReady — исход старта известен. Повторные вызовы безвредны.
+func (s *session) signalReady() { s.readyOnce.Do(func() { close(s.ready) }) }
+
+// reason — причина завершения (пусто, пока сеанс не закрыт).
+func (s *session) reason() EndReason {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endReason
 }
 
 // snapshot — фаза, счётчики и detail завершения (пусто, пока сеанс не закрыт).
