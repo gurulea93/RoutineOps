@@ -1,0 +1,4943 @@
+openapi: 3.0.3
+
+info:
+  title: RoutineOps Server API
+  version: 2.4.6
+  description: |
+    HTTP API сервера RoutineOps — точка интеграции для автоматизации и сторонних
+    интерфейсов. Веб-интерфейс из поставки использует этот же API, отдельного
+    приватного канала у него нет.
+
+    ## Аутентификация
+
+    Два равноправных способа, оба проверяются одним middleware:
+
+    * **Cookie `token`** — httpOnly-кука, выставляется `POST /api/v1/auth/login`.
+      Так работает веб-интерфейс.
+    * **`Authorization: Bearer <token>`** — сервисный API-токен для автоматизации.
+      Выпускается через `POST /api/v1/api-tokens`, показывается ОДИН раз в ответе.
+
+    ## Роли
+
+    * `viewer` — чтение.
+    * `it_admin` — чтение и изменение.
+
+    ## Операции «только человеком»
+
+    Часть операций помечена `x-requires-human: true`. Они доступны только под
+    учётной записью человека и отвечают `403` на сервисный токен, даже если у
+    токена роль `it_admin`. Правило распространяется на всё, что выпускает или
+    повышает права: приглашение пользователя, выпуск API-токена и токена
+    энроллмента, одобрение устройства и запроса локальных админ-прав, вывод
+    устройства из эксплуатации.
+
+    Смысл в том, что иначе модель отзыва была бы фикцией: утёкший токен выписал
+    бы себе новый, который пережил бы удаление исходного.
+
+    ## Ошибки
+
+    Тело ошибки — `text/plain` с короткой строкой, не JSON. Значим код ответа.
+
+  license:
+    name: Apache-2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://mdm.example.com
+    description: Ваш сервер RoutineOps
+
+tags:
+  - name: Аутентификация
+  - name: Устройства
+  - name: Энроллмент
+  - name: Задачи
+  - name: Блокировка
+  - name: Скрипты
+  - name: Скрипт-политики
+  - name: Софт-политики
+  - name: Группы устройств
+  - name: Алерты
+  - name: Локальные админ-права
+  - name: Пользователи
+  - name: API-токены
+  - name: Каталог
+  - name: Аудит
+  - name: Служебное
+
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+
+paths:
+  # ─────────────────────────── Аутентификация ───────────────────────────
+  /api/v1/auth/login:
+    post:
+      tags: [Аутентификация]
+      summary: Вход по email и паролю
+      description: |
+        Выставляет httpOnly-куку `token`. Ограничение: 10 запросов в минуту с одного IP.
+        Дополнительно действует счётчик неудачных попыток на учётную запись.
+
+        Пароль проверяется сначала локально. Если он не сошёлся, а каталог включён с
+        `login_enabled` (Enterprise), пара проверяется по LDAP/AD. Порядок именно такой:
+        локальный пароль обязан работать при отключённой в домене учётке и при
+        недоступном контроллере домена, иначе падение AD запирало бы панель целиком.
+        По этой же причине доступ отзывается удалением пользователя, а не отключением
+        учётки в домене. Каталог только подтверждает пароль: учётных записей он не
+        создаёт и роль из групп AD не назначает — роль остаётся локальной. Использованный
+        способ пишется в аудит (`method`: `local` либо `ldap`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Вход выполнен, кука выставлена
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: '`token=<jwt>; HttpOnly; Secure; SameSite=Strict`'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Неверные учётные данные
+          content: { text/plain: { schema: { type: string } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Аутентификация]
+      summary: Выход
+      description: Гасит куку `token`.
+      security: []
+      responses:
+        '200': { description: Кука погашена }
+
+  /api/v1/auth/forgot-password:
+    post:
+      tags: [Аутентификация]
+      summary: Запрос ссылки на сброс пароля
+      description: |
+        Всегда отвечает `200` независимо от существования адреса — чтобы по ответу
+        нельзя было перебирать учётные записи. Ограничение: 5 запросов в минуту с IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200': { description: Запрос принят }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/reset-password:
+    post:
+      tags: [Аутентификация]
+      summary: Установка нового пароля по токену из письма
+      description: 'Ограничение: 10 запросов в минуту с IP.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200': { description: Пароль изменён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/auth/invite:
+    get:
+      tags: [Аутентификация]
+      summary: Проверка токена приглашения
+      security: []
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Приглашение действительно
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email: { type: string, format: email }
+                  role: { $ref: '#/components/schemas/Role' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/auth/accept-invite:
+    post:
+      tags: [Аутентификация]
+      summary: Создание учётной записи по приглашению
+      description: 'Ограничение: 10 запросов в минуту с IP.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, name, password]
+              properties:
+                token: { type: string }
+                name: { type: string }
+                password: { type: string, format: password }
+      responses:
+        '200': { description: Учётная запись создана }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/v1/me:
+    get:
+      tags: [Аутентификация]
+      summary: Текущая личность и роль
+      description: |
+        Источник роли для гейтинга интерфейса. Под сервисным токеном отдаёт личность
+        и роль САМОГО токена, а не создавшего его администратора.
+      responses:
+        '200':
+          description: Личность
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Identity' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/me/password:
+    post:
+      tags: [Аутентификация]
+      summary: Смена собственного пароля
+      description: Гасит все живые сессии владельца.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, format: password }
+                new_password: { type: string, format: password }
+      responses:
+        '200': { description: Пароль изменён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/profile/telegram:
+    get:
+      tags: [Аутентификация]
+      summary: Состояние привязки Telegram
+      description: |
+        Отдаёт непогашенный токен привязки ВЛАДЕЛЬЦА учётной записи, поэтому закрыт
+        для сервисных токенов: иначе держатель токена скормил бы его боту и начал
+        получать чужие алерты.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Состояние привязки
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  linked: { type: boolean }
+                  link_token: { type: string }
+                  bot_username: { type: string }
+                  min_severity:
+                    type: string
+                    enum: [critical, high, medium, low]
+                    description: Порог доставки уведомлений владельца учётной записи.
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/profile/notify-min-severity:
+    post:
+      tags: [Аутентификация]
+      summary: Порог доставки уведомлений
+      description: |
+        Меняет минимальную критичность алертов, о которых владелец учётной записи
+        получает уведомление в Telegram. Алерты ниже порога остаются в панели, но
+        не рассылаются.
+
+        Личная настройка, а не административная: решать за коллегу, каких алертов
+        ему не видеть, не должен никто. Отсюда же закрытость для сервисных токенов —
+        у токена нет личности, и он менял бы настройку создавшего его администратора.
+
+        Неизвестный уровень отклоняется с 400, а не подставляется значением по
+        умолчанию: молчаливая подстановка превратила бы опечатку в тихое отключение
+        части уведомлений, которое ничем себя не проявляет.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [min_severity]
+              properties:
+                min_severity:
+                  type: string
+                  enum: [critical, high, medium, low]
+      responses:
+        '200':
+          description: Порог сохранён
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  min_severity: { type: string }
+        '400': { description: Неизвестный уровень критичности }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/profile/telegram-link:
+    post:
+      tags: [Аутентификация]
+      summary: Выпуск токена привязки Telegram
+      description: 'Роль: `it_admin`. Привязка — личное действие человека.'
+      x-requires-human: true
+      responses:
+        '200':
+          description: Токен привязки
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  # ─────────────────────────── Устройства ───────────────────────────
+  /api/v1/devices:
+    get:
+      tags: [Устройства]
+      summary: Список устройств
+      description: |
+        Поля расширенного инвентаря (`arch`, `console_user`, `disk_encryption`,
+        `os_patch_date`, `boot_time`, `disk_free`, `domain_joined`, `tpm`,
+        `secure_boot`) в списке НЕ заполняются — они приходят в карточке устройства.
+
+        Выдача постраничная: тело — страница, общее число устройств под фильтром
+        отдаётся заголовком `X-Total-Count`. Устройства в статусе `pending` в
+        список не попадают.
+      parameters:
+        - name: q
+          in: query
+          description: |
+            Поиск по подстроке любого собираемого атрибута: имя, ОС, IP (внутренний
+            и внешний), MAC, серийник, CPU, диск, версия агента, CN сертификата, id.
+            MAC и серийник сравниваются и без разделителей. Длиннее 128 символов —
+            обрезается.
+          schema: { type: string, maxLength: 128 }
+        - name: group_id
+          in: query
+          description: Только члены этой группы. Не-UUID даёт пустую выдачу, а не ошибку.
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Устройства
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/TotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Устройства]
+      summary: Регистрация устройства и выпуск одноразового токена энроллмента
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hostname]
+              properties:
+                hostname: { type: string }
+                os: { $ref: '#/components/schemas/OS' }
+      responses:
+        '201':
+          description: Устройство создано в статусе `pending`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string, format: uuid }
+                  enrollment_token: { type: string }
+                  ca_sha256:
+                    type: string
+                    description: Отпечаток CA для пиннинга при энроллменте агента
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/devices/across-tenants:
+    get:
+      tags: [Устройства]
+      summary: Список устройств по всем тенантам
+      description: |
+        Роль: `provider_admin`. Только учётная запись человека (`x-requires-human`).
+        Перед выдачей пишет событие аудита `devices.list_across_tenants`. Параметры
+        поиска и пагинации те же, что у `GET /api/v1/devices`.
+      x-requires-human: true
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 128 }
+        - name: group_id
+          in: query
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Устройства
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/TotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Device' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/devices/{id}:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    get:
+      tags: [Устройства]
+      summary: Карточка устройства
+      responses:
+        '200':
+          description: Устройство
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Device' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Устройства]
+      summary: Удаление устройства из базы
+      description: |
+        Роль: `it_admin`. Удаляет запись и всё связанное каскадом и в той же
+        транзакции отзывает сертификат устройства (тумбстоун отпечатка): живой агент
+        удалённого устройства больше не «воскресит» его пустой записью при следующем
+        подключении. Ре-энролл по новому токену выпускает новый сертификат и проходит.
+        Агента на машине НЕ трогает — для этого есть вывод из эксплуатации; веб-интерфейс
+        предлагает удаление только для уже выведенных из эксплуатации устройств.
+      responses:
+        '204': { description: Удалено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices/{id}/owner:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    put:
+      tags: [Устройства]
+      summary: Привязка владельца устройства
+      description: |
+        Роль: `it_admin`. Владелец — КАРТОЧКА ЧЕЛОВЕКА (`Person`), а не аккаунт панели:
+        аккаунты нужны тем, кто в панель ходит (админы, поддержка), а сотруднику ради
+        закреплённого за ним ноутбука вход не нужен.
+
+        Карточка может быть заведена вручную (`POST /persons`, Free) или принесена
+        синком каталога (Enterprise) — для устройства это один и тот же владелец.
+        Пустой `person_id` снимает владельца.
+
+        Назначенный здесь владелец синком НЕ затирается: авто-матч каталога заполняет
+        только устройства без владельца.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [person_id]
+              properties:
+                person_id:
+                  type: string
+                  description: UUID карточки человека; пустая строка снимает владельца
+      responses:
+        '204': { description: Владелец обновлён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/persons:
+    post:
+      tags: [Устройства]
+      summary: Завести карточку человека (владельца)
+      description: |
+        Роль: `it_admin`. Заводит человека, за которым числятся устройства. Приглашение
+        НЕ отправляется и аккаунт не создаётся: вход в панель владельцу не нужен.
+
+        `display_name` обязателен — карточка без имени нечитаема в списке владельцев.
+        `email` необязателен (корпоративная почта есть не у всех), но если задан, то
+        разбирается как адрес.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name: { type: string, maxLength: 200 }
+                email: { type: string, maxLength: 320 }
+      responses:
+        '201':
+          description: Карточка заведена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Person' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/persons/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [Устройства]
+      summary: Правка карточки человека
+      description: |
+        Роль: `it_admin`. Только для карточек, заведённых вручную (`source: manual`).
+        Карточку из каталога правят в AD — 409: правка здесь пережила бы ровно до
+        следующего синка, и оператор решил бы, что панель его не слушает.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [display_name]
+              properties:
+                display_name: { type: string, maxLength: 200 }
+                email: { type: string, maxLength: 320 }
+      responses:
+        '204': { description: Обновлено }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Карточка из каталога — правится в AD }
+    delete:
+      tags: [Устройства]
+      summary: Удаление карточки человека
+      description: |
+        Роль: `it_admin`. Только для карточек `source: manual`. Устройства, где карточка
+        стояла владельцем, остаются без владельца — сами машины не затрагиваются.
+      responses:
+        '204': { description: Удалено }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Карточка из каталога — удаляется в AD }
+
+  /api/v1/devices/{id}/status:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    put:
+      tags: [Устройства]
+      summary: Смена статуса устройства
+      description: |
+        Роль: `it_admin`. Перевод в управляемый статус из очереди одобрения этой
+        ручкой невозможен — для этого есть одобрение.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/DeviceStatus' }
+      responses:
+        '200': { description: Статус изменён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/devices/{id}/decommission:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Вывод устройства из эксплуатации
+      description: |
+        Роль: `it_admin`. Необратимо. Агент снимает службу, разоружает защиту от
+        вмешательства, удаляет состояние, сертификат и собственный бинарь.
+        Статус переходит в терминальный `decommissioned` только после подтверждения
+        от агента, то есть операция требует его сотрудничества. Для враждебного или
+        украденного устройства используйте блокировку — она применяется на сервере
+        мгновенно.
+      x-requires-human: true
+      responses:
+        '202': { description: Команда поставлена в очередь агенту }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices/{id}/reboot:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Перезагрузка устройства
+      description: |
+        Роль: `it_admin`. Устройство должно быть `active` (иначе 409): остальные
+        состояния Connect не примет, и задача висела бы недоставленной.
+
+        Успешный ответ означает «перезагрузка ЗАПЛАНИРОВАНА»: агент отчитывается
+        сразу после того, как планировщик ОС принял команду, а не после того, как
+        машина поднялась. Отмены запланированной перезагрузки нет.
+
+        Повторный вызов при недоставленной заявке возвращает ТУ ЖЕ задачу. Новый
+        `task_id` для того же намерения означал бы вторую перезагрузку: агент
+        дедуплицирует durably по `task_id` и переживает перезагрузку, поэтому чужой
+        id для него — новая команда, и устройство уходит в цикл.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: На Windows показывается сотруднику в системном предупреждении; всегда попадает в аудит.
+                delay_seconds:
+                  type: integer
+                  description: >
+                    Отсрочка. `0` (или поле не задано) = ДЕФОЛТ АГЕНТА (60 с), а НЕ
+                    «сейчас»: нулевое значение никогда не должно быть самым
+                    деструктивным вариантом. Значение от 1 до 9 поднимается до 10 —
+                    меньшего агент не примет. На macOS и Linux отсрочка округляется
+                    вверх до целых минут (секундной гранулярности в планировщике нет).
+      responses:
+        '200':
+          description: Задача поставлена (или возвращена уже существующая)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string, format: uuid }
+                  delay_seconds: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Устройство не в состоянии `active` }
+
+  /api/v1/device-groups/{id}/reboot:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Группы устройств]
+      summary: Перезагрузка всех устройств группы
+      description: |
+        Роль: `it_admin`. Команда уходит только `active`-устройствам группы.
+        Потолок — 50 машин за раз (422 сверх него): одним кликом иначе можно уронить
+        парк в рабочее время. `expected_devices` — число машин, которое панель
+        показала оператору; расхождение с фактом даёт 409, потому что подтверждали
+        не тот масштаб.
+
+        `created` может быть меньше `in_scope`: устройствам с уже недоставленной
+        заявкой вторую не заводим.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason: { type: string }
+                delay_seconds: { type: integer, description: 'Как у одиночной перезагрузки; 0 = дефолт агента (60 с)' }
+                expected_devices: { type: integer, description: 'Подтверждённое оператором число active-машин группы' }
+      responses:
+        '201':
+          description: Веер поставлен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: integer }
+                  in_scope: { type: integer }
+                  delay_seconds: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Состав группы изменился с момента подтверждения }
+        '422': { description: В группе больше 50 active-устройств }
+
+  # ─────────────────────────── Энроллмент ───────────────────────────
+  /api/v1/enroll:
+    post:
+      tags: [Энроллмент]
+      summary: Энроллмент агента (вызывает агент, не оператор)
+      description: |
+        Агент присылает CSR и одноразовый либо массовый токен, получает подписанный
+        сертификат. Аутентификация — самим токеном, поэтому эндпоинт публичный.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enrollment_token, csr_pem]
+              properties:
+                enrollment_token: { type: string }
+                csr_pem: { type: string }
+                hostname: { type: string }
+                os: { $ref: '#/components/schemas/OS' }
+                arch: { type: string, example: amd64 }
+      responses:
+        '200':
+          description: Сертификат выдан
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  certificate_pem: { type: string }
+                  ca_pem: { type: string }
+                  device_id: { type: string, format: uuid }
+                  release_pubkey:
+                    type: string
+                    description: Публичный ключ проверки самообновления агента
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401':
+          description: Токен недействителен или уже использован
+          content: { text/plain: { schema: { type: string } } }
+
+  /api/v1/devices/{id}/enrollment-token:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    get:
+      tags: [Энроллмент]
+      summary: Действующий одноразовый токен устройства
+      description: 'Роль: `it_admin`.'
+      responses:
+        '200':
+          description: Токен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enrollment_token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices/{id}/reenroll:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Энроллмент]
+      summary: Повторный энроллмент — выпуск нового токена
+      description: |
+        Роль: `it_admin`. Отклонённое или заблокированное устройство повторным
+        энроллментом в управляемый статус не возвращается — требуется одобрение.
+      responses:
+        '200':
+          description: Новый токен выпущен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enrollment_token: { type: string }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Статус устройства запрещает повторный энроллмент
+          content: { text/plain: { schema: { type: string } } }
+
+  /api/v1/enrollment-tokens/bulk:
+    post:
+      tags: [Энроллмент]
+      summary: Выпуск массового токена энроллмента
+      description: |
+        Роль: `it_admin`. Один токен на партию машин — для развёртывания образом или
+        через систему раздачи ПО.
+      x-requires-human: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                group_id:
+                  type: string
+                  format: uuid
+                  description: Пусто — без группы
+                max_uses:
+                  type: integer
+                  nullable: true
+                  description: Не задано — без ограничения до истечения срока
+                require_approval:
+                  type: boolean
+                  nullable: true
+                  default: true
+                  description: Ставить ли энроллящиеся устройства в очередь одобрения
+                ttl_hours:
+                  type: integer
+                  description: 0 — значение по умолчанию
+      responses:
+        '201':
+          description: Токен выпущен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+    get:
+      tags: [Энроллмент]
+      summary: Список выпущенных массовых токенов
+      description: |
+        Роль: `it_admin`. Самого токена в ответе нет — в базе хранится только его
+        отпечаток. Отдаёт и истёкшие/отозванные: важно видеть, чем энроллили парк.
+      responses:
+        '200':
+          description: Токены, свежие сверху
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id: { type: string, format: uuid }
+                    group_id: { type: string }
+                    group_name: { type: string }
+                    max_uses: { type: integer, nullable: true }
+                    uses: { type: integer }
+                    require_approval: { type: boolean }
+                    expires_at: { type: string, format: date-time }
+                    created_at: { type: string, format: date-time }
+
+  /api/v1/enrollment-tokens/{id}:
+    delete:
+      tags: [Энроллмент]
+      summary: Отзыв токена энроллмента
+      description: |
+        Роль: `it_admin`. Гасит токен немедленно (срок сдвигается в прошлое) — новые
+        машины по нему не заведутся, уже заведённые остаются в парке. Защитное
+        действие, поэтому сервисному токену разрешено.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Отозван }
+        '400': { description: Некорректный идентификатор }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Токен не найден или уже недействителен }
+
+  /api/v1/devices/{id}/approve:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Энроллмент]
+      summary: Одобрение устройства из очереди
+      description: 'Роль: `it_admin`. Переводит `pending_approval` в управляемый статус.'
+      x-requires-human: true
+      responses:
+        '200': { description: Одобрено }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/devices/{id}/reject:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Энроллмент]
+      summary: Отклонение устройства из очереди
+      description: |
+        Роль: `it_admin`. Защитное действие, поэтому сервисному токену разрешено.
+      responses:
+        '200': { description: Отклонено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/enrollment-queue/approve:
+    post:
+      tags: [Энроллмент]
+      summary: Пакетное одобрение очереди
+      description: 'Роль: `it_admin`.'
+      x-requires-human: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                group_id:
+                  type: string
+                  description: Пусто — все устройства в статусе `pending_approval`
+      responses:
+        '200':
+          description: Результат пакета
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  approved: { type: integer }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/enrollment-queue/reject:
+    post:
+      tags: [Энроллмент]
+      summary: Пакетное отклонение очереди
+      description: 'Роль: `it_admin`. Защитное действие, сервисному токену разрешено.'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                group_id: { type: string }
+      responses:
+        '200':
+          description: Результат пакета
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rejected: { type: integer }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Задачи ───────────────────────────
+  /api/v1/devices/{id}/tasks:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    get:
+      tags: [Задачи]
+      summary: Задачи устройства
+      responses:
+        '200':
+          description: Задачи
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Task' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Задачи]
+      summary: Разовый запуск скрипта на устройстве
+      description: |
+        Роль: `it_admin`. Содержимое исполняется на устройстве с правами службы
+        агента (root или SYSTEM). Это самый мощный канал в системе — доступ к нему
+        равносилен удалённому исполнению кода на всём парке.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [script_content, platform]
+              properties:
+                script_content: { type: string }
+                platform: { $ref: '#/components/schemas/OS' }
+                priority: { $ref: '#/components/schemas/Priority' }
+      responses:
+        '201':
+          description: Задача создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Блокировка ───────────────────────────
+  /api/v1/devices/{id}/lock:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Блокировка]
+      summary: Блокировка устройства
+      description: |
+        Роль: `it_admin`. Сервер генерирует одноразовый пароль снятия, отдаёт его
+        оператору в открытом виде и передаёт агенту только хеш. Пароль показывается
+        один раз, восстановить его нельзя.
+
+        Режим `filevault` — возможность редакции Enterprise и требует настроенного
+        эскроу ключей восстановления; в свободной редакции запрос вернёт `409`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                  description: Текст, который увидит сотрудник на экране блокировки
+                mode: { $ref: '#/components/schemas/LockMode' }
+      responses:
+        '200':
+          description: Команда поставлена агенту
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string, format: uuid }
+                  password:
+                    type: string
+                    description: Пароль снятия. Показывается ОДИН раз.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Режим блокировки недоступен (возможность Enterprise либо эскроу выключен)
+          content: { text/plain: { schema: { type: string } } }
+
+  /api/v1/devices/{id}/unlock:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Блокировка]
+      summary: Снятие блокировки
+      description: 'Роль: `it_admin`.'
+      responses:
+        '200':
+          description: Команда поставлена агенту
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string, format: uuid }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Скрипты ───────────────────────────
+  /api/v1/scripts:
+    get:
+      tags: [Скрипты]
+      summary: Библиотека скриптов
+      responses:
+        '200':
+          description: Скрипты
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Script' }
+    post:
+      tags: [Скрипты]
+      summary: Создание скрипта
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScriptInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Script' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/scripts/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Скрипты]
+      summary: Скрипт
+      responses:
+        '200':
+          description: Скрипт
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Script' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Скрипты]
+      summary: Изменение скрипта
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScriptInput' }
+      responses:
+        '200': { description: Изменён }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Скрипты]
+      summary: Удаление скрипта
+      description: 'Роль: `it_admin`. Скрипт, на который ссылается скрипт-политика, не удаляется.'
+      responses:
+        '204': { description: Удалён }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Скрипт используется скрипт-политикой
+          content: { text/plain: { schema: { type: string } } }
+
+  # ─────────────────────────── Скрипт-политики ───────────────────────────
+  /api/v1/script-policies:
+    get:
+      tags: [Скрипт-политики]
+      summary: Скрипт-политики
+      description: |
+        Политика с пустым `group_names` не таргетит ни одно устройство и молча не
+        выполняется — при разборе «политика не отработала» смотрите сюда первым делом.
+      responses:
+        '200':
+          description: Политики
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScriptPolicy' }
+    post:
+      tags: [Скрипт-политики]
+      summary: Создание скрипт-политики
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, script_id, trigger_type]
+              properties:
+                name: { type: string }
+                script_id: { type: string, format: uuid }
+                trigger_type: { $ref: '#/components/schemas/TriggerType' }
+                schedule_config:
+                  type: object
+                  description: Для `schedule` — расписание запуска
+                event_trigger_config:
+                  type: object
+                  description: Для `event` — на какие события реагировать
+      responses:
+        '201':
+          description: Создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScriptPolicy' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/script-policies/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put:
+      tags: [Скрипт-политики]
+      summary: Обновление скрипт-политики
+      description: |
+        Роль: `it_admin`. Переписывает политику целиком, кроме `is_active` (для него
+        отдельная ручка `toggle`). Нужен идемпотентному `routineops apply`: без него
+        правка расписания шла бы через удаление и создание, то есть новый `id` —
+        назначения групп отвалились бы, а история результатов потерялась.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, script_id, trigger_type]
+              properties:
+                name: { type: string }
+                script_id: { type: string, format: uuid }
+                trigger_type: { $ref: '#/components/schemas/TriggerType' }
+                schedule_config: { type: object }
+                event_trigger_config: { type: object }
+      responses:
+        '200':
+          description: Обновлена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScriptPolicy' }
+        '400': { description: Некорректный триггер или cron-выражение }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Имя политики занято }
+    delete:
+      tags: [Скрипт-политики]
+      summary: Удаление скрипт-политики
+      description: 'Роль: `it_admin`.'
+      responses:
+        '204': { description: Удалена }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/script-policies/{id}/toggle:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    patch:
+      tags: [Скрипт-политики]
+      summary: Включение и выключение политики
+      description: 'Роль: `it_admin`.'
+      responses:
+        '200':
+          description: Новое состояние
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  is_active: { type: boolean }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/script-policies/compliance:
+    get:
+      tags: [Скрипт-политики]
+      summary: Сводка выполнения по всем скрипт-политикам
+      responses:
+        '200':
+          description: Сводка
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScriptPolicyCompliance' }
+
+  /api/v1/script-policies/{id}/results:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Скрипт-политики]
+      summary: Результаты запусков политики по устройствам
+      responses:
+        '200':
+          description: Результаты
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScriptResult' }
+
+  # ─────────────────────────── Софт-политики ───────────────────────────
+  /api/v1/policies:
+    get:
+      tags: [Софт-политики]
+      summary: Правила разрешённого и запрещённого ПО
+      responses:
+        '200':
+          description: Правила
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PolicyRule' }
+    post:
+      tags: [Софт-политики]
+      summary: Создание правила
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [software_name, rule_type]
+              properties:
+                software_name: { type: string }
+                rule_type: { $ref: '#/components/schemas/RuleType' }
+                device_id:
+                  type: string
+                  nullable: true
+                  description: Не задано — правило глобальное
+                platforms:
+                  type: array
+                  items: { $ref: '#/components/schemas/PolicyPlatform' }
+                  description: Пусто — все платформы
+      responses:
+        '201':
+          description: Создано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyRule' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/policies/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    delete:
+      tags: [Софт-политики]
+      summary: Удаление правила
+      description: 'Роль: `it_admin`.'
+      responses:
+        '204': { description: Удалено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/policies/compliance:
+    get:
+      tags: [Софт-политики]
+      summary: Сводка соответствия по всем правилам
+      responses:
+        '200':
+          description: Сводка
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SoftwarePolicyCompliance' }
+
+  /api/v1/policies/{id}/compliance:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Софт-политики]
+      summary: Разрез соответствия по устройствам
+      description: Несуществующий идентификатор даёт пустой список, а не ошибку.
+      responses:
+        '200':
+          description: Устройства в области действия правила
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SoftwarePolicyDeviceCompliance' }
+
+  # ─────────────────────────── Группы устройств ───────────────────────────
+  /api/v1/compliance/report:
+    get:
+      tags: [Соответствие]
+      summary: Отчёт соответствия парка
+      description: >-
+        Считается сервером из уязвимостей (включая те, что сопоставить не удалось),
+        давности последнего контакта, версии агента относительно канала устройства и
+        состояния его durable-очереди. Доступен всем ролям.
+      responses:
+        '200':
+          description: Отчёт
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComplianceReport' }
+
+  /api/v1/compliance/report.csv:
+    get:
+      tags: [Соответствие]
+      summary: Тот же отчёт файлом
+      description: >-
+        CSV с BOM — иначе Excel портит кириллицу. Язык заголовков, ответов «да/нет» и
+        формулировок причин берётся из `lang`, затем из `Accept-Language`, затем
+        русский. Разделитель меняется ВМЕСТЕ с языком (`;` для ru, `,` для en): Excel
+        берёт разделитель списка из системной локали, и одна зашитая запятая
+        складывает отчёт в одну колонку у половины операторов. PDF не генерируется
+        сервером: страницу отчёта печатает браузер.
+      parameters:
+        - name: lang
+          in: query
+          required: false
+          schema: { type: string, enum: [ru, en] }
+          description: >-
+            Язык выгрузки. Региональные варианты (`en-US`, `ru_RU`) приводятся к
+            базовому тегу. Неизвестное значение не ошибка — отчёт отдаётся на языке
+            по умолчанию.
+      responses:
+        '200':
+          description: Файл отчёта
+          content:
+            text/csv:
+              schema: { type: string }
+
+  /api/v1/update-rollout:
+    get:
+      tags: [Группы устройств]
+      summary: Картина выкатки обновлений по каналам
+      description: >-
+        По каждому каналу — сколько в нём групп и устройств, какую версию он отдаёт
+        и на каких версиях парк сидит по факту. Реестр публикаций общий на
+        инсталляцию. Чтение доступно всем ролям.
+      responses:
+        '200':
+          description: Срез выкатки
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channels:
+                    type: array
+                    items: { $ref: '#/components/schemas/ChannelRollout' }
+                  releases:
+                    type: array
+                    items: { $ref: '#/components/schemas/AgentReleaseRow' }
+
+  /api/v1/device-groups:
+    get:
+      tags: [Группы устройств]
+      summary: Группы устройств
+      responses:
+        '200':
+          description: Группы
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/DeviceGroup' }
+    post:
+      tags: [Группы устройств]
+      summary: Создание группы
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                color: { $ref: '#/components/schemas/Color' }
+                update_channel: { $ref: '#/components/schemas/UpdateChannel' }
+      responses:
+        '201':
+          description: Создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceGroup' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: Группа с таким именем уже существует
+          content: { text/plain: { schema: { type: string } } }
+
+  /api/v1/device-groups/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    patch:
+      tags: [Группы устройств]
+      summary: Переименование группы, смена цвета и канала обновлений
+      description: >-
+        Роль: `it_admin`. Пустое поле означает «не менять».
+        Перевод в канал `beta` делает группу канареечной: её устройства получают
+        новый релиз агента раньше остального парка.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                color: { $ref: '#/components/schemas/Color' }
+                update_channel: { $ref: '#/components/schemas/UpdateChannel' }
+      responses:
+        '200': { description: Изменена }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Группы устройств]
+      summary: Удаление группы
+      description: 'Роль: `it_admin`. Устройства не удаляются, только теряют членство.'
+      responses:
+        '204': { description: Удалена }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/members:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Группы устройств]
+      summary: Добавление устройства в группу
+      description: 'Роль: `it_admin`. Устройство может состоять в нескольких группах.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id]
+              properties:
+                device_id: { type: string, format: uuid }
+      responses:
+        '204': { description: Добавлено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/members/{deviceId}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - name: deviceId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Группы устройств]
+      summary: Исключение устройства из группы
+      description: 'Роль: `it_admin`.'
+      responses:
+        '204': { description: Исключено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/policies:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Группы устройств]
+      summary: Назначение скрипт-политики группе
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policy_id]
+              properties:
+                policy_id: { type: string, format: uuid }
+      responses:
+        '204': { description: Назначена }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/policies/{policyId}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - name: policyId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Группы устройств]
+      summary: Снятие скрипт-политики с группы
+      description: 'Роль: `it_admin`.'
+      responses:
+        '204': { description: Снята }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/software-policies:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Группы устройств]
+      summary: Назначение правила ПО группе
+      description: 'Роль: `it_admin`.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rule_id]
+              properties:
+                rule_id: { type: string, format: uuid }
+      responses:
+        '204': { description: Назначено }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/software-policies/{ruleId}:
+    parameters:
+      - { $ref: '#/components/parameters/Id' }
+      - name: ruleId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Группы устройств]
+      summary: Снятие правила ПО с группы
+      description: 'Роль: `it_admin`.'
+      responses:
+        '204': { description: Снято }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/device-groups/{id}/run-script:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Группы устройств]
+      summary: Запуск скрипта на всей группе
+      description: |
+        Роль: `it_admin`. Задача создаётся каждому устройству группы в статусе
+        `active`; устройства в очереди одобрения и заблокированные пропускаются.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [script_id]
+              properties:
+                script_id: { type: string, format: uuid }
+                priority: { $ref: '#/components/schemas/Priority' }
+      responses:
+        '202':
+          description: Задачи поставлены
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  created: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Алерты ───────────────────────────
+  /api/v1/alerts:
+    get:
+      tags: [Алерты]
+      summary: Алерты безопасности
+      responses:
+        '200':
+          description: Алерты
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Alert' }
+
+  /api/v1/alerts/{id}/acknowledge:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Алерты]
+      summary: Подтверждение алерта
+      description: 'Роль: `it_admin`.'
+      responses:
+        '200': { description: Подтверждён }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Локальные админ-права ───────────────────────────
+  /api/v1/admin-access-requests:
+    get:
+      tags: [Локальные админ-права]
+      summary: Запросы локальных админ-прав от сотрудников
+      responses:
+        '200':
+          description: Запросы
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AdminAccessRequest' }
+
+  /api/v1/admin-access-requests/{id}/respond:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Локальные админ-права]
+      summary: Решение по запросу
+      description: |
+        Роль: `it_admin`. Одобрение выдаёт сотруднику права локального администратора
+        на его машине на ограниченный срок. Решение записывается в аудит вместе с тем,
+        кто его принял.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision:
+                  type: string
+                  enum: [approve, deny]
+                duration_seconds:
+                  type: integer
+                  description: Срок действия прав при одобрении
+      responses:
+        '200': { description: Решение записано }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/admin-access-requests/{id}/revoke:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Локальные админ-права]
+      summary: Отзыв выданных прав
+      description: |
+        Роль: `it_admin`. Защитное действие, поэтому сервисному токену разрешено.
+      responses:
+        '200': { description: Отозвано }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Пользователи ───────────────────────────
+  /api/v1/admin-access-requests/{id}/changes:
+    get:
+      tags: [Админ-доступ]
+      summary: Улики сессии по заявке
+      description: |
+        Сводка полноты улик и строки дельты ПО/служб за время выданных прав.
+        Формулировки в UI без обвинений. Фильтр human_likely+unknown — на клиенте.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Сводка и изменения
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  evidence: { $ref: '#/components/schemas/AdminAccessEvidence' }
+                  changes:
+                    type: array
+                    items: { $ref: '#/components/schemas/AdminSessionChange' }
+        '404': { description: Заявка не найдена }
+
+
+  /api/v1/auth/tenants:
+    get:
+      tags: [Аутентификация]
+      summary: Тенанты текущей личности
+      description: |
+        ADR-7: отдаёт членства ЭТОГО человека, а не реестр инсталляции (для реестра
+        есть `/api/v1/tenants` под надзором). Сервисный токен получает 403: личности
+        у него нет, он выпущен на одно членство и переключаться ему некуда.
+
+        Признак `active` указывает членство, в котором выпущен текущий токен.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Список членств
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [tenant_id, tenant_name, role, active]
+                  properties:
+                    tenant_id: { type: string, format: uuid }
+                    tenant_name: { type: string }
+                    role: { type: string, enum: [it_admin, viewer] }
+                    active: { type: boolean }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/auth/tenant:
+    post:
+      tags: [Аутентификация]
+      summary: Переключение активного тенанта
+      description: |
+        ADR-7 §11.4. Выпускает токен на ДРУГОЕ членство той же личности; claim `act`
+        не появляется — `UserID` в токене это строка `users`, а она уже принадлежит
+        ровно одному тенанту.
+
+        Прежний `jti` уходит в блок-лист ДО выдачи нового: иначе оба токена жили бы
+        одновременно, и отозванная сессия продолжала бы работать в старом тенанте.
+        Членство, которого у личности нет, даёт 403 — по этому же признаку событие
+        попадает в журнал как `switch_tenant_denied`.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id]
+              properties:
+                tenant_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Токен перевыпущен на указанный тенант
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { description: Членства в указанном тенанте нет }
+
+  /api/v1/auth/oidc/{id}/begin:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Идентификатор OIDC-провайдера.
+    get:
+      tags: [Аутентификация]
+      summary: Начало SSO-входа (Authorization Code + PKCE)
+      description: |
+        Enterprise. Без аутентификации: это вход. Редиректит на authorization endpoint
+        провайдера, сохраняя `state` и PKCE-verifier.
+
+        Провайдер резолвится по id SECURITY DEFINER-функцией: тенант на этом шаге ещё
+        неизвестен, а строка `oidc_providers` тенантская. Выключенный провайдер флоу
+        не начинает. Ограничение частоты — 20 запросов в минуту с адреса.
+
+        В open-core ручки нет: ответ `501`.
+      security: []
+      responses:
+        '302': { description: Редирект на IdP }
+        '404': { description: Провайдера нет либо он выключен }
+        '429': { description: Превышена частота запросов }
+        '501': { description: Сборка без поддержки SSO (open-core) }
+
+  /api/v1/auth/oidc/{id}/callback:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Идентификатор OIDC-провайдера.
+    get:
+      tags: [Аутентификация]
+      summary: Возврат от IdP после SSO-входа
+      description: |
+        Enterprise. Без аутентификации. Обменивает код на `id_token`, проверяет подпись
+        по JWKS, `iss` и `aud`.
+
+        🔴 Пользователь ищется ТОЛЬКО в тенанте провайдера: e-mail уникален в пределах
+        тенанта, поэтому глобальный поиск пускал бы чужой IdP в одноимённую учётку
+        соседнего тенанта. Учётные записи не создаются — человек должен уже быть
+        заведён; иначе редирект с `sso_error=not_registered`.
+
+        `email_verified=false` отвергается: вход мапится по адресу, и непроверенный
+        адрес означал бы захват учётной записи.
+      security: []
+      parameters:
+        - { name: code,  in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string } }
+      responses:
+        '302':
+          description: |
+            Редирект на веб-интерфейс. При успехе выставляется сессионная кука,
+            при отказе добавляется `?sso_error=…` (`not_registered`, `auth_failed`).
+        '429': { description: Превышена частота запросов }
+        '501': { description: Сборка без поддержки SSO (open-core) }
+
+  /api/v1/devices/{id}/filevault-provision:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Дозавершить provisioning FileVault на устройстве
+      description: |
+        Enterprise, macOS. Гейт лицензии живой: при истечении ручка перестаёт принимать
+        запросы без рестарта, иначе оплаченная кастодия продолжала бы наполняться.
+
+        Роль: `it_admin` + `requireHuman` (сервисный токен получает 403). До 04.08 ручка
+        висела в authed-группе и её брал любой аутентифицированный субъект, включая
+        `viewer`. Именно human-admin: provisioning заводит на машине сотрудника
+        локального админа с Secure Token, то есть повышает права на эндпоинте.
+
+        Оператор-путь взамен визита к машине: на парке «зайти в терминал каждого мака
+        и ввести пароль» раскаткой не является, а без пароля держателя Secure Token
+        ключ восстановления не добыть. Задача доезжает обычным каналом доставки, а
+        пароль агент запрашивает у сотрудника через трей — служба сама его взять не
+        может и не должна.
+
+        Задача одна на устройство: повторный вызов отдаёт уже стоящую в очереди,
+        иначе сотруднику вылезла бы очередь диалогов подряд.
+      responses:
+        '202':
+          description: Задача поставлена
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string, format: uuid }
+                  status: { type: string, example: pending }
+        '402': { description: Нет действующей лицензии на FileVault }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/agent/escrow-recipient:
+    get:
+      tags: [Служебное]
+      summary: Опубликованный получатель эскроу
+      description: |
+        Без аутентификации, как и манифест самообновления: артефакт подписан релизным
+        ключом деплойера, а сам получатель — публичный ключ. Доверие держит подпись, а
+        не то, кто спросил.
+
+        Агент проверяет подпись релизным ключом (он приходит ему при энроллменте) и
+        принимает запись, только если `epoch` не меньше уже виденного — это
+        anti-rollback: иначе откат на прежнего, возможно скомпрометированного,
+        получателя выглядел бы штатной публикацией. Канон подписи —
+        `epoch\nrecipient\nfpr`.
+
+        Схема позволяет менять кастодию публикацией, а не пересборкой агента: пиннинг
+        получателя в бинарь для этого больше не нужен.
+
+        `404`, пока ничего не публиковали — тогда агент работает по вшитому пину, и
+        включение схемы не ломает уже раскатанный парк.
+      security: []
+      responses:
+        '200':
+          description: Текущий получатель
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [epoch, recipient, fpr, signature]
+                properties:
+                  epoch: { type: integer, format: int64 }
+                  recipient: { type: string, example: age1... }
+                  fpr: { type: string }
+                  signature: { type: string, description: base64 ed25519 по канону }
+        '404': { description: Получатель ещё не публиковался }
+
+  /api/v1/tenants:
+    get:
+      tags: [Тенанты]
+      summary: Реестр тенантов инсталляции
+      description: |
+        Доступно любой аутентифицированной роли. Поле `show_tenant` в ответе — `false`,
+        если в инсталляции один тенант (UI прячет сущность «тенант», §10.2).
+      responses:
+        '200':
+          description: Тенанты
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [show_tenant, tenants]
+                properties:
+                  show_tenant: { type: boolean }
+                  tenants:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tenant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [Тенанты]
+      summary: Создание тенанта
+      description: |
+        Роль: `provider_admin`. Только учётная запись человека (`x-requires-human`).
+        Аудит пишется в журнал нового тенанта.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        '201':
+          description: Тенант создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tenant' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+  /api/v1/tenants/{id}:
+    patch:
+      tags: [Тенанты]
+      summary: Переименование тенанта
+      description: |
+        Роль: `provider_admin`. Только учётная запись человека (`x-requires-human`).
+      x-requires-human: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        '200':
+          description: Тенант переименован
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name]
+                properties:
+                  id: { type: string, format: uuid }
+                  name: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Тенанты]
+      summary: Удаление тенанта
+      description: |
+        Роль: `provider_admin`. Только учётная запись человека (`x-requires-human`).
+
+        Устройства, люди, группы, скрипты и политики удаляемого тенанта переходят
+        в тенант по умолчанию — ничего не пропадает и переносить заранее не нужно.
+        Тенант по умолчанию удалить нельзя: в нём бутстрап-личность, без которой
+        в систему некому войти; переименовать его при этом можно.
+
+        Строка тенанта сохраняется тумбстоуном и исчезает из всех выборок. Это не
+        оптимизация: журнал аудита тенантский, у каждого тенанта собственная
+        хеш-цепочка, и перенос записей склеил бы две независимые цепочки, а
+        удаление стёрло бы доказательную часть за прошедший период.
+      x-requires-human: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Тенант удалён, содержимое перенесено в тенант по умолчанию }
+        '400': { description: Попытка удалить тенант по умолчанию }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/tenants/{id}/invites:
+    post:
+      tags: [Тенанты]
+      summary: Приглашение в конкретный тенант
+      description: |
+        Роль: `provider_admin`. Только учётная запись человека (`x-requires-human`).
+
+        Обычное приглашение заводит человека в тенант приглашающего, поэтому в
+        свежесозданный тенант им было некого позвать — он оставался недостижим.
+        Эта ручка приглашает в указанный тенант.
+
+        Если почта выключена или письмо не ушло, ответ содержит `invite_url` —
+        ссылку передают вручную, иначе пригласить было бы нечем.
+      x-requires-human: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role:
+                  type: string
+                  enum: [it_admin, viewer]
+                  default: viewer
+                  description: Не указана — наименьшие права.
+      responses:
+        '200':
+          description: Приглашение создано
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: invited }
+                  email_sent: { type: string, enum: ['true', 'false'] }
+                  invite_url:
+                    type: string
+                    description: Присутствует, когда письмо не отправлено.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/devices/{id}/tenant:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Тенанты]
+      summary: Перенос устройства в другой тенант
+      description: |
+        Роль: `provider_admin`. Только учётная запись человека (`x-requires-human`).
+
+        Членство в группах при переносе снимается: группы принадлежат покинутому
+        тенанту, и устройство, оставшееся в них, оказалось бы под чужими политиками.
+        Владелец отвязывается по той же причине — карточка человека тенантская.
+        Сертификат НЕ перевыпускается: он удостоверяет машину, а не подразделение,
+        и перевыпуск потребовал бы переэнроллмента.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id]
+              properties:
+                tenant_id: { type: string, format: uuid }
+      responses:
+        '204': { description: Устройство перенесено }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { description: Устройство или тенант не найдены }
+
+  /api/v1/users:
+    get:
+      tags: [Пользователи]
+      summary: Пользователи
+      responses:
+        '200':
+          description: Пользователи
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/User' }
+
+  /api/v1/users/invite:
+    post:
+      tags: [Пользователи]
+      summary: Приглашение пользователя
+      description: |
+        Роль: `it_admin`. Выпускает учётные данные человека с любой ролью, включая
+        `it_admin`, а принятие приглашения авторизации не требует.
+
+        Если почта на сервере не настроена, ссылка приглашения возвращается прямо в
+        теле ответа — обращайтесь с ней как с паролем.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email }
+                role: { $ref: '#/components/schemas/Role' }
+      responses:
+        '201':
+          description: Приглашение выпущено
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email_sent: { type: boolean }
+                  invite_url:
+                    type: string
+                    description: Только если письмо отправить не удалось
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/users/{id}:
+    delete:
+      tags: [Пользователи]
+      summary: Удаление учётной записи
+      description: |
+        Роль: `it_admin`. Отбирает доступ насовсем: активные сессии удалённого
+        отвергаются немедленно, выпущенные им сервисные токены удаляются вместе с ним.
+
+        Что переживает удаление: записи журнала аудита (ссылки на `users` у него нет
+        намеренно), выпущенные им приглашения, раскрытия эскроу и заявки на локальные
+        права — у них ссылка обнуляется, но строки остаются.
+
+        Два отказа со статусом `409`: удалить самого себя и удалить последнего
+        `it_admin`. Второй возможен только в гонке — двое удаляют друг друга
+        одновременно; проверка сериализована на стороне БД.
+      x-requires-human: true
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Удалён }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Себя удалить нельзя либо это последний `it_admin`
+
+  # ─────────────────────────── API-токены ───────────────────────────
+  /api/v1/api-tokens:
+    get:
+      tags: [API-токены]
+      summary: Список сервисных токенов
+      description: 'Роль: `it_admin`. Сам секрет не хранится и не возвращается.'
+      x-requires-human: true
+      responses:
+        '200':
+          description: Токены
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/APIToken' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+    post:
+      tags: [API-токены]
+      summary: Выпуск сервисного токена
+      description: |
+        Роль: `it_admin`. Секрет возвращается ОДИН раз и больше не восстанавливается.
+
+        Токен — это учётные данные с ролью, поэтому его выпуск приравнен к заведению
+        пользователя и запрещён другим токенам: иначе утёкший токен выписал бы себе
+        новый, который пережил бы удаление исходного.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, role]
+              properties:
+                name: { type: string }
+                role: { $ref: '#/components/schemas/Role' }
+                expires_in_days:
+                  type: integer
+                  description: 0 — без срока
+      responses:
+        '201':
+          description: Токен выпущен
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: Секрет. Показывается ОДИН раз.
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  /api/v1/api-tokens/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    delete:
+      tags: [API-токены]
+      summary: Отзыв сервисного токена
+      description: 'Роль: `it_admin`. Отзыв мгновенный.'
+      x-requires-human: true
+      responses:
+        '204': { description: Отозван }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+
+  # ─────────────────── FileVault-эскроу: выгрузка (Enterprise) ───────────────────
+  # Возможность редакции Enterprise. В open-core этих роутов НЕТ ВООБЩЕ (пакет escrow
+  # не собирается) — не 501, а 404: в свободной сборке нет ни кода, ни age в графе.
+  # Сервер отдаёт ШИФРТЕКСТ: расшифровать он не может (инвариант TestServerHasNoDecrypt),
+  # открывает оператор офлайн утилитой routineops-unseal шерами приватного ключа.
+
+  /api/v1/devices/{id}/escrow:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    get:
+      tags: [Устройства]
+      summary: Заэскроенные секреты устройства (метаданные)
+      description: |
+        Роль: `it_admin`, только человек. Шифртекста в ответе НЕТ — он только в `reveal`.
+        `latest=true` — строка, которую отдаст выгрузка для своего `secret_type`.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Список строк эскроу, свежие первыми
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EscrowRecord' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { description: Возможность Enterprise — в этой сборке роут отсутствует }
+
+  /api/v1/devices/{id}/escrow/reveal:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Выгрузка заэскроенного секрета (шифртекст)
+      description: |
+        Роль: `it_admin`, только человек, СВЕРХ ТОГО — живой грант
+        `users.can_reveal_escrow` (ADR-F16: выдаётся out-of-band через psql, роли для
+        него нет). Проверка гранта fail-closed: ошибка БД = отказ (500, не 403 — чтобы
+        оператор не искал грант, который у него уже есть).
+
+        Отдаётся САМАЯ СВЕЖАЯ строка `(device_id, secret_type)`: re-run provisioning
+        штатно ротирует PRK/пароль, старые строки не инвалидируются, и выдача устаревшей
+        привела бы к тому, что lock-time preflight отвергнет секрет, а FileVault-лок
+        машины начнёт молча отказывать.
+
+        `recipient_fpr` строки сверяется на КАЖДУЮ выгрузку с ДОВЕРЕННЫМИ получателями —
+        настроенным на сервере и всеми когда-либо опубликованными (тот же набор, что
+        принимает приём ключей). Несовпадение = 409, потому что иначе оператор получит
+        файл, который нечем открыть, и узнает об этом в момент инцидента. Ротация
+        получателя при этом НЕ делает старые строки невозвратными: сервер отдаёт то, что
+        сам же принял. Не смогли проверить (ошибка БД) — 503, а не выдача.
+
+        **Во время сеанса удалённого стола по этому устройству — 409** (контракт §5):
+        иначе оператор откроет ключ прямо в кадре и тот ляжет в видеозапись, у которой
+        свой режим доступа. Сеансом считается и ещё не принятый (`requested`): согласие
+        может прийти через секунду после того, как ключ окажется на экране.
+
+        Выгрузка и каждый отказ пишутся в аудит (`reveal_escrow` / `reveal_escrow_denied`).
+      x-requires-human: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                secret_type:
+                  type: string
+                  enum: [prk, secondary_cred]
+                  default: prk
+      responses:
+        '200':
+          description: Шифртекст самой свежей строки
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/EscrowRecord'
+                  - type: object
+                    properties:
+                      device_id:
+                        type: string
+                        format: uuid
+                        description: Нужен routineops-unseal для сверки device-binding, вложенного в конверт
+                      ciphertext_b64:
+                        type: string
+                        description: age-blob как есть, base64
+        '400': { description: Неизвестный secret_type }
+        '403': { description: Нет роли, сервисный токен либо нет гранта can_reveal_escrow }
+        '404': { description: Строки эскроу нет (или роут отсутствует — сборка не Enterprise) }
+        '409': { description: 'recipient строки не входит в доверенные (настроенный + опубликованные), либо по устройству идёт сеанс удалённого стола (контракт §5)' }
+        '503': { description: Не удалось проверить получателя строки (ошибка БД) — ключ не выдан, ретрай уместен }
+
+  /api/v1/devices/{id}/screen-sessions:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Запросить интерактивный сеанс с экраном (ADR-8)
+      description: |
+        Роль: `it_admin`, только человек — как и ВСЕ ручки `screen-*`, без исключений.
+        Сервисный токен несёт роль, зафиксированную при выпуске; наблюдение за экраном
+        сотрудника автоматикой не запрашивают.
+
+        **Повод обязателен.** Оператор, которому нечего написать, не имеет причины
+        подключаться, и в режиме `unattended` повод — единственное, что объясняет
+        наблюдение постфактум.
+
+        Порядок проверок: устройство активно → агент ОБЪЯВИЛ способность
+        (`devices.capabilities`, версии для этого мало: free-сборка той же версии
+        удалённого стола не содержит вовсе) → агент на связи. Только потом заводится
+        строка сеанса — иначе журнал заполнялся бы сеансами, которых не было.
+
+        Приглашение уходит подключённому агенту НЕМЕДЛЕННО, минуя очередь: задача,
+        доставленная через минуту, хуже честного `409 device_offline`.
+
+        Строка сеанса, задача-приглашение и строка аудита `screen_session_requested`
+        пишутся ОДНОЙ транзакцией. Не записался аудит — нет ни сеанса, ни приглашения:
+        сеанс наблюдения, о котором не осталось следа, — ровно то, ради предотвращения
+        чего фича и проектировалась.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  maxLength: 500
+                  description: Повод; уходит в аудит и (в режиме consent_required) показывается сотруднику
+                control:
+                  type: boolean
+                  default: false
+                  description: |
+                    Запросить сеанс С УПРАВЛЕНИЕМ: оператор сможет двигать мышь и нажимать
+                    клавиши от имени сотрудника.
+
+                    Объявляется ЗДЕСЬ и больше нигде. Область сеанса фиксируется
+                    приглашением и на лету не расширяется, поэтому ручки «взять управление
+                    посреди наблюдения» не существует — это всегда новый сеанс с новой
+                    строкой аудита. Обратное (вернуть управление) возможно и необратимо.
+
+                    Порождает отдельную строку аудита `screen_session_control_granted` и
+                    меняет текст, который видит сотрудник: плашка и диалог согласия
+                    говорят про управление, а не про просмотр.
+      responses:
+        '201':
+          description: Сеанс создан, приглашение доставлено агенту
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScreenSession' }
+        '400': { description: Повод не задан }
+        '403': { description: Нет роли либо сервисный токен }
+        '404': { description: Устройства нет, оно не активно или чужого тенанта (роут отсутствует — сборка не Enterprise) }
+        '409': { description: 'device_offline — агент не на связи; agent_unsupported — агент не умеет удалённый стол; agent_no_control — агент не умеет управление (способность screen_input объявляется отдельно от screen_session, иначе старый агент умер бы с SCOPE_VIOLATION на первой пачке ввода); recording_quota_exhausted — исчерпан объём записей тенанта' }
+        '500': { description: Не записался аудит — сеанс не создан (fail-closed) }
+    get:
+      tags: [Устройства]
+      summary: Журнал сеансов устройства
+      description: |
+        Роль: `it_admin`, только человек. Журнал — часть контракта, а не удобство: сеанс
+        обязан быть виден в карточке устройства постфактум, с оператором, поводом,
+        длительностью и признаком записи.
+      x-requires-human: true
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        '200':
+          description: Сеансы, новые сверху
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScreenSession' }
+        '403': { description: Нет роли либо сервисный токен }
+
+  /api/v1/screen-sessions/{sid}:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    get:
+      tags: [Устройства]
+      summary: Состояние сеанса
+      description: |
+        Роль: `it_admin`, только человек. Тенант берётся из claims оператора, сеанс лишь
+        проверяется на принадлежность; чужой сеанс даёт `404`, а не `403` — чтобы не
+        подтверждать его существование.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Сеанс
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScreenSession' }
+        '403': { description: Нет роли либо сервисный токен }
+        '404': { description: Сеанса нет или он чужого тенанта }
+
+  /api/v1/screen-sessions/{sid}/stop:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    post:
+      tags: [Устройства]
+      summary: Прекратить сеанс
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Идемпотентна: сеанс мог закончиться сам
+        (сотрудник, блокировка экрана, потолок длительности), и это не ошибка.
+      responses:
+        '204': { description: Сеанс закрыт }
+        '403': { description: Нет роли либо сервисный токен }
+        '404': { description: Сеанса нет или он чужого тенанта }
+
+  /api/v1/screen-sessions/{sid}/live:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    get:
+      tags: [Устройства]
+      summary: Кадры живого сеанса (long-poll, бинарный поток)
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек — включая эту ручку.
+
+        Long-poll, а не WebSocket: WS упирается в три мины разом (серверный WriteTimeout
+        переживает Hijack, nginx без `proxy_http_version 1.1` рвёт апгрейд, CSP
+        `connect-src` надо проверять на wss живьём). Лечатся они вместе с введением
+        управления, в отдельном этапе.
+
+        Тело — поток записей `[u32 len][u32 rel_ms][payload]`, где payload это часть кадра
+        в формате `internal/screenframe` (тайлы JPEG). Не base64-JSON: base64 раздувает
+        кадр на треть и заставляет браузер держать обе копии.
+
+        Кадры ДЕЛЬТОВЫЕ. Зритель обязан слать `since` = последний полученный `X-Screen-Seq`;
+        подключившемуся заново или отставшему сервер отдаёт поток начиная с полного кадра
+        (и просит его у агента), а не дельты поверх чужого состояния.
+
+        Каждый запрос отмечает живого зрителя: нет обращений дольше потолка — сеанс
+        закрывается (`VIEWER_GONE`). Закрытая вкладка перестаёт отмечать, пауза по
+        `document.hidden` — нет.
+      parameters:
+        - in: query
+          name: since
+          schema: { type: integer, format: int64, default: 0 }
+          description: Последний полученный номер кадра; 0 = начать с полного кадра
+        - in: query
+          name: wait
+          schema: { type: integer, default: 20000, maximum: 25000 }
+          description: Сколько миллисекунд держать запрос, если новых кадров нет
+      responses:
+        '200':
+          description: |
+            Ноль или больше кадров. Заголовки: `X-Screen-Seq` (курсор для следующего
+            запроса), `X-Screen-Width` / `X-Screen-Height` (геометрия холста),
+            `X-Screen-Closed` и `X-Screen-End-Reason` — если сеанс закончился.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403': { description: Нет роли либо сервисный токен }
+        '202':
+          description: |
+            Сеанс создан, агент ещё не открыл стрим — приглашение доезжает, захватчик
+            поднимается, а в режиме `consent_required` сотрудник ещё отвечает. Это НЕ
+            конец сеанса: клиент обязан продолжать опрос. Отдельный код нужен потому, что
+            общий 410 приходил на первый же запрос и читался панелью как «сеанс завершён».
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [requested] }
+                  waiting: { type: string, enum: [agent] }
+        '404': { description: Сеанса нет или он чужого тенанта }
+        '410': { description: Сеанс больше не живой — смотреть нечего }
+
+  /api/v1/screen-sessions/{sid}/recording:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    get:
+      tags: [Устройства]
+      summary: Запись сеанса (бинарный поток тайлов)
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек, СВЕРХ ТОГО — живой отзываемый грант
+        `users.can_view_session_recording` (по форме `can_reveal_escrow`). Проверка гранта
+        fail-closed: ошибка БД = 500, а не 403 — иначе оператор пойдёт искать право,
+        которое у него есть.
+
+        **Сам факт просмотра пишется в аудит, и запись не отдаётся, если аудит не
+        записался.** В режиме `unattended` запись — не подтверждение согласия, а улика, и
+        доступ к ней сам по себе поднадзорное действие. Отказ пишется отдельным действием.
+
+        Формат тот же, что у `/live`, поэтому плеер один на живой сеанс и на запись.
+        Превью, миниатюры, OCR и любая индексация содержимого на сервере запрещены.
+      responses:
+        '200':
+          description: Поток записей
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403': { description: Нет роли, сервисный токен либо нет гранта can_view_session_recording }
+        '404': { description: Сеанса нет, он чужого тенанта либо записи не существует }
+        '500': { description: Не записался аудит просмотра — запись не отдана (fail-closed) }
+
+  /api/v1/screen-sessions/{sid}/recording/manifest:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    get:
+      tags: [Устройства]
+      summary: Манифест записи (геометрия, длительность, индекс полных кадров)
+      x-requires-human: true
+      description: |
+        Те же требования, что у самой записи, включая грант и аудит факта обращения.
+        Индекс полных кадров нужен для перемотки: тайлы дельтовые, и начать
+        воспроизведение с середины можно только с keyframe'а.
+      responses:
+        '200':
+          description: Манифест
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScreenRecordingManifest' }
+        '403': { description: Нет роли, сервисный токен либо нет гранта }
+        '404': { description: Сеанса или записи нет }
+        '500': { description: Не записался аудит просмотра (fail-closed) }
+
+  /api/v1/screen-sessions/{sid}/input:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    post:
+      tags: [Устройства]
+      summary: Ввод оператора в сеансе с управлением
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Кроме того — **только оператор САМОГО сеанса**:
+        другой администратор той же роли вправе сеанс прекратить, но не печатать в него.
+        В журнале ввода стоит оператор сеанса, и чужие действия легли бы в улику под его
+        именем.
+
+        Пачками, а не событием на запрос: мышь порождает до сотни событий в секунду, и
+        запрос на каждое положил бы очередь соединений браузера раньше, чем сервер. Пачка
+        раз в 50 мс добавляет к задержке около 25 мс при врождённых 80–250 мс
+        ретрансляции кадра.
+
+        POST, а не WebSocket, и это осознанное отступление от контракта: WS нужен был
+        потоку ВНИЗ (кадры), а ввод идёт ВВЕРХ. Взамен не тронуты ни зависимости, ни
+        nginx, ни CSP.
+
+        Координаты — пиксели ПОКАЗАННОГО кадра; в координаты рабочего стола их
+        пересчитывает агент, у которого есть и вырезка, и масштаб профиля. Точка вне
+        кадра отвергается, а не зажимается в границы.
+
+        Порядок обработки: журнал ввода пишется ДО отправки. Не записался — ввод НЕ
+        отправлен и ответ `500`: действие под учётной записью сотрудника, о котором не
+        осталось строки, — это ровно та неатрибутируемость, ради которой журнал заведён.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScreenInputBatch' }
+      responses:
+        '204': { description: Пачка принята и отправлена агенту }
+        '400': { description: Незнакомый вид события либо битое тело }
+        '403': { description: Нет роли, сервисный токен либо чужой сеанс }
+        '409':
+          description: |
+            Сеанс без управления (`session has no control`), управление уже возвращено
+            (`control_returned`) либо стрим уже закрыт (`session_not_live`). Все три —
+            окончательные: повторять пачку бессмысленно, управления в этом сеансе больше
+            не будет.
+        '410': { description: Сеанс завершён }
+        '413': { description: Слишком много событий в пачке либо слишком длинный текст }
+        '500': { description: Журнал ввода не записался — ввод не отправлен }
+        '503':
+          description: |
+            ВРЕМЕННЫЙ отказ, пачку можно повторить. Два источника:
+            `input_backlog` — агент не успевает принимать ввод;
+            `session_not_live_yet` — стрим ещё не открыт (сеанс в статусе `requested`:
+            приглашение едет на устройство, захватчик поднимается, в режиме согласия
+            отвечает сотрудник).
+
+            Разделение обязательно. Раньше «ещё не открыт» отдавал 409 наравне с
+            «управление возвращено», и панель, начинающая слать ввод сразу после создания
+            сеанса, гасила управление до конца сеанса — при `control=t` и
+            `control_returned_at IS NULL` на сервере. Симметрично тому, как `GET /live`
+            отвечает `202`, а не `410`, пока сеанс в статусе `requested`.
+
+  /api/v1/screen-sessions/{sid}/control:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    delete:
+      tags: [Устройства]
+      summary: Вернуть управление сотруднику
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Наблюдение при этом ПРОДОЛЖАЕТСЯ — прекращается
+        только ввод.
+
+        Необратимо в пределах сеанса: область сеанса умеет только сужаться, и взять
+        управление снова — это НОВЫЙ сеанс с новой строкой аудита. Ручки «взять
+        управление» не существует намеренно: расширение области по управляющему сообщению
+        сводило бы на нет весь смысл того, что область enforce'ит агент.
+
+        Идемпотентна: повторный вызов отдаёт `204` и второй строки аудита не пишет.
+        Агенту при этом уходит `release_all` — иначе сотрудник остался бы с клавишей,
+        зажатой оператором в последний момент.
+      responses:
+        '204': { description: Управление возвращено (или уже было возвращено) }
+        '403': { description: Нет роли либо сервисный токен }
+        '404': { description: Сеанса нет или он чужого тенанта }
+        '409': { description: Сеанс без управления }
+
+  /api/v1/screen-sessions/{sid}/input-events:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/ScreenSessionId' }]
+    get:
+      tags: [Устройства]
+      summary: Журнал ввода сеанса
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек.
+
+        Печатные символы здесь ОТСУТСТВУЮТ по построению: для `kind=text` едет только
+        количество символов. Полный keylog — не «выключенная опция», а то, чего в
+        продукте нет: пароль, введённый оператором в чужую машину, не должен лежать в
+        нашей базе открытым текстом.
+
+        Движения мыши не пишутся вовсе: при отправке раз в 50 мс это двадцать строк в
+        секунду на сеанс, а к вопросу «что оператор сделал» траектория курсора не
+        добавляет ничего. Что было на экране, показывает запись сеанса.
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 1000, maximum: 5000 }
+      responses:
+        '200':
+          description: Строки журнала, по возрастанию смещения от начала сеанса
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScreenInputEntry' }
+        '403': { description: Нет роли либо сервисный токен }
+        '404': { description: Сеанса нет или он чужого тенанта }
+
+  /api/v1/screen-control-windows:
+    x-enterprise: true
+    get:
+      tags: [Устройства]
+      summary: Окна неатрибутируемости (интервалы управления)
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Тенант — из claims оператора.
+
+        Отвечает на вопрос кадрового разбора: в какие интервалы за машиной действовал не
+        её владелец. Внутри такого окна всё, что произошло во внешних системах, выглядит
+        как действия сотрудника — его SSO-сессия, его IP, его учётная запись.
+
+        Конец окна — РАНЬШЕЕ из возврата управления и конца сеанса: оператор, вернувший
+        управление на десятой минуте часового сеанса, отвечает за десять минут. Пустой
+        `to` означает «управление идёт прямо сейчас», а не «данные потерялись».
+
+        Смотровые сеансы в выгрузку не попадают: смотреть — не значит действовать.
+      parameters:
+        - in: query
+          name: device_id
+          schema: { type: string, format: uuid }
+          description: Ограничить одним устройством
+        - in: query
+          name: days
+          schema: { type: integer, default: 90, maximum: 400 }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 200, maximum: 1000 }
+      responses:
+        '200':
+          description: Окна управления, новые сверху
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScreenControlWindow' }
+        '403': { description: Нет роли либо сервисный токен }
+
+  /api/v1/screen-access-mode:
+    x-enterprise: true
+    get:
+      tags: [Устройства]
+      summary: Режим доступа к экрану и состояние квоты записей
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Тенант берётся из идентичности вызывающего и в
+        пути НЕ передаётся (ADR-6).
+
+        Вместе с режимом отдаётся состояние квоты записей: администратор, у которого
+        сеансы вдруг стали отказывать с `recording_quota_exhausted`, обязан видеть
+        причину там же, где настраивает наблюдение, а не искать её в логах сервера.
+      responses:
+        '200':
+          description: Режим и квота
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string, enum: [unattended, consent_required] }
+                  profile_cap: { type: string, enum: [low, medium], description: Потолок профиля сеансов тенанта }
+                  recording_used: { type: integer, format: int64, description: Занято записями, байт }
+                  recording_quota: { type: integer, format: int64, description: Потолок на тенанта, байт }
+                  recording_retention: { type: integer, description: Срок хранения записей, суток }
+        '403': { description: Нет роли либо сервисный токен }
+    patch:
+      tags: [Устройства]
+      summary: Переключить режим доступа к экрану (§4 контракта)
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Два значения: `unattended` (по умолчанию) и
+        `consent_required` — диалог согласия сотрудника перед сеансом.
+
+        Смена пишется в аудит В ТОЙ ЖЕ ТРАНЗАКЦИИ и fail-closed: не записался аудит —
+        режим не сменился. Причина не формальная: переход на `unattended` снимает у
+        сотрудников право отказать, и изменение, о котором не осталось следа,
+        неотличимо от «так было всегда».
+
+        Резидентная плашка «за вашим экраном наблюдают» показывается в ОБОИХ режимах и
+        флага отключения не имеет — этот запрос на неё не влияет.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [unattended, consent_required] }
+      responses:
+        '200':
+          description: Режим применён
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string }
+                  previous_mode: { type: string }
+        '400': { description: Неизвестный режим }
+        '403': { description: Нет роли либо сервисный токен }
+        '500': { description: Не записался аудит смены — режим не изменён (fail-closed) }
+
+  /api/v1/screen-profile-cap:
+    x-enterprise: true
+    patch:
+      tags: [Устройства]
+      summary: Потолок профиля сеансов экрана (§10 контракта)
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Два значения: `medium` (по умолчанию — 2 к/с,
+        до 1920 px) и `low` (1 к/с, до 1280 px).
+
+        Это ПОТОЛОК, а не значение: профиль сеанса выдаёт сервер в приглашении, но не
+        выше того, что разрешил тенант. Оператор выбрать профиль не может — §10 держит
+        потолки вне интерфейса оператора, — а тенант на узком канале обязан мочь
+        опуститься для всего своего парка.
+
+        Умолчание `medium` появилось после полевого замера: сеанс с управлением отъедал
+        1.6–1.7 % бюджета `low`, то есть худший случай (keyframe каждый кадр), на который
+        считался прежний бюджет, в поле не наступает.
+
+        Смена пишется в аудит В ТОЙ ЖЕ ТРАНЗАКЦИИ и fail-closed — как и смена режима
+        доступа: изменение меняет полосу, которую парк тенанта отъедает у ретранслятора.
+
+        Отдельная ручка, а не поле в теле `PATCH /screen-access-mode`: режим доступа про
+        права сотрудника, потолок — про полосу канала, и склеенные в один запрос они
+        давали бы одну строку аудита на два разных по смыслу изменения.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [profile_cap]
+              properties:
+                profile_cap: { type: string, enum: [low, medium] }
+      responses:
+        '200':
+          description: Потолок применён
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile_cap: { type: string }
+                  previous_profile_cap: { type: string }
+        '400': { description: Потолок вне списка low/medium }
+        '403': { description: Нет роли либо сервисный токен }
+        '500': { description: Не записался аудит смены — потолок не изменён (fail-closed) }
+
+  /api/v1/screen-recording-grants:
+    x-enterprise: true
+    get:
+      tags: [Устройства]
+      summary: Кому разрешён просмотр записей сеансов
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Отдаёт администраторов тенанта с состоянием
+        отзываемого гранта `users.can_view_session_recording` (§5).
+      responses:
+        '200':
+          description: Список администраторов и их грантов
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    user_id: { type: string, format: uuid }
+                    email: { type: string }
+                    role: { type: string }
+                    can_view_session_recording: { type: boolean }
+        '403': { description: Нет роли либо сервисный токен }
+
+  /api/v1/screen-recording-grants/me:
+    x-enterprise: true
+    get:
+      tags: [Устройства]
+      summary: Разрешено ли МНЕ смотреть записи сеансов
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Отдаёт один бит — состояние отзываемого гранта
+        `users.can_view_session_recording` у ВЫЗЫВАЮЩЕГО (§5).
+
+        Нужна интерфейсу: без неё панель устройства предлагала кнопку «Запись» каждому
+        администратору, а скачивание отвечало 403 всем, кому грант не выдан. Список по
+        тенанту для этого не годится — панель спрашивает про себя, а получала бы строки
+        всех администраторов тенанта на каждый открытый экран устройства.
+
+        Авторизацией НЕ является: грант отзываемый, и решение принимает
+        `GET /screen-sessions/{sid}/recording` в момент запроса файла.
+      responses:
+        '200':
+          description: Состояние собственного гранта
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  can_view_session_recording: { type: boolean }
+        '403': { description: Нет роли либо сервисный токен }
+
+  /api/v1/screen-recording-grants/{uid}:
+    x-enterprise: true
+    parameters:
+      - name: uid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Идентификатор администратора
+    put:
+      tags: [Устройства]
+      summary: Выдать или отозвать право смотреть записи сеансов
+      x-requires-human: true
+      description: |
+        Роль: `it_admin`, только человек. Выдача и отзыв пишутся в аудит в той же
+        транзакции и fail-closed: грант открывает доступ к содержимому экрана
+        сотрудника.
+
+        Выдаётся только администраторам (`role = it_admin`): наблюдателю право не нужно
+        — он и сеанс запросить не может, — а грант, лежащий на его строке, пережил бы
+        повышение роли и открыл бы доступ молча.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [can_view_session_recording]
+              properties:
+                can_view_session_recording: { type: boolean }
+      responses:
+        '204': { description: Применено }
+        '403': { description: Нет роли либо сервисный токен }
+        '404': { description: Нет такого администратора в тенанте вызывающего }
+        '500': { description: Не записался аудит — грант не изменён (fail-closed) }
+
+  /api/v1/devices/{id}/lock/arm:
+    x-enterprise: true
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Вооружение FileVault-лока секретами (ADR-F24)
+      description: |
+        Роль: `it_admin`, только человек. Кладёт секреты, которые агент заберёт на
+        lock-time отдельным pull-каналом. Команда лока остаётся durable и неизменной —
+        секрет в БД не попадает НИКОГДА: он живёт только в памяти сервера, под TTL
+        (`ROUTINEOPS_LOCK_ARM_TTL`, дефолт 15м) и отдаётся агенту ОДИН раз.
+
+        Вооружать можно только под ЖИВОЙ desired-лок с `lock_mode=filevault` — это и
+        есть граница окна, в котором секрет лежит в RAM. Без активного лока, при
+        overlay-локе и при локе без `request_id` (выдан до миграции 032) — 409.
+
+        Повторный вызов перезаписывает и продлевает: агент мог забрать секрет и не
+        довести ревок (машина уходит в шатдаун), после чего вооружение надо повторить.
+        Рестарт сервера гасит вооружение — агент уйдёт в `NOT_ARMED`, это fail-closed.
+
+        🔴 В аудит (`arm_lock_secrets`) пишется ФАКТ вооружения — какой лок и какие поля
+        поданы, — и никогда значения. Аудит стоит ДО вооружения и fail-closed: не
+        записали — не вооружили.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Хотя бы одно поле обязано быть непустым
+              properties:
+                mdmadmin_password:
+                  type: string
+                  description: Пароль сервисной учётки mdmadmin
+                personal_recovery_key:
+                  type: string
+                  description: Personal Recovery Key тома FileVault
+      responses:
+        '200':
+          description: Вооружено
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request_id:
+                    type: string
+                    description: Команда лока, под которую вооружено; чужой id секрет не получит
+                  expires_at:
+                    type: string
+                    format: date-time
+        '400': { description: Битое тело либо оба секрета пусты }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { description: Роут отсутствует — сборка не Enterprise либо escrow не сконфигурирован }
+        '409': { description: Нет активного FileVault-лока, лок без request_id либо лицензия не покрывает FileVault }
+
+  /api/v1/devices/{id}/software/uninstall:
+    parameters: [{ $ref: '#/components/parameters/DeviceId' }]
+    post:
+      tags: [Устройства]
+      summary: Удаление установленного ПО
+      description: |
+        Роль: `it_admin`. Ставит задачу снятия ПО с устройства.
+
+        Тело содержит только ИДЕНТИФИКАЦИЮ цели. Остальной селектор (версия, путь,
+        метод, scope) сервер берёт из собственного снимка инвентаря — иначе клиент мог
+        бы прислать произвольный метод, и сверка метода на агенте проверяла бы
+        присланное против присланного.
+
+        Агент присланную строку деинсталлятора НЕ выполняет и вообще не принимает от
+        сервера команд ОС: он снимает инвентарь заново, находит запись по селектору в
+        своём свежем снимке и выполняет метод, который определил сам. Иначе канал задач
+        стал бы вторым путём произвольного исполнения — мимо подписи, аудита и потолков
+        скриптов.
+
+        Повторный вызов при живой недоставленной заявке возвращает ТУ ЖЕ задачу: новый
+        `task_id` агент считает новой командой.
+
+        Исход приезжает отдельным полем `uninstall_outcome` (см. `Task`), а не текстом:
+        `target_changed`, `ambiguous`, `not_removable`, `self_protected` требуют разных
+        действий оператора, а `still_present` против `failed` — различие безопасности
+        (msiexec отдаёт 0 на снос, отложенный до перезагрузки).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [software_name]
+              properties:
+                software_name: { type: string }
+                uninstall_id:
+                  type: string
+                  description: >
+                    Машинный ключ из инвентаря (ProductCode, имя пакета). Различает
+                    одноимённые записи разных вендоров. На macOS пуст — там ключом
+                    служит install_location.
+                reason: { type: string, description: Причина для журнала аудита }
+      responses:
+        '202':
+          description: Задача поставлена
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_id: { type: string }
+                  status: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: Нет в инвентаре, снять нечем либо устройство не active }
+
+  /api/v1/escrow/status:
+    x-enterprise: true
+    get:
+      tags: [Устройства]
+      summary: Готовность FileVault-эскроу
+      description: |
+        Любая аутентифицированная роль. Нужен затем, что эскроу — fail-closed фича:
+        при невыставленном или неподошедшем `ESCROW_RECIPIENT` она выключается ТИХО, и
+        без этой ручки заметить это можно было бы только по отказу первого же
+        FileVault-лока. `enabled` считается живым гейтом: истечение лицензии переводит
+        его в `false` без рестарта.
+      responses:
+        '200':
+          description: Статус
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                    description: Эскроу сконфигурировано И лицензия покрывает FileVault И жива
+                  recipient_fpr:
+                    type: string
+                    description: Отпечаток запиненного публичного age-recipient (не секрет)
+        '404': { description: Роут отсутствует — сборка не Enterprise }
+
+  # ─────────────────────────── Лицензия (Enterprise) ───────────────────────────
+  # В open-core этих роутов нет — 404, и страница «Лицензия» показывает «недоступно в
+  # этой редакции». Лицензия проверяется вшитым на сборке публичным ключом вендора.
+
+  /api/v1/license:
+    x-enterprise: true
+    get:
+      tags: [Администрирование]
+      summary: Снимок энтайтлмента
+      description: |
+        Роль: `it_admin`. Секретов не отдаёт. `configured` и `valid` различают «истекла»
+        (`configured && !valid`) от «не задана» (`!configured`) — UI показывает разные
+        состояния. `valid` считается тем же выражением, что и боевой гейт, иначе экран
+        говорил бы «активна», когда операции уже отбиваются.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Снимок на момент запроса
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LicenseStatus' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { description: Роут отсутствует — сборка не Enterprise }
+    post:
+      tags: [Администрирование]
+      summary: Применение или деактивация лицензии
+      description: |
+        Роль: `it_admin`. Применяется LIVE, без рестарта, и персистится, чтобы пережить
+        его. Пустой `license` = деактивация (в аудит уходит отдельным действием
+        `deactivate_license`: снятие enterprise и его выдача не должны выглядеть в
+        журнале одинаково). Отклонённая лицензия НЕ сбрасывает текущую.
+
+        `persist_warning` непусто, когда live-применение удалось, а сохранение — нет
+        (том :ro) либо будет перекрыто на старте переменной `ROUTINEOPS_LICENSE`. Молчать
+        в этом случае нельзя: админ считал бы, что сохранил, а рестарт вернул бы его в
+        прежнее состояние.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                license:
+                  type: string
+                  description: Blob лицензии; пустая строка = деактивация
+                activation_password:
+                  type: string
+                activation_code:
+                  type: string
+                  description: >-
+                    Код активации: сервер сам получит лицензию у вендора и дальше будет
+                    продлевать её раз в сутки. Задан — `license`/`activation_password`
+                    игнорируются. Неизвестный код = 400, недоступный вендор = 502.
+      responses:
+        '200':
+          description: Применено
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/LicenseStatus'
+                  - type: object
+                    properties:
+                      persist_warning:
+                        type: string
+                        description: Непусто, если после рестарта состояние не совпадёт с текущим
+        '400': { description: Некорректный запрос либо лицензия отклонена (подпись/активация/срок) }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { description: Роут отсутствует — сборка не Enterprise }
+
+  # ─────────────────────────── Каталог (LDAP, Enterprise) ───────────────────────────
+  # Синхронизация персон из LDAP/Active Directory и авто-привязка владельцев устройств.
+  # Возможность редакции Enterprise: в open-core-сборке кода каталога физически нет,
+  # ручки конфига/теста/синка отвечают 501 (страница «Каталог» в UI скрыта).
+
+  /api/v1/directory/config:
+    get:
+      tags: [Каталог]
+      summary: Конфигурация подключения к каталогу
+      description: |
+        Роль: `it_admin`. Bind-пароль в ответ не входит — только флаг `has_password`.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Конфигурация
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DirectoryConfig' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '501': { description: Возможность Enterprise — в этой сборке недоступна }
+    put:
+      tags: [Каталог]
+      summary: Сохранение конфигурации каталога
+      description: |
+        Роль: `it_admin`. Пустые `bind_password` и `ca_cert_pem` НЕ меняют сохранённые
+        значения — интерфейс не показывает ни пароль, ни сертификат и шлёт пустые
+        строки при правке соседних полей. Оба хранятся вне БД и в аудит не пишутся;
+        в журнал уходят только метаданные, включая факт замены сертификата.
+
+        Транспорт: `ldaps://` в `url` — неявный TLS; `ldap://` + `start_tls` — апгрейд
+        открытого соединения; `ldap://` без `start_tls` — открытый канал (боевой AD
+        обычно отклоняет по нему simple bind, а при `login_enabled` такую комбинацию
+        отбиваем и мы: см. описание поля). Заданный `ca_cert_pem` ЗАМЕНЯЕТ
+        системные корни, а не дополняет их: доверие адресуется конкретному УЦ
+        организации, иначе подошёл бы сертификат любого публичного УЦ, выписанный на
+        имя контроллера домена.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/DirectoryConfig'
+                - type: object
+                  properties:
+                    bind_password:
+                      type: string
+                      description: Пустая строка = не менять существующий пароль
+                    ca_cert_pem:
+                      type: string
+                      description: >
+                        Корневой сертификат каталога в PEM (можно цепочкой). Пустая
+                        строка = не менять сохранённый. Разбирается при сохранении:
+                        битый PEM отвергается с 400, а не всплывает отказом синка позже.
+      responses:
+        '204': { description: Сохранено }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '501': { description: Возможность Enterprise — в этой сборке недоступна }
+
+  /api/v1/directory/test:
+    post:
+      tags: [Каталог]
+      summary: Проверка подключения к каталогу
+      description: 'Роль: `it_admin`. Ошибка связи возвращается в теле со статусом 200.'
+      x-requires-human: true
+      responses:
+        '200':
+          description: Итог проверки
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, error] }
+                  error: { type: string }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '501': { description: Возможность Enterprise — в этой сборке недоступна }
+
+  /api/v1/directory/sync:
+    post:
+      tags: [Каталог]
+      summary: Немедленная синхронизация каталога
+      description: |
+        Роль: `it_admin`. Тянет персон из каталога и привязывает владельцев устройств:
+        точный матч по SID консольного пользователя, fallback по логину; отключённые
+        учётки не матчатся. Помимо ручного запуска синхронизация идёт по расписанию
+        (`sync_interval_min`).
+      x-requires-human: true
+      responses:
+        '200':
+          description: Итог синхронизации
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DirectorySyncResult' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '501': { description: Возможность Enterprise — в этой сборке недоступна }
+
+  /api/v1/directory/persons:
+    get:
+      tags: [Каталог]
+      summary: Персоны каталога
+      description: |
+        Роль: `it_admin`. Читает синхронизированных персон из БД; в open-core-сборке
+        отвечает пустым списком (синхронизации нет).
+      responses:
+        '200':
+          description: Персоны
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Person' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Аудит ───────────────────────────
+  /api/v1/audit-log:
+    get:
+      tags: [Аудит]
+      summary: Журнал аудита
+      description: |
+        Фильтры применяет сервер, выдача постраничная: тело — страница, общее число
+        записей под фильтром — в заголовке `X-Total-Count`.
+      parameters:
+        - name: action
+          in: query
+          description: Точное совпадение действия (`login`, `create_device`, ...).
+          schema: { type: string }
+        - name: who
+          in: query
+          description: |
+            Подстрока в адресе автора события. Действия агента записаны как
+            `agent:<device_id>`.
+          schema: { type: string }
+        - name: from
+          in: query
+          description: |
+            Нижняя граница периода, включительно. Момент времени в RFC3339 с зоной —
+            границу суток считает клиент в своём поясе. Другой формат = 400.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Верхняя граница периода, включительно. Формат тот же.
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: Записи
+          headers:
+            X-Total-Count: { $ref: '#/components/headers/TotalCount' }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEntry' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/audit-log/verify:
+    get:
+      tags: [Аудит]
+      summary: Проверка целостности журнала
+      description: |
+        Проверяет хеш-цепочку журнала аудита: каждую запись против её собственного
+        хеша, каждую связку с соседом, непрерывность номеров и совпадение с
+        сохранёнными якорями.
+
+        **Код ответа всегда 200, в том числе при обнаруженной подделке.** «Проверка
+        выполнена, результат — журнал подделан» это успешный ответ, а не ошибка
+        сервера; судить о результате надо по полю `ok`. Ответ 4xx/5xx на найденную
+        подделку был бы неотличим от недоступности сервера — то есть противнику
+        хватило бы уронить ручку, чтобы скрыть результат.
+
+        Обнаруживаются: правка поля (`reason: hash`), удаление записи из середины
+        (`gap`), перестановка или вставка (`link`), полный пересчёт цепочки после
+        подделки (`anchor_mismatch`). Удаление самых старых записей по сроку
+        хранения нарушением НЕ считается — оно лишь сдвигает `first_seq`.
+
+        Цепочка доказывает внутреннюю согласованность. Тот, кто может писать в БД,
+        пересчитает её целиком; поймать это позволяет только сверка `head_hash` с
+        внешней копией — сервер ежесуточно печатает голову в свой лог.
+      responses:
+        '200':
+          description: Результат проверки (в том числе отрицательный)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    description: false — цепочка нарушена; см. reason и broken_seq.
+                  chained:
+                    type: integer
+                    format: int64
+                    description: Сколько записей входит в цепочку и проверено.
+                  unchained:
+                    type: integer
+                    format: int64
+                    description: |
+                      Записи, сделанные до включения цепочки. Не покрыты ей и никогда
+                      не будут: ретроспективный пересчёт по возможно подделанным
+                      данным дал бы валидную цепочку над подделкой.
+                  first_seq:
+                    type: integer
+                    format: int64
+                    description: Начало уцелевшего участка; больше 1 = префикс усечён по сроку хранения.
+                  last_seq: { type: integer, format: int64 }
+                  head_hash:
+                    type: string
+                    description: Хеш последней записи — значение для сверки с внешней копией.
+                  reason:
+                    type: string
+                    enum: [hash, gap, link, anchor]
+                  broken_seq: { type: integer, format: int64 }
+                  anchor_mismatch: { type: boolean }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  # ─────────────────────────── Служебное ───────────────────────────
+  /healthz:
+    get:
+      tags: [Служебное]
+      summary: Проверка живости
+      security: []
+      responses:
+        '200': { description: Сервер жив }
+
+  /ca.crt:
+    get:
+      tags: [Служебное]
+      summary: Корневой сертификат CA
+      description: |
+        Отдаётся публично, потому что нужен агенту ДО того, как у него появится
+        идентичность. Целостность обеспечивается не транспортом, а пиннингом:
+        агент сверяет отпечаток с переданным ему при установке `ca_sha256`.
+      security: []
+      responses:
+        '200':
+          description: PEM
+          content:
+            application/x-pem-file:
+              schema: { type: string }
+
+  /api/v1/agent/version:
+    get:
+      tags: [Служебное]
+      summary: Манифест самообновления агента
+      description: |
+        Отдаёт последний опубликованный выпуск для указанной платформы. Постепенной
+        раскатки нет: единственный тормоз — не публиковать выпуск.
+      security: []
+      parameters:
+        - name: os
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/OS' }
+        - name: arch
+          in: query
+          required: true
+          schema: { type: string, example: amd64 }
+      responses:
+        '200':
+          description: Манифест
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string, example: 2.4.6 }
+                  url: { type: string, format: uri }
+                  sha256: { type: string }
+                  signature:
+                    type: string
+                    description: Подпись над sha256 бинаря
+                  manifest_signature:
+                    type: string
+                    description: Подпись над version\nos\narch\nsha256 — защита от отката
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/installer:
+    get:
+      tags: [Служебное]
+      summary: Скрипт установки агента
+      security: []
+      parameters:
+        - name: os
+          in: query
+          required: true
+          schema: { $ref: '#/components/schemas/OS' }
+      responses:
+        '200':
+          description: Текст скрипта
+          content:
+            text/plain:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  # --- MFA (Q-44) -----------------------------------------------------------
+  /api/v1/auth/mfa/login:
+    post:
+      tags: [Аутентификация]
+      summary: Второй шаг входа — код TOTP или код восстановления
+      description: |
+        Вызывается, когда `/auth/login` ответил `mfa_required`. Авторизуется
+        временной кукой `mfa_token` (claim `mfa_pending`), которую тот шаг и выдал:
+        полноценная сессия здесь ещё не выпущена и до успеха не выпускается.
+
+        Код восстановления одноразовый и списывается ДО выдачи сессии. Ограничение
+        частоты — 10 запросов в минуту с адреса.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, description: Код из приложения либо код восстановления }
+      responses:
+        '200': { description: Вход завершён, кука сессии выставлена }
+        '401': { description: Неверный код либо нет/протух mfa_token }
+        '409': { description: MFA у личности не настроена }
+  /api/v1/auth/mfa/enroll:
+    post:
+      tags: [Аутентификация]
+      summary: Начать привязку TOTP
+      description: |
+        Возвращает `otpauth://`-URI для приложения и десять кодов восстановления.
+        Коды показываются ЕДИНСТВЕННЫЙ раз: в базе лежат только их хеши.
+
+        MFA включается не здесь, а после `/auth/mfa/verify` — иначе неудачная
+        привязка запирала бы человека снаружи.
+
+        Ручка доступна и с полусессией `mfa_pending`: политика тенанта «требовать
+        MFA» отправляет на привязку до того, как второй фактор существует.
+      responses:
+        '200':
+          description: URI для приложения и коды восстановления
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uri: { type: string }
+                  recovery_codes: { type: array, items: { type: string } }
+        '409': { description: MFA уже включена — сначала отключите }
+  /api/v1/auth/mfa/verify:
+    post:
+      tags: [Аутентификация]
+      summary: Подтвердить привязку TOTP первым кодом
+      description: |
+        Включает MFA, если код сходится. Если запрос пришёл с полусессией
+        `mfa_pending`, здесь же выдаётся обычная сессия — вход завершается.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        '200': { description: MFA включена }
+        '401': { description: Неверный код }
+        '409': { description: Привязка не начиналась }
+  /api/v1/auth/mfa:
+    delete:
+      tags: [Аутентификация]
+      summary: Отключить MFA
+      description: |
+        Требует свежий код второго фактора (TOTP или код восстановления): снятие
+        второго фактора весит столько же, сколько его выдача, и одной угнанной
+        сессии для этого быть не должно.
+
+        Политику тенанта «требовать MFA» это не обходит — следующий вход снова
+        потребует привязки.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string }
+      responses:
+        '200': { description: MFA отключена }
+        '401': { description: Неверный код }
+        '409': { description: MFA не была включена }
+
+  # --- SAML (Q-46) ----------------------------------------------------------
+  /api/v1/auth/saml/{id}/metadata:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+        description: Идентификатор SAML-провайдера.
+    get:
+      tags: [Аутентификация]
+      summary: Метаданные SP для настройки IdP
+      description: |
+        Enterprise. Без аутентификации: файл забирает администратор IdP. Содержит
+        сертификат SP — он постоянный и хранится вместе с провайдером, поэтому
+        рестарт сервера доверие не ломает.
+
+        Выключенный провайдер неотличим от отсутствующего.
+      security: []
+      responses:
+        '200': { description: XML метаданных SP }
+        '404': { description: Провайдера нет либо он выключен }
+  /api/v1/auth/saml/{id}/begin:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Аутентификация]
+      summary: Начало SAML-входа
+      description: |
+        Enterprise. Редиректит на IdP и кладёт идентификатор AuthnRequest в куку —
+        на шаге ACS ответ принимается только на СВОЙ запрос.
+      security: []
+      responses:
+        '302': { description: Редирект на IdP }
+        '404': { description: Провайдера нет либо он выключен }
+  /api/v1/auth/saml/{id}/acs:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Аутентификация]
+      summary: Приём assertion от IdP (Assertion Consumer Service)
+      description: |
+        Enterprise. Принимает ответ ТОЛЬКО на собственный AuthnRequest (сверка
+        InResponseTo по куке из `/begin`), иначе годилась бы любая подписанная
+        assertion, полученная где-то ещё.
+
+        Вход происходит строго в тенант провайдера: IdP заводит администратор
+        конкретного тенанта, и чужой IdP не должен пускать в чужой тенант.
+      security: []
+      responses:
+        '302': { description: Успех — редирект в панель; отказ — на /login с sso_error }
+        '404': { description: Провайдера нет либо он выключен }
+
+  # --- SCIM (Q-45) ----------------------------------------------------------
+  /api/v1/scim/v2/Users:
+    x-enterprise: true
+    get:
+      tags: [Пользователи]
+      summary: SCIM 2.0 — список пользователей тенанта
+      description: |
+        Enterprise. Провизионинг из внешнего IdP. Ходит сервисным токеном с ролью
+        it_admin, поэтому `requireHuman` здесь сознательно НЕ стоит — иначе SCIM
+        не работал бы по определению.
+      responses:
+        '200': { description: ListResponse SCIM }
+    post:
+      tags: [Пользователи]
+      summary: SCIM 2.0 — завести пользователя
+      description: |
+        Создаёт членство в тенанте с ролью `viewer`. Пароля у такой учётной записи
+        нет: вход только через IdP либо через сброс пароля по почте.
+      responses:
+        '201': { description: Создан }
+        '400': { $ref: '#/components/responses/BadRequest' }
+  /api/v1/scim/v2/Users/{id}:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Пользователи]
+      summary: SCIM 2.0 — карточка пользователя
+      responses:
+        '200': { description: Пользователь }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Пользователи]
+      summary: SCIM 2.0 — обновить пользователя
+      description: |
+        `active: false` означает увольнение и удаляет членство: отдельного состояния
+        «приостановлен» у членства нет, а именно автоотключение при увольнении и есть
+        то, ради чего SCIM подключают.
+      responses:
+        '200': { description: Обновлён }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Пользователи]
+      summary: SCIM 2.0 — удалить пользователя
+      responses:
+        '204': { description: Удалён }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- SIEM (Q-47) ----------------------------------------------------------
+  /api/v1/siem:
+    x-enterprise: true
+    get:
+      tags: [Журнал]
+      summary: Приёмники выгрузки журнала (вебхук, syslog, CEF)
+      description: |
+        Enterprise. Роль `it_admin`, только человеком: адрес приёмника определяет,
+        КУДА уезжает журнал целиком, и менять его автоматике незачем.
+
+        Секрет подписи наружу не отдаётся никогда — только признак `has_secret`.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Список приёмников со статусом последней доставки
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SIEMIntegration' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+    post:
+      tags: [Журнал]
+      summary: Добавить приёмник SIEM
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SIEMIntegrationInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SIEMIntegration' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+  /api/v1/siem/{id}:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [Журнал]
+      summary: Изменить приёмник SIEM
+      description: |
+        Пустой `secret` означает «не менять» — как `client_secret` у OIDC. Снять
+        подпись можно только явным `clear_secret: true`, иначе смена адреса каждый
+        раз молча обнуляла бы её.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SIEMIntegrationInput' }
+      responses:
+        '204': { description: Обновлён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Журнал]
+      summary: Удалить приёмник SIEM
+      x-requires-human: true
+      responses:
+        '204': { description: Удалён }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/siem/{id}/test:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Журнал]
+      summary: Отправить в приёмник тестовое событие
+      description: |
+        Enterprise. Роль `it_admin`, только человеком.
+
+        Событие уходит ТЕМ ЖЕ кодом доставки, которым поедут боевые, — проверка,
+        идущая другим путём, отвечала бы не на тот вопрос. Исход записывается в те
+        же поля статуса (`last_status`, `error_count`), что и боевая доставка.
+
+        Недоступный приёмник — это `200` с `ok: false`, а не `5xx`: неверный адрес
+        отвечает на вопрос «работает ли настройка», а не означает сбой сервера.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Результат попытки доставки
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string, description: Причина отказа; пусто при успехе }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Управление провайдерами SSO (Enterprise) ------------------------------
+  # Ручки управления IdP. До Q-60 в спецификации их не было вовсе: гард
+  # docs/openapi.yaml не умел разбирать вложенный r.Route(...) и швы открытого
+  # пакета, поэтому /oidc/* были для него невидимы целиком, а SAML заводился только
+  # вставкой строки в saml_providers руками.
+
+  /api/v1/oidc/providers:
+    x-enterprise: true
+    get:
+      tags: [Аутентификация]
+      summary: Провайдеры SSO по OIDC
+      description: |
+        Enterprise. Роль `it_admin`, только человеком: кто заводит IdP, тот заводит
+        вход, а это выпуск прав.
+
+        `client_secret` наружу не отдаётся — только признак `has_secret`.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Список провайдеров тенанта
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/OIDCProvider' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '501': { description: Сборка без поддержки SSO (open-core) }
+    post:
+      tags: [Аутентификация]
+      summary: Добавить провайдер OIDC
+      description: |
+        `issuer_url` обязан быть `https` (http допустим только на loopback): по нему
+        едут discovery и JWKS, то есть ключи проверки подписи `id_token`.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OIDCProviderInput' }
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OIDCProvider' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '501': { description: Сборка без поддержки SSO (open-core) }
+  /api/v1/oidc/providers/{id}:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    put:
+      tags: [Аутентификация]
+      summary: Изменить провайдер OIDC
+      description: Пустой `client_secret` означает «не менять».
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OIDCProviderInput' }
+      responses:
+        '204': { description: Обновлён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { description: Сборка без поддержки SSO (open-core) }
+    delete:
+      tags: [Аутентификация]
+      summary: Удалить провайдер OIDC
+      x-requires-human: true
+      responses:
+        '204': { description: Удалён }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501': { description: Сборка без поддержки SSO (open-core) }
+
+  /api/v1/saml/providers:
+    x-enterprise: true
+    get:
+      tags: [Аутентификация]
+      summary: Провайдеры SSO по SAML
+      description: |
+        Enterprise. Роль `it_admin`, только человеком.
+
+        Приватник ключевой пары SP не отдаётся ни в каком виде; сертификат, наоборот,
+        отдаётся целиком — это публичная часть, и её админ загружает в IdP.
+        В списке XML метаданных IdP не отдаётся (десятки килобайт на строку) — только
+        признак `has_idp_metadata_xml`.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Список провайдеров тенанта
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SAMLProvider' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+    post:
+      tags: [Аутентификация]
+      summary: Добавить провайдер SAML
+      description: |
+        Нужен ЛИБО `idp_metadata_url` (обязательно https, http только на loopback),
+        ЛИБО `idp_metadata_xml` — для IdP в закрытом контуре. XML разбирается сразу
+        при сохранении: узнавать о битых метаданных нужно админу в момент настройки,
+        а не сотруднику в момент неудачного входа.
+
+        Ключевая пара SP выпускается ЗДЕСЬ и живёт в БД постоянно: IdP пинит наш
+        сертификат, и перевыпуск пары ломал бы доверие после каждого рестарта.
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SAMLProviderInput' }
+      responses:
+        '201':
+          description: Создан; ключевая пара SP уже выпущена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SAMLProvider' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+  /api/v1/saml/providers/{id}:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Аутентификация]
+      summary: Карточка провайдера SAML
+      description: Отличается от списка тем, что отдаёт `idp_metadata_xml` целиком.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Провайдер
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SAMLProvider' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Аутентификация]
+      summary: Изменить провайдер SAML
+      description: Ключевая пара SP не трогается — иначе «переименовал» означало бы «сломал доверие IdP».
+      x-requires-human: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SAMLProviderInput' }
+      responses:
+        '204': { description: Обновлён }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Аутентификация]
+      summary: Удалить провайдер SAML
+      x-requires-human: true
+      responses:
+        '204': { description: Удалён вместе с ключевой парой }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/saml/providers/{id}/sp-metadata:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Аутентификация]
+      summary: Метаданные нашей стороны (SP) для загрузки в IdP
+      description: |
+        Не дубль публичной `/auth/saml/{id}/metadata`, а замена ей на этапе
+        настройки: публичная отдаёт только ВКЛЮЧЁННЫХ провайдеров и требует
+        доступных метаданных IdP — то есть недостижима ровно тогда, когда нужна.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Entity ID, ACS, сертификат подписи и готовый XML
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entity_id: { type: string }
+                  acs_url: { type: string }
+                  metadata_url: { type: string }
+                  certificate: { type: string, description: PEM публичного сертификата SP }
+                  metadata_xml: { type: string }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/saml/providers/{id}/test:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Аутентификация]
+      summary: Проверить доступность и полноту метаданных IdP
+      description: |
+        Enterprise. Роль `it_admin`, только человеком.
+
+        Без этой проверки единственный способ узнать об ошибке настройки — попытка
+        входа сотрудника: он видит редирект `?sso_error=auth_failed`, а причина
+        остаётся в логе сервера, куда админ не смотрит.
+
+        Недоступный IdP — `200` с `ok: false`, а не `5xx`.
+      x-requires-human: true
+      responses:
+        '200':
+          description: Результат проверки
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  error: { type: string }
+                  idp_entity_id: { type: string }
+                  sso_url: { type: string }
+                  signing_certs: { type: integer }
+                  source: { type: string, enum: [xml, url] }
+        '403': { $ref: '#/components/responses/ForbiddenHuman' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # --- Уязвимости (Q-50) ----------------------------------------------------
+  /api/v1/devices/{id}/vulnerabilities:
+    x-enterprise: true
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Устройства]
+      summary: Уязвимости, найденные в ПО устройства
+      description: |
+        Enterprise. Сопоставление инвентаря устройства со справочником CVE.
+        Совпадение по имени ПО и шаблону версии — это подсказка оператору, а не
+        доказательство: нестандартные схемы версий сопоставляются неточно.
+      responses:
+        '200': { description: Список уязвимостей }
+        '404': { $ref: '#/components/responses/NotFound' }
+  /api/v1/provider/cve-feed:
+    x-enterprise: true
+    post:
+      tags: [Устройства]
+      summary: Загрузить фид CVE
+      description: |
+        Enterprise. Только надзорная личность (`provider_admin`) и только человеком:
+        справочник общий на инсталляцию, и его подмена меняет картину уязвимостей
+        сразу во всех тенантах.
+      responses:
+        '200': { description: Фид принят }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: token
+      description: httpOnly-кука, выставляется входом. Так работает веб-интерфейс.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Сервисный API-токен для автоматизации.
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      description: Идентификатор устройства
+      schema: { type: string, format: uuid }
+    ScreenSessionId:
+      name: sid
+      in: path
+      required: true
+      description: Идентификатор интерактивного сеанса. Прав НЕ даёт (ADR-8 п.2)
+      schema: { type: string, format: uuid }
+    Limit:
+      name: limit
+      in: query
+      description: |
+        Размер страницы. По умолчанию 50, потолок 500; значение вне диапазона
+        (0, отрицательное, больше потолка) молча приводится к умолчанию.
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+    Offset:
+      name: offset
+      in: query
+      description: Смещение от начала выдачи.
+      schema: { type: integer, minimum: 0, default: 0 }
+
+  headers:
+    TotalCount:
+      description: |
+        Общее число записей под фильтром, без учёта `limit`/`offset`. Заголовком,
+        а не полем в теле: тело остаётся массивом, поэтому существующие клиенты
+        не ломаются. На пустой странице (`offset` за концом выдачи) приходит 0 —
+        счётчик считается вместе со строками.
+      schema: { type: integer, minimum: 0 }
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос
+      content: { text/plain: { schema: { type: string } } }
+    Unauthorized:
+      description: Не аутентифицирован либо срок действия токена истёк
+      content: { text/plain: { schema: { type: string } } }
+    Forbidden:
+      description: Недостаточно прав (требуется роль `it_admin`)
+      content: { text/plain: { schema: { type: string } } }
+    ForbiddenHuman:
+      description: |
+        Недостаточно прав. Операция доступна только человеку: сервисный токен
+        получает этот ответ даже с ролью `it_admin`.
+      content: { text/plain: { schema: { type: string } } }
+    NotFound:
+      description: Не найдено
+      content: { text/plain: { schema: { type: string } } }
+    TooManyRequests:
+      description: Превышено ограничение частоты запросов
+      content: { text/plain: { schema: { type: string } } }
+
+  schemas:
+    Tenant:
+      type: object
+      required: [id, name, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Role:
+      type: string
+      enum: [viewer, it_admin]
+
+    OS:
+      type: string
+      enum: [windows, macos, linux]
+      description: |
+        Значение, которое принимают эндпоинты устройств и задач. Агент при этом
+        РАПОРТУЕТ операционную систему с заглавной (`Windows`, `macOS`), и именно в
+        таком виде она возвращается в карточке устройства.
+
+    ScriptPlatform:
+      type: string
+      enum: [macOS, Windows, linux]
+      description: |
+        ⚠️ Библиотека скриптов принимает ИМЕННО такое написание и отвергает
+        `macos`/`windows` с ответом 400. Обратите внимание на `linux` со строчной —
+        софт-политики в том же поле требуют `Linux` с заглавной (см. PolicyPlatform).
+
+    PolicyPlatform:
+      type: string
+      enum: [macOS, Windows, Linux]
+      description: |
+        ⚠️ Правила ПО принимают только такое написание, включая `Linux` с ЗАГЛАВНОЙ —
+        в отличие от библиотеки скриптов, где та же платформа пишется `linux`.
+
+        Сводка по регистру платформы, проверено на живом сервере:
+
+        | эндпоинт | что принимает |
+        |---|---|
+        | `POST /devices` | строчные (`windows`, `macos`) |
+        | `POST /devices/{id}/tasks` | НЕ проверяет, принимает любую строку |
+        | `POST`/`PUT /scripts` | `macOS`, `Windows`, `linux` |
+        | `POST /policies` | `macOS`, `Windows`, `Linux` |
+
+        Расхождение историческое. Приводить к одному виду — ломающее изменение для
+        существующих клиентов, поэтому пока задокументировано как есть.
+
+    Priority:
+      type: string
+      enum: [low, normal, high]
+      default: normal
+
+    Color:
+      type: string
+      pattern: '^#[0-9a-fA-F]{6}$'
+      example: '#3b82f6'
+
+    LockMode:
+      type: string
+      enum: [overlay, filevault]
+      default: overlay
+      description: |
+        `overlay` — полноэкранный замок с полем пароля. `filevault` — деструктивный
+        режим редакции Enterprise (снятие Secure Token на macOS).
+
+    DeviceStatus:
+      type: string
+      enum: [pending, pending_approval, enrolled, active, blocked, rejected, decommissioned]
+      description: |
+        `pending` — зарегистрировано, агент ещё не энроллился.
+        `pending_approval` — энроллилось и ждёт решения оператора.
+        `enrolled` — энроллмент завершён, сертификат выдан, но первого heartbeat
+        ещё не было. Переходное состояние: обычный heartbeat поднимает в `active`.
+        `active` — под управлением.
+        `blocked` — доступ отозван на границе, соединения агента рвутся.
+        `rejected` — отклонено при энроллменте.
+        `decommissioned` — терминальный статус после вывода из эксплуатации.
+
+    RuleType:
+      type: string
+      enum: [allowed, forbidden]
+
+    TriggerType:
+      type: string
+      enum: [schedule, event]
+
+    Identity:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+
+    DeviceGroupRef:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        color: { $ref: '#/components/schemas/Color' }
+
+    Device:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        hostname: { type: string }
+        os: { $ref: '#/components/schemas/OS' }
+        os_version: { type: string }
+        ip_address: { type: string }
+        public_ip: { type: string }
+        tenant_id:
+          type: string
+          format: uuid
+          description: >
+            Идентификатор тенанта устройства. Заполняется в
+            `GET /devices/across-tenants`; в обычном тенант-скоупнутом списке
+            обычно отсутствует.
+        status: { $ref: '#/components/schemas/DeviceStatus' }
+        lock_status:
+          type: string
+          enum: [locked, unlocked]
+          description: ЖЕЛАЕМОЕ состояние блокировки (что назначил оператор).
+        lock_actual_state:
+          type: string
+          enum: ['', locked, unlocked, lock_failed, filevault_revoked, filevault_revoke_failed]
+          description: >
+            ФАКТИЧЕСКОЕ состояние, о котором доложил агент. Отдаётся только карточкой
+            устройства (`GET /devices/{id}`), в списке отсутствует. Пусто — отчётов не
+            было. Расхождение с `lock_status` означает, что блокировка не применилась
+            (`lock_failed`) либо применена наполовину (`filevault_*`).
+        lock_actual_at: { type: string, format: date-time, nullable: true }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        enrolled_at: { type: string, format: date-time, nullable: true }
+        cert_cn: { type: string }
+        agent_version: { type: string }
+        cpu: { type: string }
+        ram_mb: { type: integer, format: int64 }
+        disk: { type: string }
+        disk_free: { type: string }
+        mac_address: { type: string }
+        serial_number: { type: string }
+        arch: { type: string }
+        console_user:
+          type: string
+          description: 'На Windows в виде `DOMAIN\user`. Пусто — за консолью никого.'
+        owner_person_id:
+          type: string
+          description: UUID карточки владельца (Person). Пусто — владелец не назначен.
+        owner_person_name:
+          type: string
+          description: ФИО владельца (для показа).
+        owner_person_email:
+          type: string
+          description: Почта владельца. Пусто — не задана.
+        outbox_unavailable:
+          type: boolean
+          description: >
+            Durable-очередь агента недоступна: отчёты о задачах, статусы блокировки и
+            security-события с устройства НЕ доходят. Признак приезжает в heartbeat —
+            единственном канале, не зависящем от очереди. Отдаётся и в списке, и в
+            карточке. `true` означает, что отсутствие событий с этого устройства
+            перестало быть свидетельством того, что на нём ничего не происходит.
+        degraded_detail:
+          type: string
+          description: >
+            Причина недоступности очереди (текст ошибки ввода-вывода), обрезанная агентом
+            до 200 байт. Пусто при `outbox_unavailable: true` допустимо — причину не
+            всегда удаётся получить.
+        degraded_since:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            Момент, с которого очередь недоступна. `null` — очередь жива. Взводится один
+            раз и не обновляется каждым heartbeat.
+        disk_encryption:
+          type: string
+          enum: ['enabled', 'disabled', '']
+        os_patch_date:
+          type: string
+          description: 'Дата вида `2006-01-02`. Пусто — неизвестно.'
+        boot_time:
+          type: integer
+          format: int64
+          description: Время загрузки в формате unix. 0 — неизвестно.
+        domain_joined: { type: string, enum: ['true', 'false', ''] }
+        tpm: { type: string, enum: ['true', 'false', ''] }
+        secure_boot: { type: string, enum: ['true', 'false', ''] }
+        groups:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceGroupRef' }
+
+    Task:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        script_content: { type: string }
+        platform: { $ref: '#/components/schemas/OS' }
+        priority: { $ref: '#/components/schemas/Priority' }
+        status:
+          type: string
+          enum: [pending, acked, completed, failed]
+          description: |
+            `pending` — создана, агенту ещё не доставлена. `acked` — агент подтвердил
+            приём. `completed` / `failed` — исполнена. Задача, застрявшая в `acked`,
+            закрывается по таймауту.
+        output: { type: string, nullable: true }
+        error_log: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        task_type:
+          type: string
+          enum: [script, lock, decommission]
+          description: |
+            ⚠️ Список задач устройства эти поля НЕ заполняет — там всегда пусто.
+            То же относится к `lock_reason`, `lock_unlock` и `lock_mode`.
+            Хеш пароля снятия (`lock_hash`) не отдаётся вовсе: он не должен попадать
+            в выдачу, доступную роли `viewer`.
+        lock_reason: { type: string }
+        lock_unlock: { type: boolean }
+        lock_mode: { $ref: '#/components/schemas/LockMode' }
+
+    Alert:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        device_hostname: { type: string }
+        alert_type: { type: string }
+        severity:
+          type: string
+          enum: [critical, high, medium, low]
+          description: |
+            Критичность, зафиксированная в момент создания алерта. Правка правил
+            по умолчанию не переписывает её у уже разобранных инцидентов — иначе
+            разбор постфактум («что мы тогда видели») стал бы невозможен.
+
+            Список отсортирован сначала по признаку принятости, затем по критичности,
+            затем по свежести: принятый critical уже разобран человеком и не должен
+            вытеснять непринятые из окна выдачи.
+        details: { type: string }
+        created_at: { type: string, format: date-time }
+        acknowledged_at: { type: string, format: date-time, nullable: true }
+
+    Script:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { $ref: '#/components/schemas/ScriptPlatform' }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ScriptInput:
+      type: object
+      required: [name, platform, content]
+      properties:
+        name: { type: string }
+        platform: { $ref: '#/components/schemas/ScriptPlatform' }
+        content: { type: string }
+
+    ScriptPolicy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        script_id: { type: string, format: uuid }
+        script_name: { type: string }
+        trigger_type: { $ref: '#/components/schemas/TriggerType' }
+        schedule_config: { type: object }
+        event_trigger_config: { type: object }
+        is_active: { type: boolean }
+        created_at: { type: string, format: date-time }
+        group_names:
+          type: array
+          items: { type: string }
+          description: Пусто — политика не таргетит ни одно устройство.
+
+    ScriptPolicyCompliance:
+      type: object
+      properties:
+        policy_id: { type: string, format: uuid }
+        in_scope: { type: integer }
+        pass: { type: integer }
+        fail: { type: integer }
+        unknown: { type: integer }
+
+    ScriptResult:
+      type: object
+      properties:
+        device_id: { type: string, format: uuid }
+        hostname: { type: string }
+        exit_code: { type: integer }
+        stdout: { type: string }
+        stderr: { type: string }
+        finished_at: { type: string, format: date-time }
+
+    PolicyRule:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        software_name: { type: string }
+        rule_type: { $ref: '#/components/schemas/RuleType' }
+        device_id: { type: string, format: uuid, nullable: true }
+        group_id: { type: string, format: uuid, nullable: true }
+        platforms:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyPlatform' }
+          description: Пусто — все платформы.
+        updated_at: { type: string, format: date-time }
+
+    SoftwarePolicyCompliance:
+      type: object
+      properties:
+        rule_id: { type: string, format: uuid }
+        in_scope:
+          type: integer
+          description: Число устройств, на которые распространяется правило
+        pass: { type: integer }
+        fail: { type: integer }
+        checked:
+          type: boolean
+          description: Была ли вообще проверка
+
+    SoftwarePolicyDeviceCompliance:
+      type: object
+      properties:
+        device_id: { type: string, format: uuid }
+        hostname: { type: string }
+        os: { $ref: '#/components/schemas/OS' }
+        status: { type: string }
+        installed: { type: boolean }
+        matched_software: { type: string }
+        matched_version: { type: string }
+        matched_scope:
+          type: string
+          description: >
+            Scope найденного совпадения: `machine` (установлено на машину, снимаемо)
+            или `user` (установлено в профиль сотрудника — нарушение засчитано, но
+            удалить нельзя: служба агента в чужой профиль не ходит). Пусто, если
+            совпадений нет или агент старее 2.6.0. Из двух совпадений в примере
+            показывается machine — оператору полезнее то, с которым можно что-то сделать.
+          enum: ['', machine, user]
+
+    DeviceGroup:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        color: { $ref: '#/components/schemas/Color' }
+        update_channel: { $ref: '#/components/schemas/UpdateChannel' }
+        created_at: { type: string, format: date-time }
+
+    DeviceCompliance:
+      type: object
+      properties:
+        device_id: { type: string, format: uuid }
+        hostname: { type: string }
+        os: { type: string }
+        os_version: { type: string }
+        agent_version: { type: string }
+        update_channel: { $ref: '#/components/schemas/UpdateChannel' }
+        status: { type: string }
+        last_seen_at: { type: string, format: date-time, nullable: true }
+        vulnerable_count: { type: integer, description: Подтверждённые уязвимости }
+        unverified_count: { type: integer, description: 'Уязвимости, которые сопоставить не удалось' }
+        compliant: { type: boolean }
+        reasons:
+          type: array
+          items:
+            type: string
+            enum: [vulnerable, unverified, stale, outdated_agent, degraded, locked]
+
+    ComplianceReport:
+      type: object
+      properties:
+        summary:
+          type: object
+          properties:
+            devices: { type: integer }
+            compliant: { type: integer }
+            non_compliant: { type: integer }
+            by_reason:
+              type: object
+              additionalProperties: { type: integer }
+            generated_at: { type: string, format: date-time }
+            stale_after_days: { type: integer }
+        devices:
+          type: array
+          items: { $ref: '#/components/schemas/DeviceCompliance' }
+
+    UpdateChannel:
+      type: string
+      enum: [stable, beta]
+      default: stable
+      description: >-
+        Канал обновлений агента. `beta` — канареечный: релиз доезжает до этих
+        устройств раньше остального парка. Канал видит и стабильные сборки, то есть
+        канарейка никогда не оказывается старее парка.
+
+    VersionCount:
+      type: object
+      properties:
+        version: { type: string, description: 'Пусто — агент ещё ни разу не отчитался' }
+        count: { type: integer }
+
+    ChannelTarget:
+      type: object
+      description: Версия, которую канал отдаёт агенту этой платформы прямо сейчас.
+      properties:
+        os: { type: string }
+        arch: { type: string }
+        version: { type: string }
+
+    ChannelRollout:
+      type: object
+      properties:
+        channel: { $ref: '#/components/schemas/UpdateChannel' }
+        groups: { type: integer, description: Групп в этом канале }
+        devices: { type: integer, description: Устройств в этом канале }
+        versions:
+          type: array
+          items: { $ref: '#/components/schemas/VersionCount' }
+        targets:
+          type: array
+          items: { $ref: '#/components/schemas/ChannelTarget' }
+
+    AgentReleaseRow:
+      type: object
+      properties:
+        os: { type: string }
+        arch: { type: string }
+        version: { type: string }
+        channel: { $ref: '#/components/schemas/UpdateChannel' }
+        sha256: { type: string }
+        created_at: { type: string, format: date-time }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/Role' }
+        created_at: { type: string, format: date-time }
+
+    APIToken:
+      type: object
+      description: Секрет не хранится и в списке не возвращается.
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        role: { $ref: '#/components/schemas/Role' }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true }
+        last_used_at: { type: string, format: date-time, nullable: true }
+
+    ScreenInputBatch:
+      type: object
+      description: |
+        Пачка событий ввода, снятых с ОДНОГО показанного кадра.
+      properties:
+        frame_width:
+          type: integer
+          description: |
+            Геометрия кадра, в котором оператор ЦЕЛИЛСЯ. Без неё пересчитать координаты в
+            рабочий стол нельзя: между ними лежит и вырезка нужного экрана, и даунскейл
+            профиля.
+        frame_height: { type: integer }
+        release_all:
+          type: boolean
+          description: |
+            Отпустить всё зажатое немедленно. Шлётся при возврате управления, при потере
+            фокуса вкладкой и при её закрытии. Не удобство, а часть контракта: потерянное
+            `key_up` оставляет сотруднику залипший модификатор на его собственной машине.
+        events:
+          type: array
+          maxItems: 512
+          items:
+            type: object
+            properties:
+              kind:
+                type: string
+                enum: [mouse_move, mouse_down, mouse_up, wheel, key_down, key_up, text]
+              x: { type: integer, description: Пиксель кадра, не рабочего стола }
+              y: { type: integer }
+              button: { type: integer, description: '0 левая, 1 средняя, 2 правая' }
+              wheel_x: { type: integer, description: '«Клики» колеса, не пиксели' }
+              wheel_y: { type: integer }
+              code:
+                type: string
+                description: |
+                  ФИЗИЧЕСКАЯ клавиша в терминах W3C `KeyboardEvent.code` («KeyA», «Enter»,
+                  «ShiftLeft»). Именно физическая: раскладка у сотрудника своя, и «нажать
+                  ту же кнопку» переносимо, а «нажать букву Ы» — нет.
+              text:
+                type: string
+                description: |
+                  Печатный ввод текстом — минуя раскладку. Отдельно от клавиш, потому что
+                  символ, набранный через IME или мёртвую клавишу, физической клавише не
+                  соответствует вовсе.
+
+    ScreenInputEntry:
+      type: object
+      description: Строка журнала ввода (§9.21 контракта удалённого стола).
+      properties:
+        kind:
+          type: string
+          enum: [control_granted, control_returned, click, key, text, scroll, move]
+        detail:
+          type: string
+          description: |
+            Код клавиши или кнопка. Для `kind=text` ПУСТО: печатные символы не пишутся.
+        events:
+          type: integer
+          description: |
+            Сколько событий свёрнуто в строку. Для `kind=text` — количество введённых
+            символов, и это всё, что о них известно.
+        offset_ms:
+          type: integer
+          format: int64
+          description: |
+            От начала сеанса, а не абсолютное время: журнал смотрят рядом с записью, и «на
+            14-й минуте» полезнее, чем «в 14:37:02».
+        at: { type: string, format: date-time }
+
+    ScreenControlWindow:
+      type: object
+      description: |
+        Интервал, в течение которого машиной управлял оператор.
+      properties:
+        session_id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        device_name: { type: string }
+        operator_email: { type: string }
+        reason: { type: string }
+        mode: { type: string, enum: [unattended, consent_required] }
+        from: { type: string, format: date-time }
+        to:
+          type: string
+          format: date-time
+          description: |
+            Раньшее из возврата управления и конца сеанса. Отсутствует, когда управление
+            идёт прямо сейчас.
+        input_events:
+          type: integer
+          format: int64
+          description: Сколько строк журнала ввода набралось за окно
+
+    ScreenSession:
+      type: object
+      description: |
+        Строка журнала интерактивных сеансов. Именно она, а не строка задачи, — источник
+        истины о жизни сеанса: результат задачи отдаётся сразу по исходу ЗАПРОСА, иначе
+        часовой сеанс помечался бы провалившимся на пятнадцатой минуте.
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        operator_id: { type: string, format: uuid }
+        operator_email: { type: string }
+        reason: { type: string, description: Повод оператора; обязателен }
+        mode:
+          type: string
+          enum: [unattended, consent_required]
+          description: Режим доступа — свойство тенанта, а не константа кода
+        profile: { type: string, description: 'Профиль потолков; в Ф1 всегда low' }
+        status:
+          type: string
+          enum: [requested, active, ended]
+        end_reason:
+          type: string
+          description: |
+            Код причины завершения (USER_TERMINATED, SESSION_LOCKED, VIEWER_GONE,
+            DEVICE_CUT_OFF, OPERATOR_REVOKED, WAYLAND_UNSUPPORTED, ...). Строка, а не
+            enum: enum превратил бы незнакомую причину в UNSPECIFIED, то есть потерял бы
+            ровно то, ради чего код и заводился.
+        end_detail: { type: string }
+        task_id: { type: string, format: uuid }
+        width: { type: integer }
+        height: { type: integer }
+        frames: { type: integer, format: int64 }
+        bytes: { type: integer, format: int64 }
+        has_recording: { type: boolean }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: string, format: date-time }
+        control:
+          type: boolean
+          description: |
+            Сеанс запрошен С УПРАВЛЕНИЕМ. Объявляется приглашением ОДИН раз: область
+            сеанса расширить на лету нельзя, поэтому «взять управление» — это всегда
+            новый сеанс.
+        control_returned_at:
+          type: string
+          format: date-time
+          description: |
+            Момент возврата управления сотруднику. Закрывает окно, за которое отвечает
+            оператор, раньше конца сеанса.
+        consent_state:
+          type: string
+          enum: [GRANTED, DENIED, TIMEOUT, UNAVAILABLE]
+          description: |
+            Зафиксированный исход согласия сотрудника. Отсутствует, когда вопрос не
+            задавался (режим unattended) — это НЕ «нет ответа»: сеанс без спрошенного
+            согласия и сеанс, где сотрудник промолчал, разные события.
+            TIMEOUT — промолчал (по контракту отказ, но чаще означает «отошёл»),
+            UNAVAILABLE — спросить было негде.
+        consent_at: { type: string, format: date-time }
+
+    ScreenRecordingManifest:
+      type: object
+      description: Спутник frames.bin; путь на диске наружу не отдаётся.
+      properties:
+        version: { type: integer }
+        session_id: { type: string, format: uuid }
+        width: { type: integer }
+        height: { type: integer }
+        started_at: { type: string, format: date-time }
+        duration_ms: { type: integer, format: int64 }
+        frames: { type: integer }
+        end_reason: { type: string }
+        truncated:
+          type: boolean
+          description: Достигнута квота записи на сеанс — запись оборвана, но сеанс шёл дальше
+        keyframes:
+          type: array
+          description: Точки, с которых можно начать воспроизведение
+          items:
+            type: object
+            properties:
+              seq: { type: integer, format: int64 }
+              rel_ms: { type: integer, format: int64 }
+              offset: { type: integer, format: int64 }
+
+    EscrowRecord:
+      type: object
+      description: Строка эскроу БЕЗ шифртекста. На устройстве их легитимно несколько одного типа — перевыпуск ротирует секрет, а старые строки остаются.
+      properties:
+        id: { type: string, format: uuid }
+        secret_type: { type: string, enum: [prk, secondary_cred] }
+        recipient_fpr: { type: string, description: 'fpr публичного age-recipient, которым запечатан blob' }
+        key_scheme: { type: string, example: age-v1 }
+        agent_version: { type: string }
+        escrowed_at: { type: string, format: date-time }
+        revealed_at: { type: string, format: date-time, description: 'Последняя выгрузка; полная история — в аудите' }
+        revealed_by: { type: string, description: 'Email того, кто выгружал' }
+        latest: { type: boolean, description: 'Эту строку отдаст reveal для своего secret_type' }
+
+    LicenseStatus:
+      type: object
+      description: >
+        Снимок энтайтлмента на момент запроса (Enterprise). Секретов не содержит:
+        сам blob лицензии обратно не отдаётся.
+      properties:
+        configured: { type: boolean, description: 'Лицензия валидно подписана и активирована — возможно, при этом истекла' }
+        valid: { type: boolean, description: 'Живой энтайтлмент: считается тем же выражением, что и боевой гейт' }
+        licensee: { type: string }
+        edition: { type: string }
+        features: { type: array, items: { type: string }, description: 'Покрытые возможности, напр. filevault' }
+        expires_at: { type: string, format: date-time }
+        seats: { type: integer, description: 'Историческое поле; модель лицензирования плоская, по времени' }
+
+
+    AdminAccessEvidence:
+      type: object
+      properties:
+        baseline_captured_at: { type: string, format: date-time, nullable: true }
+        changes_final_at: { type: string, format: date-time, nullable: true }
+        changes_summary: { type: object }
+        changes_completeness: { type: string }
+        changes_rebooted: { type: boolean }
+        changes_truncated: { type: boolean }
+        software_health: { type: string }
+        services_health: { type: string }
+        last_window_seq: { type: integer }
+
+    AdminSessionChange:
+      type: object
+      properties:
+        window_seq: { type: integer }
+        kind: { type: string }
+        subject: { type: string }
+        display_name: { type: string }
+        identity_key: { type: string }
+        old_value: { type: string }
+        new_value: { type: string }
+        vendor: { type: string }
+        scope: { type: string }
+        attribution: { type: string }
+        attribution_reason: { type: string }
+        observed_at: { type: string, format: date-time }
+
+    DirectoryConfig:
+      type: object
+      description: >
+        Подключение к LDAP/Active Directory (Enterprise). Bind-пароль в объект не
+        входит: он передаётся отдельным полем `bind_password` при сохранении и
+        обратно не возвращается.
+      properties:
+        enabled: { type: boolean }
+        url: { type: string, example: 'ldaps://dc.example.com:636' }
+        bind_dn: { type: string }
+        base_dn: { type: string }
+        user_filter:
+          type: string
+          example: '(&(objectClass=user)(objectCategory=person))'
+        sync_interval_min:
+          type: integer
+          description: 0 — только ручная синхронизация
+        has_password:
+          type: boolean
+          description: Только в ответе — задан ли bind-пароль
+        start_tls:
+          type: boolean
+          description: >
+            Поднять TLS на открытом `ldap://`-соединении (апгрейд до bind, чтобы
+            bind-пароль не шёл открытым текстом). Взаимоисключающ с `ldaps://` —
+            там TLS уже поднят, комбинация отбивается с 400.
+        has_ca_cert:
+          type: boolean
+          description: >
+            Только в ответе — задан ли корневой сертификат каталога. Сам PEM наружу
+            не возвращается никогда, передаётся write-only полем `ca_cert_pem`.
+        login_enabled:
+          type: boolean
+          description: >
+            Принимать пароль каталога на входе в панель (`POST /api/v1/auth/login`).
+            Отдельно от `enabled`: синк персон и приём пароля на вход различаются по
+            риску. Требует `enabled` и шифрованного канала (`ldaps://` либо `ldap://`
+            со `start_tls`) — иначе simple bind унёс бы в открытую пароль каждого
+            входящего, а не только сервисной учётки; обе комбинации отбиваются с 400.
+            Входить могут ТОЛЬКО уже существующие пользователи панели: каталог
+            подтверждает пароль, но учётных записей не создаёт и роль из групп AD не
+            назначает.
+
+    DirectorySyncResult:
+      type: object
+      properties:
+        synced: { type: integer, description: Персон записано/обновлено }
+        disabled: { type: integer, description: Помечено отключёнными (исчезли из выдачи) }
+        matched: { type: integer, description: Устройств привязано к владельцу }
+
+    Person:
+      type: object
+      description: >
+        Человек, за которым числятся устройства. Входа в панель у него НЕТ — аккаунты
+        (users) нужны тем, кто в неё ходит. Во Free карточку заводит оператор, в
+        Enterprise её приносит синк каталога; поля каталога у ручных карточек пусты.
+      properties:
+        id: { type: string, format: uuid }
+        display_name: { type: string, description: ФИО }
+        email: { type: string }
+        source:
+          type: string
+          enum: [ldap, manual]
+          description: >
+            Откуда карточка: `ldap` — принёс синк (правится в AD), `manual` — завёл
+            оператор (правится и удаляется в панели).
+        object_guid: { type: string, description: Канон привязки, стабилен при переименовании }
+        object_sid: { type: string }
+        sam_account: { type: string }
+        user_principal: { type: string }
+        distinguished_name: { type: string }
+        disabled: { type: boolean, description: Учётка отключена в каталоге либо исчезла из выдачи }
+
+    AdminAccessRequest:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        requested_by: { type: string }
+        status: { type: string }
+        reason: { type: string }
+        requested_at: { type: string, format: date-time }
+        pending_expires_at: { type: string, format: date-time }
+        decided_by: { type: string, nullable: true }
+        decided_at: { type: string, format: date-time, nullable: true }
+        granted_at: { type: string, format: date-time, nullable: true }
+        expires_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+
+    AuditEntry:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid, nullable: true }
+        user_email: { type: string }
+        action: { type: string }
+        target_type: { type: string }
+        target_id: { type: string }
+        details: { type: object }
+        created_at: { type: string, format: date-time }
+
+    # --- Провайдеры SSO и приёмники SIEM (Enterprise) ------------------------
+    # Секреты в этих схемах отсутствуют КОНСТРУКТИВНО, а не «не заполняются»:
+    # client_secret, приватник SP и секрет подписи вебхука не покидают сервер ни в
+    # каком ответе, и наружу видно только признак «задан».
+
+    OIDCProvider:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        client_id: { type: string }
+        issuer_url: { type: string }
+        redirect_uri: { type: string }
+        enabled: { type: boolean }
+        has_secret: { type: boolean, description: client_secret задан; сам секрет не отдаётся }
+
+    OIDCProviderInput:
+      type: object
+      required: [name, client_id, issuer_url, redirect_uri]
+      properties:
+        name: { type: string }
+        client_id: { type: string }
+        client_secret: { type: string, description: При обновлении пусто = не менять }
+        issuer_url: { type: string, description: Обязательно https (http только на loopback) }
+        redirect_uri: { type: string }
+        enabled: { type: boolean }
+
+    SAMLProvider:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        idp_metadata_url: { type: string }
+        idp_metadata_xml: { type: string, description: Только в карточке одного провайдера }
+        has_idp_metadata_xml: { type: boolean }
+        sp_entity_id: { type: string }
+        sp_acs_url: { type: string }
+        sp_metadata_url: { type: string }
+        sp_certificate: { type: string, description: PEM ПУБЛИЧНОГО сертификата SP }
+        login_url: { type: string, description: Ссылка начала входа для сотрудников }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    SAMLProviderInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        idp_metadata_url: { type: string, description: Обязательно https (http только на loopback) }
+        idp_metadata_xml: { type: string, description: Альтернатива адресу — для IdP в закрытом контуре }
+        sp_entity_id: { type: string, description: Пусто = адрес наших метаданных }
+        enabled: { type: boolean }
+
+    SIEMIntegration:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type: { type: string, enum: [webhook, syslog, cef] }
+        url: { type: string }
+        has_secret: { type: boolean, description: Подпись настроена; сам секрет не отдаётся }
+        event_filter:
+          type: array
+          items: { type: string }
+          description: Действия журнала для выгрузки. ПУСТОЙ массив = все события.
+        enabled: { type: boolean }
+        last_delivery_at: { type: string, format: date-time, nullable: true }
+        last_status: { type: string, enum: ['', ok, error] }
+        last_error: { type: string }
+        error_count: { type: integer, format: int64 }
+        delivered_count: { type: integer, format: int64 }
+
+    SIEMIntegrationInput:
+      type: object
+      required: [type, url]
+      properties:
+        type:
+          type: string
+          enum: [webhook, syslog, cef]
+          description: |
+            `webhook` — JSON по http/https; `syslog` — текст RFC 5424 по udp/tcp;
+            `cef` — CEF поверх того же транспорта. До миграции 063 тип `syslog`
+            слал CEF; существующие строки при накатке переехали в `cef`.
+        url:
+          type: string
+          description: |
+            Для webhook — http:// или https://, для syslog/cef — udp:// или tcp://
+            (порт по умолчанию 514). Прочие схемы отвергаются.
+        secret:
+          type: string
+          description: |
+            Ключ HMAC-SHA256 подписи тела вебхука (`X-RoutineOps-Signature` над
+            «timestamp.body»). При обновлении пусто = не менять.
+        clear_secret: { type: boolean, description: Явно снять подпись }
+        event_filter:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean }

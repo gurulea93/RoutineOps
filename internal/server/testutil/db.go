@@ -1,0 +1,217 @@
+package testutil
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/Floodww/RoutineOps/internal/server/tenancy"
+)
+
+// NewDSNWithCleanup возвращает DSN и функцию очистки — для использования в TestMain.
+// Если установлена TEST_POSTGRES_DSN (admin DSN), создаёт уникальную БД и возвращает
+// DSN на неё; cleanup дропает БД. Это даёт изоляцию между пакетами при общем сервере.
+//
+// Миграции катятся под owner'ом (mdm / superuser). После миграций создаётся роль
+// mdm_app (NOSUPERUSER NOBYPASSRLS) и DSN переключается на неё — тесты видят RLS
+// ровно так, как видит его приложение в проде (Q-14).
+func NewDSNWithCleanup() (dsn string, cleanup func()) {
+	if adminDSN := os.Getenv("TEST_POSTGRES_DSN"); adminDSN != "" {
+		dsn, drop := createTempDatabase(adminDSN)
+		runMigrationsCtx(context.Background(), dsn)
+		dsn = createAppRole(context.Background(), dsn)
+		return dsn, drop
+	}
+
+	ctx := context.Background()
+	c, err := postgres.Run(ctx,
+		"postgres:16-alpine",
+		postgres.WithDatabase("mdm_test"),
+		postgres.WithUsername("mdm"),
+		postgres.WithPassword("mdm"),
+		// trust для всех локальных подключений: mdm_app (049) может подключаться
+		// без пароля. В проде pg_hba.conf управляется отдельно.
+		testcontainers.WithEnv(map[string]string{"POSTGRES_HOST_AUTH_METHOD": "trust"}),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+		),
+	)
+	if err != nil {
+		panic("testcontainers postgres: " + err.Error())
+	}
+	dsn, err = c.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		panic("connection string: " + err.Error())
+	}
+	runMigrationsCtx(ctx, dsn)
+	dsn = createAppRole(ctx, dsn)
+	return dsn, func() { _ = c.Terminate(ctx) }
+}
+
+// createTempDatabase создаёт уникальную БД на сервере, указанном в adminDSN,
+// и возвращает DSN на неё + функцию-дропалку.
+func createTempDatabase(adminDSN string) (dsn string, drop func()) {
+	ctx := context.Background()
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		panic("rand: " + err.Error())
+	}
+	dbName := "mdm_test_" + hex.EncodeToString(buf)
+
+	conn, err := pgx.Connect(ctx, adminDSN)
+	if err != nil {
+		panic("admin connect: " + err.Error())
+	}
+	if _, err := conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %q", dbName)); err != nil {
+		_ = conn.Close(ctx)
+		panic("CREATE DATABASE: " + err.Error())
+	}
+	_ = conn.Close(ctx)
+
+	u, err := url.Parse(adminDSN)
+	if err != nil {
+		panic("parse adminDSN: " + err.Error())
+	}
+	u.Path = "/" + dbName
+	dsn = u.String()
+
+	drop = func() {
+		c, err := pgx.Connect(ctx, adminDSN)
+		if err != nil {
+			return
+		}
+		defer c.Close(ctx)
+		_, _ = c.Exec(ctx, fmt.Sprintf("DROP DATABASE IF EXISTS %q WITH (FORCE)", dbName))
+	}
+	return dsn, drop
+}
+
+// appRoleTestPassword — пароль тестовой app-роли. Не секрет: роль создаётся в
+// одноразовой БД, которую cleanup дропает. Нужен потому, что внешний Postgres
+// (CI, локальный compose) требует аутентификацию, а свой контейнер поднимается с trust.
+const appRoleTestPassword = "mdm_app_test"
+
+// createAppRole создаёт роль mdm_app (NOSUPERUSER NOBYPASSRLS) в тестовой БД и
+// возвращает DSN с этой ролью. Зеркалит миграцию 049_app_role.sql: тесты ходят
+// под ограниченной ролью → RLS действует, rls_test не скипает.
+func createAppRole(ctx context.Context, ownerDSN string) string {
+	conn, err := pgx.Connect(ctx, ownerDSN)
+	if err != nil {
+		panic("createAppRole connect: " + err.Error())
+	}
+	defer conn.Close(ctx)
+
+	// Имя БД нужно для GRANT CONNECT. Узнаём из текущего подключения.
+	var dbName string
+	if err := conn.QueryRow(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
+		panic("createAppRole current_database: " + err.Error())
+	}
+
+	stmts := []string{
+		"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mdm_app') THEN CREATE ROLE mdm_app LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE; END IF; END $$",
+		fmt.Sprintf("GRANT CONNECT ON DATABASE %q TO mdm_app", dbName),
+		"GRANT USAGE ON SCHEMA public TO mdm_app",
+		"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO mdm_app",
+		"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO mdm_app",
+		"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO mdm_app",
+		// Дефолтный GUC: тесты, не использующие BindTenant явно, попадают в скоуп
+		// DefaultTenantID. На проде BindTenant вызывается всегда; ALTER ROLE SET —
+		// страховка от забытого скоупа (fail-safe → видеть только свой тенант, а не всё).
+		"ALTER ROLE mdm_app SET routineops.tenant_id = '" + tenancy.DefaultTenantID + "'",
+		// 🔴 Пароль обязателен, и вот почему его отсутствие пряталось. Свой контейнер мы
+		// поднимаем с POSTGRES_HOST_AUTH_METHOD=trust — там пароль не спрашивают, и
+		// беспарольная роль подключалась. А ВНЕШНИЙ сервер из TEST_POSTGRES_DSN (сервис
+		// postgres в CI, локальный docker compose) живёт с дефолтным scram-sha-256, и та
+		// же роль получала «password authentication failed for user mdm_app» — то есть
+		// весь пакет api падал в TestMain ещё до первого теста. Локально гейт при этом
+		// был зелёным: без TEST_POSTGRES_DSN путь уходит в testcontainers с trust.
+		// Секретом этот пароль не является: роль живёт в одноразовой тестовой БД.
+		"ALTER ROLE mdm_app PASSWORD '" + appRoleTestPassword + "'",
+	}
+	for _, s := range stmts {
+		if err := execRoleStmt(ctx, conn, s); err != nil {
+			panic("createAppRole: " + s[:40] + "…: " + err.Error())
+		}
+	}
+
+	// Переписываем userinfo в DSN на mdm_app.
+	u, err := url.Parse(ownerDSN)
+	if err != nil {
+		panic("createAppRole parse DSN: " + err.Error())
+	}
+	u.User = url.UserPassword("mdm_app", appRoleTestPassword)
+	return u.String()
+}
+
+// execRoleStmt повторяет оператор, проигравший гонку за кластерную роль. Пакеты тестов
+// идут параллельно, каждый в своей БД, но на ОДНОМ сервере (TEST_POSTGRES_DSN в CI), а
+// mdm_app — одна на кластер: одновременные ALTER ROLE правят одну строку pg_authid, и
+// второй получает «tuple concurrently updated» (XX000), одновременный CREATE ROLE —
+// unique_violation (23505). Advisory-лок не спасает: его пространство — одна БД.
+// Значения у всех одинаковые, поэтому повтор безопасен.
+func execRoleStmt(ctx context.Context, conn *pgx.Conn, sql string) error {
+	var err error
+	for attempt := 1; attempt <= 10; attempt++ {
+		if _, err = conn.Exec(ctx, sql); err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || (pgErr.Code != "XX000" && pgErr.Code != "23505") {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * 20 * time.Millisecond)
+	}
+	return err
+}
+
+func runMigrationsCtx(ctx context.Context, dsn string) {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		panic("connect for migrations: " + err.Error())
+	}
+	defer conn.Close(ctx)
+
+	root := findRoot()
+	entries, _ := os.ReadDir(filepath.Join(root, "migrations"))
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			files = append(files, filepath.Join(root, "migrations", e.Name()))
+		}
+	}
+	sort.Strings(files)
+	for _, f := range files {
+		sql, _ := os.ReadFile(f)
+		if _, err := conn.Exec(ctx, string(sql)); err != nil {
+			panic("migration " + filepath.Base(f) + ": " + err.Error())
+		}
+	}
+}
+
+func findRoot() string {
+	dir, _ := os.Getwd()
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			panic("go.mod not found")
+		}
+		dir = parent
+	}
+}

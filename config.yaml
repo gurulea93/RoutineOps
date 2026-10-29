@@ -1,0 +1,54 @@
+# MDM Server Configuration
+# Copy this file and fill in your values before deploying.
+
+server:
+  # Address for the HTTPS REST API
+  http_addr: ":8081"
+  # Address for the gRPC agent gateway (mTLS)
+  grpc_addr: ":50051"
+  # Publicly reachable URL (used in invite/reset email links and installer scripts)
+  public_url: "https://your-domain.com"
+
+tls:
+  # Server TLS certificate and key (for HTTPS and gRPC)
+  cert: "certs/server.crt"
+  key:  "certs/server.key"
+  # CA certificate used to sign agent client certs (mTLS)
+  ca_cert: "certs/ca.crt"
+  # CA private key — required for enrollment. Leave empty to disable enrollment.
+  ca_key:  "certs/ca.key"
+
+database:
+  # PostgreSQL connection string
+  dsn: "postgres://mdm:changeme@localhost:5432/mdm?sslmode=disable"
+
+redis:
+  # Redis address (used for task queue)
+  addr: "localhost:6379"
+
+auth:
+  # Secret key for signing JWT tokens — change this in production!
+  jwt_secret: "change-me-in-production"
+
+admin:
+  # If set, creates this admin user on first startup (idempotent)
+  seed_email:    ""
+  seed_password: ""
+
+smtp:
+  # SMTP server for sending invite and password-reset emails.
+  # Leave host empty to disable email sending.
+  host: ""
+  port: "587"
+  user: ""
+  pass: ""
+  # Sender address shown in emails
+  from: "noreply@your-domain.com"
+
+telegram:
+  # Telegram bot token for alert notifications. Leave empty to disable.
+  bot_token: ""
+
+releases:
+  # Directory where agent binaries are stored for self-update
+  dir: "./releases"

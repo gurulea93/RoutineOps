@@ -1,0 +1,707 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Отменять устаревший прогон при новом пуше — только для PR/веток.
+# На main НЕ отменяем: каждый коммит в main должен полностью пройти проверки
+# (частые пуши не должны гасить длинную race-джобу предыдущего коммита).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: vet · build · test (race)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mdm_test
+          POSTGRES_USER: mdm
+          POSTGRES_PASSWORD: mdm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mdm -d mdm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt (должно быть пусто)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Не отформатировано (gofmt):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # Гарды доков: оба скрипта объявляли себя CI-гардами, но не запускались нигде.
+      # Публичный док-срез — существование файлов whitelist, leak-паттерны, замкнутость
+      # ссылок. Спецификация API — резолвимость $ref и совпадение набора эндпоинтов
+      # с маршрутами в коде (руками написанная спека тихо расходится именно так).
+      - name: guards (публичные доки · спецификация API)
+        run: |
+          # PyYAML — зависимость check-openapi.sh, объявляем её ЯВНО. Раньше гард
+          # молча полагался на то, что она случайно есть в образе ubuntu-latest: при
+          # её отсутствии он печатал «ПРОПУСК» и выходил с кодом 0, то есть проверял
+          # ноль. Теперь скрипт fail-closed, и без этой строки любое обновление
+          # образа или добавление setup-python роняло бы весь пайплайн.
+          # Ставим системным пакетом, а НЕ `pip install`: с PEP 668 интерпретатор в
+          # свежих образах помечен externally-managed, и pip в него отказывается
+          # ставить (error: externally-managed-environment) — фолбэк сработал бы
+          # ровно в тот момент, когда он нужен, и уронил бы пайплайн вместо починки.
+          python3 -c 'import yaml' 2>/dev/null \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
+          python3 -c 'import yaml' || { echo "PyYAML недоступен — гард спецификации API не может работать" >&2; exit 1; }
+          # check-public-docs.sh и его whitelist вырезаются из Free-среза
+          # (export-free.sh, шаг 4) — это мейнтейнерский тулинг. В срезе гард
+          # и не нужен: он проверяет список, по которому срез и сделан.
+          if [ -f scripts/check-public-docs.sh ]; then
+            bash scripts/check-public-docs.sh
+          else
+            echo "check-public-docs.sh отсутствует (Free-срез) — пропуск"
+          fi
+          bash scripts/check-openapi.sh
+
+      # Скомпилированные бинари в дереве. Тот же класс, что и гарды ниже — «ревью это не
+      # ловит по построению»: у бинаря нет диффа, `git add -A` забирает его молча, а
+      # `go build ./cmd/...` кладёт исполняемые файлы прямо в корень репозитория. Так
+      # уехали 37 МБ тремя коммитами, и увидел их человек, а не проверка.
+      - name: no-binaries (артефакты сборки в репозитории)
+        run: sh scripts/check-no-binaries.sh
+
+      # Guard open-core: canary-либы (age → escrow, go-ldap → каталог) и enterprise-пакеты
+      # не должны попадать в граф зависимостей шипаемых free-бинарей. Job собирается БЕЗ
+      # -tags enterprise, то есть ровно в той конфигурации, которую гард и проверяет.
+      # До сих пор запускался только руками перед пушем (server/README.md), а пушим мы
+      # прямо в main — между «забыл прогнать» и enterprise-кодом в публичном репозитории
+      # не было ни одного автоматического барьера.
+      - name: leak-guard (enterprise → open-core)
+        run: sh scripts/check-oss-no-enterprise.sh
+
+      # Тот же класс проблемы, что и у гардов выше, только по другой оси: leak-скан
+      # Free-среза (имена, внутренние хосты/IP, процесс-ссылки на приватные доки) жил
+      # ТОЛЬКО внутри export-free.sh, а тот гоняется руками и лишь перед публикацией.
+      # Утечки поэтому копились неделями и всплывали пачкой: 28.07 один прогон дал
+      # сразу четыре блокера — комментарии и одна тестовая константа, каждый из
+      # которых стоил бы минуты, поймай его коммит-в-коммит.
+      # --scan-only делает срез (шаги 1-4b) и гоняет V1/V4/V4b — чистая работа с
+      # текстом: ни protoc, ни npm, ни сборки. Про НЕпокрытое (V4c, бинари) шаг
+      # печатает явно — «leak-скан» в логе не должен читаться как «проверено всё».
+      # export-free.sh — мейнтейнерский тулинг, в сам срез он не попадает (как и
+      # check-public-docs.sh выше). В публичном репозитории шаг падал `No such file`
+      # с кодом 127 — то есть красный CI на здоровом коде. Пропуск ЯВНЫЙ: в срезе
+      # сканировать нечего, срез уже сделан этим же скриптом.
+      - name: leak-скан Free-среза (утечки в публичный код)
+        run: |
+          if [ -f scripts/export-free.sh ]; then
+            bash scripts/export-free.sh --scan-only
+          else
+            echo "::notice::export-free.sh отсутствует (Free-срез) — leak-скан пропущен"
+          fi
+
+      # Регрессия из поля (13.07): install.sh был идемпотентен настолько, что
+      # ИСПРАВЛЕННЫЙ адрес сервера никуда не доезжал — опечатка в цифре IP стоила дня.
+      # Тест закрывает и обратную половину (CA, секреты и БД трогать нельзя), но до
+      # сих пор запускался руками. Docker и hostname в нём заглушки, нужен только
+      # bash+openssl — на раннере это секунды.
+      - name: install.sh — реконсиляция адресов и секретов
+        run: bash scripts/test-install-readdress.sh
+
+      # Свежесть ТРЕКНУТЫХ установщиков. Отдельная поверхность от самообновления парка:
+      # install.sh/update.sh копируют эти файлы в releases/ безусловно, оттуда их отдаёт
+      # кнопка «Скачать MSI/PKG», и они же уезжают в публичный срез байт-в-байт. Парк при
+      # этом здоров и про них не знает — поэтому отставание ничем себя не проявляло.
+      # Поймано 05.08.2026: PKG был 2.6.0, MSI 2.5.9.0 с 03.08.
+      #
+      # Зависимости объявлены ЯВНО, как PyYAML у гарда доков выше: скрипт fail-closed и
+      # без инструментов отказывает, а не печатает «пропуск» с кодом 0. msitools читает
+      # ProductVersion из MSI, libarchive-tools (bsdtar) распаковывает xar-архив .pkg —
+      # GNU tar в образе xar не умеет.
+      - name: версии установщиков в репозитории == AGENT_VERSION
+        run: |
+          command -v msiinfo >/dev/null 2>&1 && command -v bsdtar >/dev/null 2>&1 \
+            || { sudo apt-get update -qq && sudo apt-get install -y -qq msitools libarchive-tools; }
+          bash scripts/check-installer-versions.sh
+
+      - name: build
+        run: go build ./...
+
+      - name: test (race) + coverage gate
+        env:
+          TEST_POSTGRES_DSN: postgres://mdm:mdm@localhost:5432/mdm_test?sslmode=disable
+        run: |
+          # -coverpkg=./... инструментирует все пакеты модуля при каждом тест-бинаре,
+          # поэтому интеграционные тесты (gateway→storage и т.п.) считаются в агрегате.
+          go test -race -coverprofile=coverage.out -covermode=atomic -coverpkg=./... ./...
+          # Сам гейт — в scripts/coverage-gate.sh: джоб теперь два (open-core и
+          # enterprise), и держать двадцать строк awk в двух местах значит получить
+          # два РАЗНЫХ гейта при первой же правке исключений.
+          bash scripts/coverage-gate.sh coverage.out 70 55 "open-core"
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+
+  test-windows:
+    name: test (windows · cert store)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Runtime-проверка Windows Certificate Store провайдера (NCrypt-подпись):
+      # платформенный код, который нельзя прогнать на ubuntu/macOS. Интеграционный
+      # тест сам создаёт/чистит самоподписанный серт с CNG-ключом в CurrentUser\My.
+      - name: test keystore (windows)
+        run: go test -v -timeout 2m ./internal/agent/keystore/...
+
+      # Windows-tagged тесты decommission (батч-делетер, resolveInstallDir, контракт с
+      # именем службы) не компилируются на ubuntu, поэтому в основном job не гоняются
+      # вообще — без этого шага регрессия сноса ловилась бы только руками на стенде.
+      - name: test decommission (windows)
+        run: go test -v -timeout 2m ./internal/agent/decommission/...
+
+      # Вывод CLI-веток у -H windowsgui-бинаря. Проверяется развилка attachParentConsole:
+      # перенаправление, заданное родителем (файл, пайп), перебивать нельзя, а консольный
+      # и невалидный дескриптор — обязано. Полевая цена ошибки уже заплачена: `agent
+      # version` отдавал НОЛЬ БАЙТ в -RedirectStandardOutput, а screen-probe отвечала
+      # только кодом возврата — то есть диагностика захвата на Windows не работала вовсе.
+      # Тест не enterprise-only: он про подсистему бинаря, а не про удалённый стол, и в
+      # публичном срезе обязан гоняться так же.
+      - name: test вывода CLI (windows, GUI-subsystem)
+        run: go test -v -timeout 2m -run TestRedirectedToFileRespectsParentChoice ./cmd/agent/
+
+      # Полнодуплексность канала сеанса. Дефект, ради которого шаг заведён, стоил всей
+      # приёмки удалённого стола: синхронные хэндлы именованного канала заставляли
+      # Windows сериализовать чтение и запись по одному файловому объекту, и первый же
+      # кадр не уходил НИКОГДА — при живом сеансе, живом процессе и нулевых ошибках.
+      # Проверить это можно только на Windows и только на настоящем канале: net.Pipe и
+      # posix-транспорт полнодуплексны, то есть весь остальной набор к дефекту слеп.
+      #
+      # Гард на срез (см. правило «живой CI — только публичный репозиторий»): пакет
+      # enterprise-тегованный, в срезе его исходников нет, и безусловный шаг падал бы там
+      # на здоровом дереве. Маркер — сам файл транспорта, а не переменная окружения.
+      - name: test канала сеанса (windows, enterprise)
+        shell: bash
+        run: |
+          if [ -f internal/agent/winsession/pipe_windows.go ]; then
+            go test -v -timeout 3m -tags enterprise ./internal/agent/winsession/...
+          else
+            echo "::notice::winsession/pipe_windows.go отсутствует (Free-срез) — гейт канала сеанса пропущен"
+          fi
+
+  windows-msi:
+    name: windows · MSI build + install
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Сборка MSI-инсталлятора (WiX v4) — валидатор корректности авторинга.
+      # enroll требует живого сервера, поэтому ставим без токена (раскладка
+      # файлов), а регистрацию службы в SCM проверяем прямым `agent install`.
+      - name: build agent.exe (windows/amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        # -H windowsgui — та же подсистема, что у боевого бинаря (Makefile build-win).
+        # Без неё exe получается консольным, cmd.exe его ДОЖИДАЕТСЯ, и шаг с uninstall.bat
+        # проверял бы поведение, которого в поле нет: там GUI-subsystem, и без start /wait
+        # батник уехал бы вперёд живого msiexec. Гейт обязан стоять на той же границе.
+        run: go build -ldflags "-H windowsgui" -o installer/windows/agent.exe ./cmd/agent
+
+      - name: stub ca.crt для упаковки
+        shell: pwsh
+        run: Set-Content -Path installer/windows/ca.crt -Value "MDM-CI-PLACEHOLDER-CA"
+
+      - name: install WiX
+        # Пин на v4 (схема agent.wxs — v4/wxs). v6+/v7 требуют принятия OSMF EULA
+        # и валятся в CI (WIX7015).
+        run: dotnet tool install --global wix --version 4.0.5
+
+      - name: wix build agent.msi
+        # -arch x64: иначе пакет x86 и ProgramFiles64Folder уезжает в Program Files (x86).
+        # UninstallBat — тот же файл, что кладёт боевой авторинг. Скрипт ручного снятия
+        # обязан приезжать НА ДИСК: пока его там не было, администратор искал его в
+        # исходниках и копировал из браузера, а копипаст ломает переносы строк.
+        run: wix build installer/windows/agent.wxs -arch x64 -d Version=0.0.0 -d AgentExe=installer/windows/agent.exe -d CaCert=installer/windows/ca.crt -d UninstallBat=build/msi/uninstall.bat -o agent.msi
+
+      # До сих пор CI собирал ТОЛЬКО валидатор — файл, который никуда не едет.
+      # Боевой авторинг (build/msi/mdm-agent.wxs, его собирает build-msi.ps1) не
+      # проверялся ничем, хотя именно он уходит на парк: опечатка в нём всплывала
+      # бы на релизной сборке, а не в PR. Нужен util-extension: боевой источник
+      # зовёт WixQuietExec для enroll/uninstall.
+      #
+      # Шаг был красным с рождения (WIX0103), потом «позеленел» гардом
+      # `Test-Path build/msi/mdm-agent.exe` — и это была маскировка, а не починка:
+      # mdm-agent.exe нигде не трекается (его кладёт build-msi.ps1 локально), поэтому
+      # гард не срабатывал НИКОГДА, ни в срезе, ни в полном дереве. Зелёная джоба
+      # означала «шаг не выполнялся», а боевой авторинг по-прежнему не проверял никто.
+      #
+      # Чинится двумя вещами, обе обязательны:
+      #   -bindpath build/msi — wix резолвит SourceFile/Source из .wxs относительно
+      #     ТЕКУЩЕГО каталога, а icon.ico лежит рядом с .wxs;
+      #   Copy-Item — боевой .wxs берёт бинарь ЗАХАРДКОЖЕННЫМ именем
+      #     (`Source="mdm-agent.exe"`), а не через переменную, в отличие от валидатора
+      #     (`Source="$(var.AgentExe)"`). Поэтому -d AgentExe здесь ничего не значил и
+      #     убран как мёртвый: подставлять его в этом авторинге просто некуда.
+      # Расхождение «валидатор через переменную, боевой хардкодом» осталось; убирать
+      # его надо отдельно и осознанно, а не попутно с починкой CI.
+      #
+      # Гард убран целиком: после копирования бинарь есть в ЛЮБОМ репозитории, .wxs и
+      # icon.ico доезжают в срез вместе с остальным build/msi. То есть боевой авторинг
+      # теперь проверяется и в публичном репозитории тоже — раньше не проверялся нигде.
+      - name: wix build боевого MSI (то, что реально едет в поле)
+        shell: pwsh
+        run: |
+          Copy-Item installer/windows/agent.exe build/msi/mdm-agent.exe -Force
+          wix extension add -g WixToolset.Util.wixext/4.0.5
+          wix build build/msi/mdm-agent.wxs -arch x64 -ext WixToolset.Util.wixext `
+            -bindpath build/msi -d Version=0.0.0 -o prod-authoring.msi
+
+      # UpgradeCode валидатора и боевого MSI обязаны РАЗЛИЧАТЬСЯ. Это не
+      # придирка к стилю: совпади они — MSI, собранный в CI (другой профиль
+      # установки, без SERVER_ADDR), стал бы для Windows апгрейдом боевой
+      # установки и мог бы подменить рабочего агента на парке, случайно попав в
+      # releases. Гейт держит расхождение намеренным, а не забытым.
+      - name: гейт UpgradeCode (валидатор ≠ боевой)
+        shell: pwsh
+        run: |
+          $rx = 'UpgradeCode="([0-9a-fA-F-]{36})"'
+          $prod = (Select-String -Path build/msi/mdm-agent.wxs -Pattern $rx).Matches[0].Groups[1].Value
+          $ci   = (Select-String -Path installer/windows/agent.wxs -Pattern $rx).Matches[0].Groups[1].Value
+          Write-Host "боевой=$prod валидатор=$ci"
+          if (-not $prod -or -not $ci) { Write-Error "UpgradeCode не найден в одном из .wxs"; exit 1 }
+          if ($prod -eq $ci) {
+            Write-Error "UpgradeCode совпали: MSI из CI стал бы апгрейдом боевой установки"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-msi
+          path: agent.msi
+
+      # Реальная тихая установка MSI (без ENROLL_TOKEN → enroll-CA пропускается,
+      # кладутся только файлы). Проверяем, что бинарь лёг в Program Files.
+      - name: silent install MSI
+        shell: pwsh
+        run: |
+          $p = Start-Process msiexec -ArgumentList '/i','agent.msi','/quiet','/l*v','install.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { if (Test-Path install.log) { Get-Content install.log -Tail 50 }; throw "msiexec /i exit $($p.ExitCode)" }
+          $exe = Join-Path $Env:ProgramFiles 'RoutineOps\RoutineOps-agent.exe'
+          if (-not (Test-Path $exe)) { throw "agent.exe не установлен: $exe" }
+          Write-Host "OK: установлен $exe"
+
+      # Регистрация службы в SCM под LocalSystem — реальный путь install_windows.go
+      # (CreateService + recovery actions). Сервер не нужен: проверяем сам факт
+      # регистрации и снятия. Пути сертов фиктивные (читаются только при run).
+      - name: smoke регистрации Windows-службы
+        shell: pwsh
+        run: |
+          # 🔴 Только Start-Process -Wait, не оператор `&`. Агент собран -H windowsgui
+          # (шаг «build agent.exe» выше — намеренно, чтобы гейт щупал ту же подсистему,
+          # что едет в поле). GUI-процесса PowerShell не дожидается: управление
+          # возвращается сразу, $LASTEXITCODE не выставляется ВООБЩЕ и остаётся пустым,
+          # а `"" -ne 0` истинно — шаг падал с «agent install exit » без кода. Это тот же
+          # дефект, что чинили в uninstall.bat (там лечение — start "" /wait).
+          $exe = Join-Path $Env:ProgramFiles 'RoutineOps\RoutineOps-agent.exe'
+          $run = {
+            param($argv, $what)
+            $p = Start-Process $exe -ArgumentList $argv -Wait -PassThru -NoNewWindow
+            if ($p.ExitCode -ne 0) { throw "$what exit $($p.ExitCode)" }
+          }
+          & $run @('install','-server','localhost:50051','-server-name','localhost',
+                   '-cert','C:\mdm\agent.crt','-key','C:\mdm\agent.key','-ca','C:\mdm\ca.crt') 'agent install'
+          sc.exe query RoutineOps-agent
+          if ($LASTEXITCODE -ne 0) { throw "служба RoutineOps-agent не зарегистрирована" }
+          & $run @('uninstall') 'agent uninstall'
+          Write-Host "OK: служба зарегистрирована и снята"
+
+      # Тихое удаление MSI — должно убрать файлы (и службу через DoUninstall CA).
+      - name: silent uninstall MSI
+        shell: pwsh
+        run: |
+          $p = Start-Process msiexec -ArgumentList '/x','agent.msi','/quiet' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec /x exit $($p.ExitCode)" }
+          $exe = Join-Path $Env:ProgramFiles 'RoutineOps\RoutineOps-agent.exe'
+          if (Test-Path $exe) { throw "agent.exe остался после удаления: $exe" }
+          Write-Host "OK: MSI удалён, файлы убраны"
+
+      # 🔴 Гейт полевого бага: ручное снятие обязано снимать РЕГИСТРАЦИЮ продукта, а
+      # установщик — не отдавать молча 0, когда ставить он ничего не будет.
+      #
+      # Почему здесь и почему на БОЕВОМ авторинге. Шаги выше гоняют валидатор
+      # (installer/windows/agent.wxs) с намеренно ДРУГИМ UpgradeCode — а подкоманда
+      # msi-unregister ищет продукт по боевому коду и валидатор не нашла бы вовсе. Кроме
+      # того, валидатор не кладёт uninstall.bat в тот же профиль и не имеет Launch-условий.
+      # То есть проверить это можно только на том авторинге, который реально едет в поле.
+      #
+      # Прогон идёт ПОСЛЕ снятия валидатора: оба ставят файлы в %ProgramFiles%\RoutineOps.
+      #
+      # Половины гейта, красные на коде до соответствующих правок:
+      #   - без вызова msi-unregister в батнике продукт остаётся в ARP (шаг 4b);
+      #   - без второго Launch-условия повторный /i отдаёт 0 (шаг 3);
+      #   - без отказа по взведённой защите батник снёс бы агент в обход безопасного
+      #     режима, то есть в обход самозащиты (шаг 4).
+      - name: гейт ручного снятия и повторной установки (боевой MSI)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $rx = 'UpgradeCode="([0-9a-fA-F-]{36})"'
+          $uc = '{' + (Select-String -Path build/msi/mdm-agent.wxs -Pattern $rx).Matches[0].Groups[1].Value + '}'
+          function Get-RoProducts {
+            $inst = New-Object -ComObject WindowsInstaller.Installer
+            try { return @($inst.GetType().InvokeMember('RelatedProducts','GetProperty',$null,$inst,@($uc))) }
+            catch { return @() }
+          }
+          # Сервера нет: enroll упадёт, но EnrollExec помечен Return="ignore" — файлы лягут.
+          $props = @(
+            'ENROLL_URL="https://127.0.0.1:1/api/v1/enroll"','ENROLL_TOKEN="ci-token"',
+            'CA_URL="https://127.0.0.1:1/ca.crt"','CA_SHA256="00"','SERVER_ADDR="127.0.0.1:50051"')
+
+          # 1. чистая установка боевого пакета
+          $p = Start-Process msiexec -ArgumentList (@('/i','prod-authoring.msi','/qn','/l*v','prod-install.log') + $props) -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content prod-install.log -Tail 40; throw "чистая установка боевого MSI: exit $($p.ExitCode)" }
+          $bat = Join-Path $Env:ProgramFiles 'RoutineOps\uninstall.bat'
+          if (-not (Test-Path $bat)) { throw "MSI не положил uninstall.bat: $bat" }
+
+          # 2. продукт зарегистрирован
+          if ((Get-RoProducts).Count -eq 0) { throw "продукт не зарегистрирован по UpgradeCode $uc — проверять нечего" }
+          Write-Host "OK: продукт зарегистрирован"
+
+          # 3. повтор /i с теми же свойствами обязан ОТКАЗАТЬ, а не отдать 0
+          $p = Start-Process msiexec -ArgumentList (@('/i','prod-authoring.msi','/qn','/l*v','repeat.log') + $props) -Wait -PassThru
+          if ($p.ExitCode -eq 0) {
+            throw "повторная установка поверх уже зарегистрированного продукта вернула 0: установщик снова молчит при нулевом результате"
+          }
+          if (-not (Select-String -Path repeat.log -Pattern 'REINSTALL=ALL REINSTALLMODE=vomus' -Quiet)) {
+            throw "отказ не содержит подсказки REINSTALL=ALL REINSTALLMODE=vomus — оператор получит голый код"
+          }
+          Write-Host "OK: повторная установка отклонена с внятным текстом (exit $($p.ExitCode))"
+
+          # 4. КОНТРАКТ ЗАЩИТЫ. По взведённой tamper-protection штатная процедура снятия
+          #    требует сначала безопасного режима, и батник обязан ОТКАЗАТЬСЯ с кодом 2,
+          #    ничего не тронув, — а не сносить агент в обход самозащиты.
+          #
+          #    🔴 Раньше гейт звал батник сразу и падал на его законном отказе — то есть
+          #    красным был не дефект, а сам гейт. Обнулять флаги молча значит потерять
+          #    половину поведения: отказ по взведённой защите не покрыт больше НИЧЕМ, а
+          #    это единственное, что стоит между «снести агент» и «снести агент, зная
+          #    пароль администратора».
+          #    Флаги ВЗВОДИМ САМИ, если их нет, а не требуем от установки. Проверено на
+          #    живой машине: боевой MSI их не ставит — после чистой установки оба пусты, и
+          #    взводит их агент на пути enroll, до которого в CI (и на любом стенде без
+          #    сервера) исполнение не доходит. То, что в упавшем прогоне защита оказалась
+          #    взведена, — след предыдущего шага джобы, а не свойство установки.
+          #    Требовать «установка обязана взвести» значит гейтить чужое поведение и
+          #    получить красное на исправном дереве.
+          $key = 'HKLM:\SOFTWARE\RoutineOps\Agent'
+          $prot  = (Get-ItemProperty -Path $key -Name TamperProtection -EA SilentlyContinue).TamperProtection
+          $guard = (Get-ItemProperty -Path $key -Name SafeBootGuard    -EA SilentlyContinue).SafeBootGuard
+          if (($prot -ne 1) -and ($guard -ne 1)) {
+            if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+            Set-ItemProperty -Path $key -Name TamperProtection -Value 1 -Type DWord
+            Set-ItemProperty -Path $key -Name SafeBootGuard    -Value 1 -Type DWord
+            Write-Host "защита взведена самим гейтом (после установки флаги были пусты)"
+          }
+          '' | & $bat
+          $armedRC = $LASTEXITCODE
+          if ($armedRC -ne 2) {
+            throw "по ВЗВЕДЁННОЙ защите uninstall.bat вернул $armedRC, ожидался 2 (отказ): снос в обход безопасного режима — это обход самозащиты"
+          }
+          if (-not (Test-Path $bat)) { throw "батник отказался, но при этом снёс себя — отказ обязан ничего не менять" }
+          if ((Get-RoProducts).Count -eq 0) { throw "батник отказался, но снял регистрацию продукта — отказ обязан ничего не менять" }
+          Write-Host "OK: по взведённой защите снятие отклонено (exit 2) и ничего не тронуто"
+
+          # 4b. Разоружаем — в CI безопасного режима нет, и эквивалент из доки это
+          #     обнуление обоих флагов. Только теперь штатное снятие обязано пройти.
+          Set-ItemProperty -Path $key -Name TamperProtection -Value 0 -Type DWord
+          Set-ItemProperty -Path $key -Name SafeBootGuard    -Value 0 -Type DWord
+
+          #    Пустая строка в stdin: в батнике есть pause, без неё шаг повис бы.
+          #    Вызов через `&`, а не `cmd /c "..."`: cmd срезает внешние кавычки, и путь
+          #    с пробелом («Program Files») развалился бы на два аргумента.
+          '' | & $bat
+          $batRC = $LASTEXITCODE
+          Write-Host "uninstall.bat завершился с кодом $batRC"
+          # Код возврата проверяем, а не печатаем: батник для того и переписан, чтобы
+          # «Готово» не печаталось при неполном снятии. 0 — готово; всё остальное здесь
+          # означает, что он сам сообщил о проблеме.
+          if ($batRC -ne 0) { throw "uninstall.bat отчитался о неполном снятии (код $batRC)" }
+          $left = Get-RoProducts
+          if ($left.Count -ne 0) {
+            throw "после uninstall.bat продукт всё ещё зарегистрирован ($($left -join ',')): следующая установка того же пакета уйдёт в режим обслуживания и молча ничего не сделает"
+          }
+          Write-Host "OK: регистрация снята вместе с файлами"
+
+          # 5. и теперь тот же пакет ставится как на чистую машину
+          $p = Start-Process msiexec -ArgumentList (@('/i','prod-authoring.msi','/qn','/l*v','again.log') + $props) -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content again.log -Tail 40; throw "повторная установка после снятия: exit $($p.ExitCode)" }
+          $exe = Join-Path $Env:ProgramFiles 'RoutineOps\RoutineOps-agent.exe'
+          if (-not (Test-Path $exe)) { throw "после снятия и повторной установки бинаря нет: $exe" }
+          Write-Host "OK: после ручного снятия пакет ставится заново"
+
+          # 6. за собой убрать
+          Start-Process msiexec -ArgumentList '/x','prod-authoring.msi','/qn','/norestart' -Wait -PassThru | Out-Null
+
+  # 🔴 ОТДЕЛЬНАЯ джоба, а не флаг к предыдущей. Enterprise-код и его тесты живут под
+  # `//go:build enterprise`, и обычный `go test`/`golangci-lint` их НЕ КОМПИЛИРУЕТ.
+  # То есть весь платный набор — SAML, SCIM, SIEM, эскроу, лицензия, FileVault, CVE,
+  # каналы обновлений — в CI не проверялся вообще ни разу: джоба выше была зелёной
+  # ровно потому, что этих файлов для неё не существует. Ровно та же дыра нашлась и в
+  # локальном pre-push (закрыта там же).
+  enterprise:
+    name: enterprise · test + lint (build tag)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: mdm_test
+          POSTGRES_USER: mdm
+          POSTGRES_PASSWORD: mdm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mdm -d mdm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # Публичный Free-репозиторий получает ЭТОТ ЖЕ файл (workflow'ы едут в срезе), но
+      # БЕЗ enterprise-исходников — их вырезает export-free.sh. `go build -tags enterprise`
+      # там падает по построению: «undefined: enterpriseSetup» и ещё десяток символов,
+      # которых в открытой сборке нет и не должно быть. Проверено 03.08 на срезе 2.8.0 —
+      # красный CI в публичном репозитории на совершенно здоровом коде.
+      #
+      # Поэтому джоба сначала спрашивает, есть ли что собирать под тегом, и в open-core
+      # ЯВНО пропускает шаги с заметкой в логе, а не притворяется, что проверила. Условие
+      # смотрит на composition-root enterprise: он есть только в приватном суперсете.
+      - name: есть ли enterprise-исходники
+        id: detect
+        run: |
+          if [ -f cmd/server/enterprise.go ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::enterprise-исходников нет (open-core срез) — сборка под тегом пропущена"
+          fi
+
+      - uses: actions/setup-go@v5
+        if: steps.detect.outputs.present == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: build (enterprise)
+        if: steps.detect.outputs.present == 'true'
+        run: go build -tags enterprise ./...
+
+      # -p 1: пакеты по одному. Параллельные пакеты дерутся за общую тестовую БД и
+      # дают «connection refused» на ровном месте, а мигающий гейт хуже медленного.
+      - name: test (enterprise) + coverage gate
+        if: steps.detect.outputs.present == 'true'
+        env:
+          TEST_POSTGRES_DSN: postgres://mdm:mdm@localhost:5432/mdm_test?sslmode=disable
+        run: |
+          # 🔴 Покрытие ENTERPRISE-сборки не мерил никогда ни один гейт: он жил только в
+          # open-core джобе, где половины пакетов не существует вовсе. Менее
+          # протестированной оказывалась ровно та часть, за которую платят —
+          # internal/server/uninstall был на 0%, то есть не проверялся ничем.
+          #
+          # ./... , а не ./internal/... : -coverpkg считает по всему модулю, и урезанный
+          # набор пакетов дал бы агрегат, посчитанный по другому знаменателю, чем в
+          # open-core джобе. Пороги те же — расходиться им не с чего.
+          go test -p 1 -tags enterprise -coverprofile=coverage-ent.out -covermode=atomic -coverpkg=./... ./...
+          bash scripts/coverage-gate.sh coverage-ent.out 70 55 "enterprise"
+
+      - name: golangci-lint (enterprise)
+        if: steps.detect.outputs.present == 'true'
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.12.2
+          args: --build-tags enterprise ./...
+
+  # Сборка образа — БЕЗ публикации. Автодеплоя здесь нет и не должно быть: прод-запись
+  # остаётся ручной. Смысл джобы в том, чтобы «собирается ли то, что мы выкатываем»
+  # выяснялось на пуше, а не в момент, когда образ понадобился.
+  image:
+    name: docker · сборка образа (без публикации)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Обе редакции: open-core и enterprise собираются ОДНИМ Dockerfile через
+        # build-arg, и ломается обычно ровно та, которую не собирают.
+        edition: ["", "enterprise"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Тот же случай, что у джобы enterprise: в публичном срезе enterprise-исходников
+      # нет, и сборка образа под этим тегом падает по построению. Пропускаем явно.
+      - name: docker build (${{ matrix.edition == '' && 'open-core' || matrix.edition }})
+        run: |
+          if [ "${{ matrix.edition }}" = "enterprise" ] && [ ! -f cmd/server/enterprise.go ]; then
+            echo "::notice::enterprise-исходников нет (open-core срез) — сборка образа под тегом пропущена"
+            exit 0
+          fi
+          docker build \
+            --build-arg BUILD_TAGS='${{ matrix.edition }}' \
+            --build-arg VERSION="ci-${GITHUB_SHA::8}" \
+            -t routineops-server:ci-${{ matrix.edition || 'free' }} .
+
+  proto-breaking:
+    name: proto · buf breaking
+    # Валит сборку при ломающем изменении контракта (ADR-4: поля только
+    # аддитивно, без удаления/смены номера/типа).
+    #
+    # Джоба была PR-only, и это делало её мёртвой: пушим мы ОБА прямо в main, а
+    # на push baseline «ветка main» — это сам же push, сравнение вырождается и
+    # всегда зелёное. Контракт вооружения (5e9d5ba) не проверил ни человек, ни
+    # CI. Теперь baseline берётся по событию: на PR — main, на push — коммит ДО
+    # пуша (github.event.before), то есть ровно то состояние контракта, которое
+    # push и меняет.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # buf читает базовый контракт из локальной ветки main — подтягиваем её.
+      # Только для PR: на push baseline адресуется по SHA, ветка не нужна.
+      - name: fetch main
+        if: github.event_name == 'pull_request'
+        run: git fetch origin main:main
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+
+      - name: выбрать baseline
+        id: baseline
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ref=branch=main" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Первый пуш в ветку или force-push с пересозданием истории: сравнивать
+          # не с чем. Пропускаем ЯВНО, а не сравниваем с несуществующим коммитом —
+          # иначе джоба падала бы на пустом месте и её отключили бы снова.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            echo "baseline недоступен ($BEFORE) — сравнивать не с чем, пропуск"
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ref=ref=$BEFORE" >> "$GITHUB_OUTPUT"
+
+      - name: buf breaking
+        if: steps.baseline.outputs.skip != '1'
+        # subdir=proto: читать baseline с корнем модуля = proto/, как в buf.yaml
+        # текущей ветки. Иначе на бутстрап-PR (main ещё без buf.yaml) baseline
+        # именует файл proto/agent.proto, а текущая ветка — agent.proto, и buf
+        # ложно репортит «файл удалён».
+        run: buf breaking --against ".git#${{ steps.baseline.outputs.ref }},subdir=proto"
+
+  cross-build:
+    name: cross-build агента
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: linux,   goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Кросс-компиляция агента под все целевые ОС — ловит поломки в
+      # платформенных файлах (priv_*/console_*/proc_*), невидимые при сборке на macOS.
+      - name: build agent ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -o /dev/null ./cmd/agent
+
+      # То же самое, но с тегом enterprise. Без этого шага целый пласт платформенного
+      # кода не собирался НИ РАЗУ: удалённый стол лежит под `//go:build enterprise`,
+      # публикуемый windows-бинарь — free, а все остальные проверки собирают агента под
+      # хозяйскую ОС раннера (linux). Так и уехало столкновение имён `rect` с Win32-RECT,
+      # из-за которого enterprise-агент под Windows не компилировался вообще.
+      #
+      # 🔴 В публичном репозитории шаг НЕ «собирает то же самое»: `-tags enterprise`
+      # исключает free-заглушки (`//go:build !enterprise`), а реализаций там нет —
+      # их вырезал export-free.sh. Сборка падает по построению:
+      #   cmd/agent/main.go: undefined: wireScreen, runScreenProbe, runScreenWorker,
+      #   runFileVaultProvision, escrowSealerStatus, wireFileVaultChain, …
+      # Поэтому тот же гард, что у джобы `enterprise` ниже. Маркер — агентский, а не
+      # cmd/server/enterprise.go: срез может разойтись по слоям, и проверять надо
+      # наличие ровно того, что этот шаг компилирует.
+      - name: есть ли enterprise-исходники агента
+        id: agent_ent
+        shell: bash
+        run: |
+          if [ -f cmd/agent/screen_wiring.go ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::enterprise-исходников агента нет (open-core срез) — сборка под тегом пропущена"
+          fi
+
+      # То же самое, но с тегом enterprise. Без этого шага целый пласт платформенного
+      # кода не собирался НИ РАЗУ (см. столкновение `rect` с Win32-RECT выше).
+      - name: build agent (enterprise) ${{ matrix.goos }}/${{ matrix.goarch }}
+        if: steps.agent_ent.outputs.present == 'true'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -tags enterprise -o /dev/null ./cmd/agent

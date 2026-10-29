@@ -1,0 +1,58 @@
+name: web
+
+# 🔴 push в main здесь ОБЯЗАТЕЛЕН, а не «на всякий случай»: в этот репозиторий пушат
+# прямо в main, без PR. Пока триггер был только `pull_request`, веб-гейты на реальном
+# пути изменений не срабатывали НИ РАЗУ — фронт проверялся лишь в тех редких случаях,
+# когда кто-то заводил PR.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+  pull_request:
+    paths:
+      - "web/**"
+      - ".github/workflows/web.yml"
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # npm ci, а не npm install: lockfile давно содержит vitest (комментарий про
+      # «ещё не содержит» устарел), и установка обязана ставить ровно то, что в нём
+      # записано. `npm install` молча подтягивает более свежие версии — гейт тогда
+      # проверяет не тот набор зависимостей, что стоит у людей и в проде.
+      - name: Install deps
+        run: npm ci --no-audit --no-fund
+      # Главный гейт — сборка vite. ВАЖНО: `tsc --noEmit` в этом репозитории NO-OP
+      # из-за конфигурации проекта и зеленеет на сломанных типах; полагаться на него
+      # нельзя, поэтому отдельного шага типов здесь нет.
+      - name: Build
+        run: npm run build
+      - name: Unit tests
+        run: npm test
+      # 🔴 Браузерный гейт выпадающего списка. Заведён по факту, а не на всякий случай:
+      # компонент ломался ДВАЖДЫ, и оба раза по причинам, которых в jsdom не существует —
+      # stacking context от backdrop-filter (меню уезжало под соседнюю карточку) и
+      # `pointer-events: none`, который Radix ставит на body в модальном режиме (меню
+      # рисовалось и не нажималось). Оба раза `npm test` был зелёным.
+      #
+      # Бэкенда не требует: стенд /select-harness.html поднимается тем же vite dev и в
+      # продакшн-сборку не попадает (Vite собирает только index.html).
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+      - name: UI gate (dropdown)
+        run: npm run test:ui
+      # Lint информативный — не блокируем на существующем долге (7 warning'ов
+      # react-refresh в ui-примитивах на дату правки).
+      - name: Lint
+        run: npm run lint
+        continue-on-error: true

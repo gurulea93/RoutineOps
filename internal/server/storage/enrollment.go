@@ -1,0 +1,554 @@
+package storage
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+type EnrollmentToken struct {
+	ID              string
+	TenantID        string
+	DeviceID        string // "" для bulk-токена (device_id NULL — не привязан к устройству)
+	GroupID         string // "" если партия без группы
+	MaxUses         *int   // nil = безлимит до ExpiresAt
+	Uses            int
+	RequireApproval bool
+	ExpiresAt       time.Time
+	UsedAt          *time.Time
+	CreatedAt       time.Time
+}
+
+// hashEnrollToken — SHA-256(hex) enrollment-токена для хранения и поиска (N6).
+// Токен высокоэнтропийный (UUID v4 / rand hex), поэтому детерминированный хеш без
+// соли безопасен и позволяет искать по равенству. Plaintext в БД не хранится.
+func hashEnrollToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// ErrEnrollTokenAlreadyUsed — enrollment-токен уже погашен. Guarded UPDATE
+// (WHERE used_at IS NULL) + проверка RowsAffected закрывают гонку single-use:
+// два параллельных redeem больше не выдают два серта на один токен (E/TOCTOU).
+var ErrEnrollTokenAlreadyUsed = errors.New("enrollment token already used")
+
+// ErrDeviceNotReenrollable — реенролл запрошен для устройства в статусе, из которого
+// возврат в строй обязан идти через выделенную ручку, а не в обход неё.
+var ErrDeviceNotReenrollable = errors.New("device status forbids reenroll")
+
+// ErrDeviceNotEnrollable — редим токена для устройства в статусе, который запрещает
+// самостоятельный возврат в строй (см. notEnrollableStatuses).
+var ErrDeviceNotEnrollable = errors.New("device status forbids enroll")
+
+// notEnrollableStatuses — статусы, из которых устройство НЕ возвращается в строй
+// само: только явным действием оператора (approve / отдельная ручка). Один список на
+// оба входа — редим токена (EnrollDevice) и реенролл (ResetDeviceForReenroll), иначе
+// закрытая в одном месте дверь остаётся открытой в другом.
+var notEnrollableStatuses = []string{"pending_approval", "rejected", "decommissioned", "blocked"}
+
+func (db *DB) CreatePendingDevice(ctx context.Context, tenantID, hostname, os string) (*Device, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		defer finish(true)
+	}
+	var d Device
+	err = db.Scoped(ctx).QueryRow(ctx, `
+		INSERT INTO devices (tenant_id, hostname, os, status)
+		VALUES ($1, $2, $3, 'pending')
+		RETURNING id, hostname, os, COALESCE(os_version, ''), COALESCE(ip_address, ''),
+		          status, last_seen_at, created_at
+	`, tenantID, hostname, os).Scan(&d.ID, &d.Hostname, &d.OS, &d.OSVersion,
+		&d.IPAddress, &d.Status, &d.LastSeenAt, &d.CreatedAt)
+	return &d, err
+}
+
+func (db *DB) CreateEnrollmentToken(ctx context.Context, tenantID, deviceID, token string, expiresAt time.Time) error {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return err
+		}
+		defer finish(true)
+	}
+	_, err = db.Scoped(ctx).Exec(ctx, `
+		INSERT INTO enrollment_tokens (tenant_id, device_id, token_hash, expires_at)
+		SELECT $1, d.id, $3, $4 FROM devices d WHERE d.id = $2 AND d.tenant_id = $1
+	`, tenantID, deviceID, hashEnrollToken(token), expiresAt)
+	return err
+}
+
+func (db *DB) GetEnrollmentToken(ctx context.Context, token string) (*EnrollmentToken, error) {
+	var t EnrollmentToken
+	// device_id теперь nullable (bulk-токен): COALESCE(::text,'') → "" для bulk.
+	err := db.pool.QueryRow(ctx, `
+		SELECT id, tenant_id::text, COALESCE(device_id::text, ''), COALESCE(group_id::text, ''),
+		       max_uses, uses, require_approval, expires_at, used_at
+		FROM auth_enrollment_by_hash($1)
+	`, hashEnrollToken(token)).Scan(&t.ID, &t.TenantID, &t.DeviceID, &t.GroupID,
+		&t.MaxUses, &t.Uses, &t.RequireApproval, &t.ExpiresAt, &t.UsedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+// CreateBulkEnrollmentToken выпускает многоразовый токен, НЕ привязанный к устройству
+// (device_id NULL). groupID/maxUses опциональны ("" / nil). requireApproval решает
+// вызывающий (дефолт политики — в ручке). Устройства создаются сами при энролле.
+func (db *DB) CreateBulkEnrollmentToken(ctx context.Context, tenantID, token, groupID string, maxUses *int, requireApproval bool, expiresAt time.Time) error {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return err
+		}
+		defer finish(true)
+	}
+	var gid *string
+	if groupID != "" {
+		gid = &groupID
+	}
+	_, err = db.Scoped(ctx).Exec(ctx, `
+		INSERT INTO enrollment_tokens (tenant_id, device_id, group_id, token_hash, max_uses, require_approval, expires_at)
+		VALUES ($1, NULL, $2, $3, $4, $5, $6)
+	`, tenantID, gid, hashEnrollToken(token), maxUses, requireApproval, expiresAt)
+	return err
+}
+
+// BulkEnrollmentToken — выпущенный массовый токен для показа оператору. Самого секрета
+// тут нет и быть не может: в БД лежит только SHA-256 (N6), плейнтекст отдаётся один раз
+// при выпуске. Оператору нужен не сам токен, а ответ на вопрос «что сейчас позволяет
+// заводить устройства и сколько раз этим воспользовались».
+type BulkEnrollmentToken struct {
+	ID              string    `json:"id"`
+	GroupID         string    `json:"group_id"`
+	GroupName       string    `json:"group_name"`
+	MaxUses         *int      `json:"max_uses"`
+	Uses            int       `json:"uses"`
+	RequireApproval bool      `json:"require_approval"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// ListBulkEnrollmentTokens — выпущенные массовые токены, свежие сверху. Истёкшие тоже
+// отдаём: оператору важно видеть, чем энроллили парк последнее время.
+// ponytail: LIMIT 100 вместо пагинации — токены выпускают штуками, не тысячами.
+func (db *DB) ListBulkEnrollmentTokens(ctx context.Context, tenantID string) ([]BulkEnrollmentToken, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		defer finish(true)
+	}
+	rows, err := db.Scoped(ctx).Query(ctx, `
+		SELECT t.id::text, COALESCE(t.group_id::text, ''), COALESCE(g.name, ''),
+		       t.max_uses, t.uses, t.require_approval, t.expires_at, t.created_at
+		FROM enrollment_tokens t
+		LEFT JOIN device_groups g ON g.id = t.group_id
+		WHERE t.tenant_id = $1 AND t.device_id IS NULL
+		ORDER BY t.created_at DESC
+		LIMIT 100
+	`, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tokens := []BulkEnrollmentToken{}
+	for rows.Next() {
+		var t BulkEnrollmentToken
+		if err := rows.Scan(&t.ID, &t.GroupID, &t.GroupName, &t.MaxUses, &t.Uses,
+			&t.RequireApproval, &t.ExpiresAt, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// RevokeEnrollmentToken гасит токен, сдвигая срок в прошлое. Отдельной колонки
+// revoked_at намеренно НЕТ: и bulk-редим (BeginBulkEnroll), и обычный (enroll-хендлер)
+// уже проверяют expires_at, поэтому отзыв не заводит НОВОГО условия, которое можно
+// забыть в одном из путей — ровно так и жила дыра с гейтом статуса, закрытая в одном
+// месте из двух. Кто и когда отозвал — в аудите.
+// false = токена нет или он уже мёртв (истёк/отозван), повторный отзыв не нужен.
+// ponytail: отозванный в списке неотличим от истёкшего сам; понадобится различать —
+// добавить revoked_at и показывать причину.
+func (db *DB) RevokeEnrollmentToken(ctx context.Context, tenantID, id string) (bool, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return false, err
+		}
+		defer finish(true)
+	}
+	ct, err := db.Scoped(ctx).Exec(ctx,
+		`UPDATE enrollment_tokens SET expires_at = now()
+		 WHERE id = $1 AND tenant_id = $2 AND expires_at > now()`, id, tenantID)
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() > 0, nil
+}
+
+// BeginBulkEnroll атомарно резервирует ОДНО использование bulk-токена (проверка
+// max_uses/срока — гонку закрывает guarded UPDATE ... uses+1 с RETURNING), создаёт
+// устройство (status 'pending') и привязывает к группе токена. Возвращает id
+// устройства и require_approval. ErrEnrollTokenAlreadyUsed = лимит исчерпан / срок
+// вышел / это не bulk-токен (device_id задан).
+//
+// tenantID — из токена (GetEnrollmentToken / auth_enrollment_by_hash): устройство
+// обязано родиться в том же тенанте, что и токен (ADR-6, WITH CHECK RLS).
+//
+// Устройство создаётся ДО подписи CSR, потому что CN серта = id устройства
+// (SignCSR(csr, deviceID)); статус и серт доставляет FinalizeBulkEnroll после подписи.
+// ⚠ ponytail: если SignCSR упадёт между Begin и Finalize (битый CSR — ошибка клиента),
+// останется осиротевшее 'pending'-устройство + одно израсходованное использование.
+// Это тот же осадок, что от любого недоведённого энролла; редко и не деструктивно.
+func (db *DB) BeginBulkEnroll(ctx context.Context, tenantID, tokenID, hostname, os string) (deviceID string, requireApproval bool, err error) {
+	tenantID, err = requireTenant(tenantID)
+	if err != nil {
+		return "", false, err
+	}
+	if hostname == "" {
+		hostname = "unknown" // первый ReportInventory перепишет (pending_approval шлёт инвентарь)
+	}
+	if os == "" {
+		os = "unknown"
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return "", false, err
+		}
+		defer func() { finish(err == nil) }()
+	}
+
+	var groupID *string
+	err = db.Scoped(ctx).QueryRow(ctx, `
+		UPDATE enrollment_tokens SET uses = uses + 1
+		WHERE id = $1 AND tenant_id = $2 AND device_id IS NULL
+		  AND (max_uses IS NULL OR uses < max_uses)
+		  AND expires_at > now()
+		RETURNING group_id::text, require_approval
+	`, tokenID, tenantID).Scan(&groupID, &requireApproval)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, ErrEnrollTokenAlreadyUsed
+		}
+		return "", false, err
+	}
+
+	if err = db.Scoped(ctx).QueryRow(ctx,
+		`INSERT INTO devices (tenant_id, hostname, os, status) VALUES ($1, $2, $3, 'pending') RETURNING id`,
+		tenantID, hostname, os).Scan(&deviceID); err != nil {
+		return "", false, err
+	}
+
+	if groupID != nil && *groupID != "" {
+		if _, err = db.Scoped(ctx).Exec(ctx,
+			`INSERT INTO device_group_members (tenant_id, device_id, group_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			tenantID, deviceID, *groupID); err != nil {
+			return "", false, err
+		}
+	}
+	return deviceID, requireApproval, nil
+}
+
+// FinalizeBulkEnroll ставит статус и серт после подписи CSR. require_approval →
+// 'pending_approval' (ждёт одобрения, gateway гейтит политики/скрипты), иначе
+// 'enrolled' (обычный heartbeat поднимет в 'active'). certFingerprint — как в
+// EnrollDevice: чтобы первый heartbeat обновил ЭТУ строку, а не создал дубль.
+func (db *DB) FinalizeBulkEnroll(ctx context.Context, tenantID, deviceID, certSerial, certFingerprint string, requireApproval bool) error {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return err
+		}
+		defer finish(true)
+	}
+	status := "enrolled"
+	if requireApproval {
+		status = "pending_approval"
+	}
+	_, err = db.Scoped(ctx).Exec(ctx, `
+		UPDATE devices SET status = $2, cert_serial = $3, enrolled_at = now(),
+		    certificate_fingerprint = COALESCE(NULLIF($4, ''), certificate_fingerprint)
+		WHERE id = $1 AND tenant_id = $5
+	`, deviceID, status, certSerial, certFingerprint, tenantID)
+	return err
+}
+
+// ApproveDevice одобряет устройство из очереди: pending_approval → active. Возвращает
+// false, если устройство не было в очереди (guarded — идемпотентно, не трогает чужие статусы).
+func (db *DB) ApproveDevice(ctx context.Context, tenantID, deviceID string) (bool, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return false, err
+		}
+		defer finish(true)
+	}
+	ct, err := db.Scoped(ctx).Exec(ctx,
+		`UPDATE devices SET status = 'active'
+		 WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval'`, deviceID, tenantID)
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() > 0, nil
+}
+
+// RejectDevice отклоняет устройство из очереди: pending_approval → rejected (терминальный,
+// gateway режет Connect/heartbeat/все RPC как blocked). false = не было в очереди.
+func (db *DB) RejectDevice(ctx context.Context, tenantID, deviceID string) (bool, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return false, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return false, err
+		}
+		defer finish(true)
+	}
+	ct, err := db.Scoped(ctx).Exec(ctx,
+		`UPDATE devices SET status = 'rejected'
+		 WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval'`, deviceID, tenantID)
+	if err != nil {
+		return false, err
+	}
+	return ct.RowsAffected() > 0, nil
+}
+
+// ApprovePendingDevices — batch-одобрение: все pending_approval (groupID "" ) или только
+// члены группы (groupID = uuid). Возвращает число одобренных.
+func (db *DB) ApprovePendingDevices(ctx context.Context, tenantID, groupID string) (int64, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return 0, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return 0, err
+		}
+		defer finish(true)
+	}
+	ct, err := db.Scoped(ctx).Exec(ctx, `
+		UPDATE devices SET status = 'active'
+		WHERE tenant_id = $1 AND status = 'pending_approval'
+		  AND ($2 = '' OR id IN (
+		    SELECT device_id FROM device_group_members
+		    WHERE tenant_id = $1 AND group_id::text = $2))
+	`, tenantID, groupID)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// RejectPendingDevices — batch-отклонение (симметрично ApprovePendingDevices).
+func (db *DB) RejectPendingDevices(ctx context.Context, tenantID, groupID string) (int64, error) {
+	tenantID, err := requireTenant(tenantID)
+	if err != nil {
+		return 0, err
+	}
+	if _, ok := TxFrom(ctx); !ok {
+		var finish func(bool)
+		ctx, finish, err = db.BindTenant(ctx, tenantID)
+		if err != nil {
+			return 0, err
+		}
+		defer finish(true)
+	}
+	ct, err := db.Scoped(ctx).Exec(ctx, `
+		UPDATE devices SET status = 'rejected'
+		WHERE tenant_id = $1 AND status = 'pending_approval'
+		  AND ($2 = '' OR id IN (
+		    SELECT device_id FROM device_group_members
+		    WHERE tenant_id = $1 AND group_id::text = $2))
+	`, tenantID, groupID)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+func (db *DB) GetActiveEnrollmentToken(ctx context.Context, tenantID, deviceID string) (*EnrollmentToken, error) {
+	ctx, finish, err := db.BindTenant(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	defer finish(false)
+
+	var t EnrollmentToken
+	err = db.Scoped(ctx).QueryRow(ctx, `
+		SELECT id, device_id, expires_at, used_at, created_at
+		FROM enrollment_tokens
+		WHERE device_id = $1 AND used_at IS NULL AND expires_at > now()
+		ORDER BY created_at DESC LIMIT 1
+	`, deviceID).Scan(&t.ID, &t.DeviceID, &t.ExpiresAt, &t.UsedAt, &t.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &t, nil
+}
+
+// EnrollDevice помечает токен использованным и переводит устройство в 'enrolled'.
+// certFingerprint (sha256 выданного серта) сохраняется здесь, чтобы первый
+// heartbeat (UpsertDeviceHeartbeat, ON CONFLICT по certificate_fingerprint) обновил
+// ЭТУ же строку, а не создал дубль устройства (БАГ 4). Пустой отпечаток не трогает
+// колонку — обратная совместимость со старыми вызовами.
+func (db *DB) EnrollDevice(ctx context.Context, tokenID, deviceID, certSerial, certFingerprint string) error {
+	tx, owned, err := db.beginScoped(ctx)
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
+
+	ct, err := tx.Exec(ctx,
+		`UPDATE enrollment_tokens SET used_at = now() WHERE id = $1 AND used_at IS NULL`, tokenID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		// Токен уже погашен (в т.ч. параллельным redeem) — единоразовость (E/TOCTOU).
+		return ErrEnrollTokenAlreadyUsed
+	}
+	// Гейт по статусу — как в ResetDeviceForReenroll: уцелевший на машине enroll.env
+	// (или просто невыбранный токен) не должен воскрешать списанное/заблокированное
+	// устройство в 'enrolled' мимо оператора. Ошибка откатывает и погашение токена,
+	// поэтому неудачная попытка не сжигает его молча.
+	ct, err = tx.Exec(ctx, `
+		UPDATE devices SET status = 'enrolled', cert_serial = $2, enrolled_at = now(),
+		    certificate_fingerprint = COALESCE(NULLIF($3, ''), certificate_fingerprint)
+		WHERE id = $1 AND status <> ALL($4)
+	`, deviceID, certSerial, certFingerprint, notEnrollableStatuses)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrDeviceNotEnrollable
+	}
+	if owned {
+		return tx.Commit(ctx)
+	}
+	return nil
+}
+
+func (db *DB) UpdatePendingDeviceInfo(ctx context.Context, deviceID, hostname, os string) error {
+	ctx, finish, _, scopeErr := db.scopeFor(ctx, "")
+	if scopeErr != nil {
+		return scopeErr
+	}
+	defer finish(true)
+	_, err := db.Scoped(ctx).Exec(ctx, `
+		UPDATE devices SET
+		  hostname = CASE WHEN $2 != '' THEN $2 ELSE hostname END,
+		  os       = CASE WHEN $3 != '' THEN $3 ELSE os END
+		WHERE id = $1 AND status = 'pending'
+	`, deviceID, hostname, os)
+	return err
+}
+
+func (db *DB) ResetDeviceForReenroll(ctx context.Context, tenantID, deviceID, newToken string, expiresAt time.Time) error {
+	ctx, finish, err := db.BindTenant(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	defer finish(true)
+
+	tx, owned, err := db.beginScoped(ctx)
+	if err != nil {
+		return err
+	}
+	if owned {
+		defer func() { _ = tx.Rollback(ctx) }()
+	}
+
+	if _, err := tx.Exec(ctx,
+		`UPDATE enrollment_tokens SET used_at = now() WHERE device_id = $1 AND used_at IS NULL`,
+		deviceID); err != nil {
+		return err
+	}
+	// 🔴 Гейт по статусу — здесь, а не в хендлере: реенролл ставит 'pending', а хартбит
+	// поднимает 'pending' → 'active' (UpsertDeviceHeartbeat), причём сертификат остаётся
+	// валидным (обнуляем только cert_serial). Без этого условия реенролл был обходной
+	// дверью в managed-статусы: отклонённое устройство возвращалось в строй БЕЗ повторного
+	// одобрения, заблокированное — в обход kill-switch, стоящее в очереди — мимо approve.
+	// Ровно то, что запрещает гейт в updateDeviceStatus (handler.go), только там дверь
+	// закрыли, а эту забыли. В storage, чтобы закрыть для всех вызывающих сразу.
+	ct, err := tx.Exec(ctx,
+		`UPDATE devices SET status = 'pending', cert_serial = NULL, enrolled_at = NULL
+		 WHERE id = $1 AND status <> ALL($2)`,
+		deviceID, notEnrollableStatuses)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrDeviceNotReenrollable
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO enrollment_tokens (device_id, token_hash, expires_at) VALUES ($1, $2, $3)
+	`, deviceID, hashEnrollToken(newToken), expiresAt); err != nil {
+		return err
+	}
+	if owned {
+		return tx.Commit(ctx)
+	}
+	return nil
+}

@@ -1,0 +1,38 @@
+# DEV ONLY — только для локальной разработки. НЕ для продакшена: пароль БД = "mdm",
+# порты биндятся на 127.0.0.1. Прод-стек — docker-compose.prod.yml (.env.prod, mTLS,
+# сгенерированные секреты, изолированная сеть).
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mdm-postgres
+    environment:
+      POSTGRES_DB: mdm
+      POSTGRES_USER: mdm
+      POSTGRES_PASSWORD: mdm
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mdm"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: mdm-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:

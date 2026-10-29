@@ -1,0 +1,1040 @@
+// Package command реализует Command Listener агента: приём Task из Connect-стрима,
+// подтверждение доставки (AckTaskReceived), выполнение скрипта и durable-доставку
+// результата: TaskResult ставится в устойчивую очередь outbox (переживает обрыв
+// связи и рестарт агента), прямой unary ReportTaskResult остаётся фолбэком на
+// случай недоступной очереди.
+//
+// Идемпотентность: доставка Task — at-least-once (Asynq), агент обязан не
+// выполнять одну задачу дважды. Дедуп по task_id персистентный (seenSet,
+// файл tasks.seen) и фиксирует факт СТАРТА задачи, а не доставки результата:
+// сдвиг фиксации на «после доставки» вернул бы двойной запуск скрипта после
+// рестарта. Окно «агент упал посреди выполнения» закрывает серверный sweep
+// зависших acked-задач (cmd/server, FailStaleAckedTasks).
+package command
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Floodww/RoutineOps/internal/agent/collector"
+	"github.com/Floodww/RoutineOps/internal/agent/outbox"
+	"github.com/Floodww/RoutineOps/internal/agent/transport"
+	"github.com/Floodww/RoutineOps/internal/agent/uninstall"
+	pb "github.com/Floodww/RoutineOps/proto"
+	"google.golang.org/protobuf/proto"
+)
+
+// callTimeout — потолок на unary-вызовы ack/report.
+const callTimeout = 30 * time.Second
+
+// maxRuntime — жёсткий потолок на выполнение одного скрипта задачи (захардкожен).
+const maxRuntime = 5 * time.Minute
+
+// provisionTimeout — потолок на дозавершение FileVault-provisioning. Внутри
+// диалог, который ждёт ответа сотрудника (filevault.DialogTimeout = 10 мин), плюс
+// сами системные операции и доставка результата. Скриптовый maxRuntime здесь
+// не годится: он резал бы диалог на середине и отчитывался ошибкой по машине, где
+// человек ещё вводит пароль.
+const provisionTimeout = 15 * time.Minute
+
+// maxConcurrentTasks — потолок ОДНОВРЕМЕННО исполняемых скриптов задач. Без него
+// всплеск Task по стриму спавнил бы неограниченно интерпретаторов от root
+// (форк-бомба/исчерпание PID и памяти). Control-plane команды (lock/decommission)
+// этим потолком не гейтятся.
+const maxConcurrentTasks = 8
+
+// shutdownGrace — сколько ждать завершения текущих задач при остановке агента.
+// Потолок выполнения ПЛЮС callTimeout: гейт по stopping стоит ДО connect/ack, но
+// задача, прошедшая его за миг до Shutdown, ещё тратит до callTimeout на ack
+// (connect — grpc.NewClient, неблокирующий; markIfNew — локальный I/O) и лишь
+// потом стартует скрипт. Её дедлайн — старт + maxRuntime, то есть до
+// Shutdown + callTimeout + maxRuntime. Грейс, равный только maxRuntime, резал
+// такой скрипт по cancel — ложный ERROR, причём ПОСТОЯННЫЙ: seen помечен до
+// запуска, передоставка выполнение уже не повторит.
+const shutdownGrace = maxRuntime + callTimeout
+
+// EnqueueFunc ставит отчёт в устойчивую очередь доставки (outbox.Queue.Enqueue).
+// Тот же контракт, что у одноимённого типа в internal/agent/scripts.
+type EnqueueFunc func(kind string, data []byte) error
+
+// Executor выполняет задачи, пришедшие от сервера.
+type Executor struct {
+	dialer  *transport.Dialer
+	log     *slog.Logger
+	enqueue EnqueueFunc // durable-доставка результата через outbox; nil = только прямой unary
+
+	// execCtx — контекст выполнения задач. НЕ сигнальный: при SIGTERM задачи
+	// продолжаются до завершения (грейс), а не убиваются мгновенно. Отменяется
+	// в Shutdown по истечении грейса.
+	execCtx context.Context
+	cancel  context.CancelFunc
+
+	wg sync.WaitGroup // учёт задач «в полёте» для graceful shutdown
+
+	mu        sync.Mutex // защищает accepting и inflight
+	accepting bool       // принимаем ли новые задачи
+	seen      *seenSet   // идемпотентность по task_id (персистентная)
+
+	// inflight — task_id задач, уже принятых в обработку (включая ждущие слот
+	// семафора). Пока задача ждёт слот, она НЕ ack'нута и на сервере остаётся
+	// 'pending' — минутный реконсайлер (cmd/server) передоставляет её снова и
+	// снова; без дедупа каждая копия спавнила бы горутину, висящую на семафоре
+	// с *pb.Task (телом скрипта) в памяти — линейный рост от времени ожидания.
+	// Дедуп НЕ молчаливый для стартовавших (seen) задач: их копии
+	// переподтверждаются ack'ом без выполнения — см. Submit.
+	inflight map[string]struct{}
+
+	// stopping закрывается в начале Shutdown: задачи, ещё не взявшие слот
+	// семафора, выходят немедленно (seen не помечен — передоставятся), вместо
+	// того чтобы стартовать посреди грейса и получить урезанное время (<
+	// maxRuntime) — ложный ERROR при cancel. Гейт НЕ герметичен: между ним и
+	// стартом скрипта стоят connect (неблокирующий) и ack (до callTimeout), так
+	// что скрипт может стартовать до callTimeout ПОСЛЕ начала Shutdown — это
+	// окно закрывает запас в shutdownGrace (maxRuntime + callTimeout), а не гейт.
+	stopping chan struct{}
+
+	// fallbacks — сколько раз результат ушёл МИМО durable-очереди прямым unary
+	// (outbox сломан/недоступен). Кумулятив уходит в каждый лог фолбэка:
+	// постоянно сломанный outbox — видимая авария, а не тихая деградация
+	// (снаружи «результаты доходят», а durability уже нет).
+	fallbacks atomic.Uint64
+
+	// connect возвращает gRPC-клиента и функцию закрытия соединения. Поле (а не
+	// прямой dial), чтобы тесты подставляли фейкового клиента. По умолчанию —
+	// dialAndClient на основе dialer.
+	connect func() (pb.AgentServiceClient, func(), error)
+
+	locker  LockApplier      // применяет команды блокировки устройства (nil = выключено)
+	revoker FileVaultRevoker // деструктивный FileVault revoke-chaining (nil = недоступен на этой ОС/сборке)
+
+	// sem ограничивает число одновременно исполняемых скриптов задач
+	// (maxConcurrentTasks). Буферизированный канал = взвешенный семафор.
+	sem chan struct{}
+
+	// onDecommission сигналит рабочему циклу остановиться и снести агента (сам
+	// teardown — service/tamper/файлы — живёт в cmd/agent, ему известны пути).
+	// nil = команда decommission отклоняется (сборка/окружение без обвязки).
+	onDecommission func(requestID, reason string)
+
+	// rebooter планирует перезагрузку устройства средствами ОС.
+	// nil = команда reboot отклоняется с ОШИБКОЙ (см. handleReboot), а не тихо
+	// игнорируется: иначе оператор видел бы «выполнено» на неперезагруженной машине.
+	rebooter Rebooter
+
+	// uninstaller снимает установленное ПО. nil = команда отклоняется с ОШИБКОЙ
+	// (та же логика, что у rebooter).
+	uninstaller Uninstaller
+
+	// fvProvisioner дозавершает FileVault-provisioning по команде оператора.
+	// nil (free-сборка, не macOS) = команда отклоняется с ОШИБКОЙ.
+	fvProvisioner FileVaultProvisioner
+
+	// screen принимает приглашения на интерактивный сеанс.
+	// nil (free-сборка, ОС без захвата) = приглашение отклоняется с ОШИБКОЙ и кодом
+	// причины: оператор, ждущий кадров от агента без этой фичи, обязан увидеть отказ.
+	screen ScreenSessioner
+
+	// inventoryNudge просит репортер снять инвентарь вне очереди — чтобы карточка
+	// устройства обновилась сразу после снятия ПО, а не через цикл. nil = не
+	// подключён (штатный цикл всё равно догонит).
+	inventoryNudge func()
+
+	// agentVersion попадает в текст отказа для неизвестного типа задачи: оператор
+	// в панели должен видеть, КАКАЯ версия агента не умеет эту задачу, иначе
+	// «не поддерживается» ничего не говорит про парк из разных версий.
+	agentVersion string
+}
+
+// LockApplier применяет команды блокировки/разблокировки устройства (реализуется
+// lock.Manager). Вынесен интерфейсом, чтобы executor не зависел от пакета lock и
+// тестировался с фейком.
+type LockApplier interface {
+	Lock(requestID, hash, reason string) error
+	Unlock() error
+}
+
+// FileVaultRevoker выполняет ДЕСТРУКТИВНУЮ dynamic-revoke-цепочку (G1/G2/G3)
+// вместо обычного оверлей-лока — только
+// когда LockCommand.lock_mode == LOCK_MODE_FILEVAULT (fail-safe: 0/unknown
+// всегда трактуется как OVERLAY, см. proto LockMode doc). Реализуется
+// filevault.Chain.RevokeAndShutdown (revoke → durable-доставленный отчёт →
+// H3 forced shutdown, строго в этом порядке); вынесен интерфейсом по тому же
+// паттерну, что LockApplier.
+type FileVaultRevoker interface {
+	RevokeAndShutdown(ctx context.Context, requestID string) (pb.LockState, error)
+}
+
+// SetLocker подключает применятель блокировок. Вызывать до старта приёма задач.
+func (e *Executor) SetLocker(l LockApplier) { e.locker = l }
+
+// SetFileVaultRevoker подключает FileVault revoke-chaining. nil (по умолчанию)
+// означает, что lock_mode=FILEVAULT будет отклонён с ошибкой, а не тихо
+// выполнен как overlay — см. handleLock.
+func (e *Executor) SetFileVaultRevoker(r FileVaultRevoker) { e.revoker = r }
+
+// SetDecommissioner подключает обработчик команды полного самоудаления. nil
+// (по умолчанию) → команда decommission отклоняется, а не выполняется тихо.
+// Вызывать до старта приёма задач.
+func (e *Executor) SetDecommissioner(f func(requestID, reason string)) { e.onDecommission = f }
+
+// Rebooter планирует перезагрузку устройства через планировщик ОС. Реализуется
+// reboot.Scheduler; вынесен интерфейсом по тому же паттерну, что LockApplier —
+// чтобы executor не зависел от пакета reboot и тестировался фейком (реальную
+// перезагрузку в тесте не вызвать).
+//
+// Возврат без ошибки означает «команда ПРИНЯТА планировщиком», а не «машина уже
+// перезагрузилась». Первое значение — ФАКТИЧЕСКАЯ отсрочка: она может отличаться
+// от запрошенной (границы, округление до минут на macOS/Linux), и отчитываться
+// серверу надо именно ей, иначе в аудите останется время, которого не было.
+type Rebooter interface {
+	Schedule(ctx context.Context, delay time.Duration, reason string) (time.Duration, error)
+}
+
+// SetRebooter подключает планировщик перезагрузки. nil (по умолчанию) → команда
+// reboot отчитывается ОШИБКОЙ, а не тихо игнорируется. Вызывать до старта приёма
+// задач.
+func (e *Executor) SetRebooter(r Rebooter) { e.rebooter = r }
+
+// FileVaultProvisioner дозавершает FileVault-provisioning на уже энролленном
+// маке: спрашивает пароль у сотрудника в его графической сессии и выполняет то,
+// что headless-постустановка выполнить не могла.
+//
+// Возвращает ошибку на ЛЮБОЙ неуспех, включая отказ человека и таймаут: по
+// контракту команды (proto: FileVaultProvisionCommand) тихий Skip запрещён —
+// оператор должен видеть причину, а не «выполнено» на непровиженной машине.
+type FileVaultProvisioner interface {
+	Provision(ctx context.Context, requestID, reason string) error
+}
+
+// SetFileVaultProvisioner подключает исполнителя provisioning. nil (по умолчанию
+// — free-сборка или не macOS) → команда отчитывается ОШИБКОЙ, той же логикой, что
+// rebooter/uninstaller.
+func (e *Executor) SetFileVaultProvisioner(p FileVaultProvisioner) { e.fvProvisioner = p }
+
+// Uninstaller снимает установленное ПО. Реализуется uninstall.Manager; вынесен
+// интерфейсом по тому же паттерну, что LockApplier и Rebooter.
+//
+// Ошибку не возвращает намеренно: у удаления ПО нет «просто ошибки» — есть
+// исход, который оператору нужно различать (снято / и так нет / цель разъехалась
+// с инвентарём / сносить нечем / это сам агент). Всё это едет в Result.
+type Uninstaller interface {
+	Run(ctx context.Context, req uninstall.Request) uninstall.Result
+}
+
+// SetUninstaller подключает исполнитель удаления ПО. nil (по умолчанию) →
+// команда отчитывается ОШИБКОЙ (см. handleUninstall), а не тихо игнорируется.
+// Вызывать до старта приёма задач.
+func (e *Executor) SetUninstaller(u Uninstaller) { e.uninstaller = u }
+
+// ScreenSessioner принимает приглашение на интерактивный сеанс. Реализуется
+// screen.Manager; вынесен интерфейсом по тому же паттерну, что LockApplier и Rebooter, —
+// пакет screen собирается только под тегом enterprise, и executor не имеет права от него
+// зависеть.
+//
+// Первое возвращаемое значение — КОД ОТКАЗА (EndReason), а не текст. Пустой код при
+// nil-ошибке означает «сеанс принят сервером и захват пошёл»; всё остальное — отказ,
+// который оператор обязан прочитать кодом (§1 контракта).
+type ScreenSessioner interface {
+	StartSession(ctx context.Context, taskID string, cmd *pb.ScreenSessionCommand) (string, error)
+}
+
+// SetScreenSessioner подключает менеджер интерактивных сеансов. nil (free-сборка или ОС
+// без захвата) → приглашение отчитывается ОШИБКОЙ с кодом причины, а не тихо
+// игнорируется. Вызывать до старта приёма задач.
+func (e *Executor) SetScreenSessioner(s ScreenSessioner) { e.screen = s }
+
+// screenStartTimeout — потолок ожидания старта сеанса.
+//
+// Складывается из запуска захватчика в сессии пользователя (до 20 с: на Retina первый
+// снимок делается ДО подключения к каналу) и подтверждения регистрации сервером (15 с).
+// Сорок пять секунд — с запасом к сумме; меньше означало бы отказывать исправной машине
+// под нагрузкой, больше — держать оператора в неведении дольше, чем он готов ждать.
+const screenStartTimeout = 45 * time.Second
+
+// SetAgentVersion сообщает исполнителю версию агента — она уходит в текст отказа
+// для неизвестных типов задач. Вызывать до старта приёма задач.
+func (e *Executor) SetAgentVersion(v string) { e.agentVersion = v }
+
+// unsupportedTaskError — текст, который увидит оператор в панели. Явно говорит, что
+// работа НЕ выполнялась: «не поддерживается» без этого читается как «сделано иначе».
+func unsupportedTaskError(agentVersion string) string {
+	v := agentVersion
+	if v == "" {
+		v = "версия неизвестна"
+	}
+	return "тип задачи не поддерживается этой версией агента (" + v + ") — задача НЕ выполнялась; обновите агента на устройстве"
+}
+
+// SetInventoryNudge подключает внеочередной пересбор инвентаря. Вызывается
+// ПОСЛЕ фактического снятия ПО: без него карточка устройства до пяти минут
+// показывала бы снятую программу как установленную, и оператор читал бы
+// успешную задачу как несработавшую. nil = штатный цикл (снимок раз в Interval).
+func (e *Executor) SetInventoryNudge(f func()) { e.inventoryNudge = f }
+
+// NewExecutor creates an executor. statePath — файл для персистентной идемпотентности
+// (""=только память). enqueue — durable-очередь доставки результатов (outbox);
+// nil = результат уходит прямым unary-вызовом без гарантии доставки.
+func NewExecutor(dialer *transport.Dialer, log *slog.Logger, statePath string, enqueue EnqueueFunc) *Executor {
+	ctx, cancel := context.WithCancel(context.Background())
+	e := &Executor{
+		dialer:    dialer,
+		log:       log,
+		enqueue:   enqueue,
+		execCtx:   ctx,
+		cancel:    cancel,
+		accepting: true,
+		seen:      loadSeenSet(statePath),
+		inflight:  make(map[string]struct{}),
+		stopping:  make(chan struct{}),
+		sem:       make(chan struct{}, maxConcurrentTasks),
+	}
+	e.connect = e.dialAndClient
+	return e
+}
+
+// dialAndClient — продакшн-реализация connect: dial + gRPC-клиент.
+func (e *Executor) dialAndClient() (pb.AgentServiceClient, func(), error) {
+	conn, err := e.dialer.Dial()
+	if err != nil {
+		return nil, nil, err
+	}
+	return pb.NewAgentServiceClient(conn), func() { conn.Close() }, nil
+}
+
+// Submit принимает Task из Connect-стрима и обрабатывает асинхронно, чтобы не
+// блокировать heartbeat. Подходит как heartbeat.OnTask.
+func (e *Executor) Submit(task *pb.Task) {
+	id := task.GetTaskId()
+	if id == "" {
+		e.log.Warn("получена задача без task_id — пропуск")
+		return
+	}
+	e.mu.Lock()
+	if !e.accepting {
+		e.mu.Unlock()
+		e.log.Warn("агент останавливается — задача отклонена", slog.String("task_id", id))
+		return
+	}
+	if _, dup := e.inflight[id]; dup {
+		// wg.Add строго под e.mu (симметрично основной ветке): Add после Unlock
+		// гнался бы с wg.Wait в Shutdown (misuse WaitGroup при нулевом счётчике).
+		seenDup := e.seen.has(id)
+		if seenDup {
+			e.wg.Add(1)
+		}
+		e.mu.Unlock()
+		// Уровень Info, не Debug: прод-логгер стоит на Info, и дроп передоставки
+		// на Debug в поле был невидим вообще.
+		if seenDup {
+			// Задача уже СТАРТОВАЛА (seen), но всё ещё в полёте — например,
+			// control-plane handle без потолка (FileVault RevokeAndShutdown
+			// держит durable-retry до конца жизни агента). Если её первый ack
+			// потерялся, сервер видит вечный 'pending' и передоставляет — молча
+			// глотать копию значит никогда не восстановить ack (прежний контракт
+			// «повторную доставку подтверждаем, но не выполняем» до inflight-
+			// дедупа это гарантировал). Переподтверждаем в короткой горутине,
+			// НЕ выполняя: connect дёшев (grpc.NewClient), ack ≤ callTimeout.
+			e.log.Info("повторная доставка задачи в обработке — переподтверждаю (ack мог потеряться)",
+				slog.String("task_id", id))
+			go func() {
+				defer e.wg.Done()
+				client, closeConn, err := e.connect()
+				if err != nil {
+					e.log.Error("task: соединение для переподтверждения", slog.String("task_id", id), slog.Any("error", err))
+					return
+				}
+				defer closeConn()
+				e.ack(client, id)
+			}()
+			return
+		}
+		// Копия задачи, ещё ЖДУЩЕЙ слот семафора (seen не помечен): ack'ать нельзя —
+		// на сервере она обязана оставаться 'pending', чтобы при рестарте агента до
+		// старта скрипта передоставка её не потеряла (sweep зачистил бы 'acked' в
+		// failed). Ожидаемая частота — раз в минуту на задачу до освобождения слота.
+		e.log.Info("задача уже ждёт слот — повторная доставка отброшена", slog.String("task_id", id))
+		return
+	}
+	e.inflight[id] = struct{}{}
+	e.wg.Add(1)
+	e.mu.Unlock()
+
+	go func() {
+		defer e.wg.Done()
+		defer func() {
+			e.mu.Lock()
+			delete(e.inflight, id)
+			e.mu.Unlock()
+		}()
+		e.handle(task)
+	}()
+}
+
+// Shutdown прекращает приём новых задач и ждёт завершения уже запущенных до
+// shutdownGrace; по истечении грейса — прерывает их (cancel execCtx).
+func (e *Executor) Shutdown() {
+	e.mu.Lock()
+	if e.accepting {
+		e.accepting = false
+		// Будим задачи, ждущие слот семафора: им нельзя стартовать посреди
+		// грейса (получили бы урезанное время и ложный ERROR) — они выходят,
+		// не пометив seen, и передоставятся после рестарта.
+		close(e.stopping)
+	}
+	e.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		e.cancel()
+	case <-time.After(shutdownGrace):
+		e.log.Warn("graceful shutdown: задачи не успели за грейс — прерываю",
+			slog.Duration("grace", shutdownGrace))
+		e.cancel()
+		e.wg.Wait()
+	}
+}
+
+func (e *Executor) handle(task *pb.Task) {
+	id := task.GetTaskId()
+
+	// Скрипт-задачи гейтим семафором ДО connect/ack/seen. Порядок критичен:
+	//  (а) seen помечается ТОЛЬКО после захвата слота — иначе задача, вытесненная
+	//      на семафоре при остановке агента (execCtx отменён), осталась бы seen,
+	//      но не выполненной, и передоставка after-restart её бы отсекла (потеря);
+	//  (б) connect тоже после слота — тысячи ждущих слот горутин иначе держали бы
+	//      открытые gRPC-соединения (исчерпание FD/памяти при bulk-push).
+	// lock/decommission/reboot (control-plane) семафором НЕ гейтим: не форк-бомба и
+	// не должны ждать за скриптами. FileVault-provisioning тоже: он не считает и не
+	// порождает нагрузку, а ЖДЁТ ответа человека до десяти минут — занимать этим
+	// слот исполнителя скриптов значит подпирать очередь чужой работы. Удаление ПО (Task.uninstall) в этот список
+	// НЕ входит осознанно — оно порождает процесс деинсталлятора и подчиняется
+	// тому же потолку, что скрипты.
+	// Приглашение на интерактивный сеанс (Task.screen_session) в этот же список: оно не
+	// считает и не порождает нагрузку, а ЖДЁТ — запуска захватчика в сессии пользователя и
+	// подтверждения сеанса сервером, до двадцати секунд. Держать этим слот исполнителя
+	// скриптов значит подпирать чужую очередь ожиданием.
+	if task.GetLock() == nil && task.GetDecommission() == nil && task.GetReboot() == nil &&
+		task.GetFilevaultProvision() == nil && task.GetScreenSession() == nil {
+		select {
+		case e.sem <- struct{}{}:
+			defer func() { <-e.sem }()
+		case <-e.stopping:
+			e.log.Warn("task: агент останавливается — скрипт не запущен (seen НЕ помечен, передоставится)", slog.String("task_id", id))
+			return
+		case <-e.execCtx.Done():
+			e.log.Warn("task: агент останавливается — скрипт не запущен (seen НЕ помечен, передоставится)", slog.String("task_id", id))
+			return
+		}
+		// Слот и остановка могли быть готовы одновременно (select выбирает
+		// случайно из готовых case) — перепроверяем: скрипт ещё не стартовал,
+		// выйти сейчас безопасно, а стартовать в грейс — значит быть убитым
+		// посреди выполнения по cancel (см. shutdownGrace).
+		select {
+		case <-e.stopping:
+			e.log.Warn("task: агент останавливается — скрипт не запущен (seen НЕ помечен, передоставится)", slog.String("task_id", id))
+			return
+		default:
+		}
+	}
+
+	client, closeConn, err := e.connect()
+	if err != nil {
+		// seen не помечаем — пусть сервер передоставит (at-least-once).
+		e.log.Error("task: соединение", slog.String("task_id", id), slog.Any("error", err))
+		return
+	}
+	defer closeConn()
+
+	// Идемпотентность: повторную доставку подтверждаем (ack мог потеряться),
+	// но скрипт второй раз не запускаем. Набор персистентный — переживает рестарт.
+	newTask := e.seen.markIfNew(id)
+	e.ack(client, id)
+	if !newTask {
+		e.log.Warn("повторная доставка задачи — выполнение пропущено", slog.String("task_id", id))
+		return
+	}
+
+	// Команда блокировки устройства приезжает в Task.lock (а не как скрипт).
+	if lc := task.GetLock(); lc != nil {
+		e.handleLock(client, id, lc)
+		return
+	}
+
+	// Команда полного самоудаления приезжает в Task.decommission.
+	if dc := task.GetDecommission(); dc != nil {
+		e.handleDecommission(client, id, dc)
+		return
+	}
+
+	// Команда перезагрузки приезжает в Task.reboot.
+	if rc := task.GetReboot(); rc != nil {
+		e.handleReboot(client, id, rc)
+		return
+	}
+
+	// Команда удаления ПО приезжает в Task.uninstall. Семафор для неё УЖЕ взят
+	// выше (она не control-plane): деинсталлятор — такой же порождаемый процесс,
+	// как скрипт, и всплеск таких задач без потолка спавнил бы msiexec'ов
+	// столько же, сколько интерпретаторов.
+	if uc := task.GetUninstall(); uc != nil {
+		e.handleUninstall(client, id, uc)
+		return
+	}
+
+	// Дозавершение FileVault-provisioning приезжает в Task.filevault_provision.
+	if fc := task.GetFilevaultProvision(); fc != nil {
+		e.handleFileVaultProvision(client, id, fc)
+		return
+	}
+
+	// Приглашение на интерактивный сеанс приезжает в Task.screen_session.
+	if sc := task.GetScreenSession(); sc != nil {
+		e.handleScreenSession(client, id, sc)
+		return
+	}
+
+	// Дошли сюда — ни одна известная команда не заполнена. Пустой script_content
+	// означает одно из двух: сервер прислал ТИП ЗАДАЧИ, которого этот агент не знает
+	// (он новее агента), либо скрипт-задачу с пустым телом. Раньше и то, и другое
+	// уезжало в runScript с пустой строкой, интерпретатор отрабатывал вхолостую и
+	// возвращал 0 — оператор в панели видел «выполнено», хотя на устройстве не
+	// произошло НИЧЕГО. Молчаливый успех хуже отказа: рассинхрон версий выглядит как
+	// сделанная работа. Поэтому — явный отказ с причиной.
+	if task.GetScriptContent() == "" {
+		e.log.Error("task: тип задачи не поддерживается этой версией агента — задача НЕ выполнялась",
+			slog.String("task_id", id), slog.String("agent_version", e.agentVersion))
+		e.deliver(client, &pb.TaskResult{
+			TaskId:   id,
+			Status:   pb.TaskStatus_TASK_STATUS_ERROR,
+			ErrorLog: unsupportedTaskError(e.agentVersion),
+		})
+		return
+	}
+
+	// Семафор скрипт-задачи уже захвачен в начале handle (см. коммент там).
+	e.log.Info("выполняю задачу", slog.String("task_id", id), slog.String("platform", task.GetPlatform()))
+	runCtx, cancel := context.WithTimeout(e.execCtx, maxRuntime)
+	defer cancel()
+	stdout, stderr, runErr := runScript(runCtx, task.GetPlatform(), task.GetScriptContent())
+
+	result := &pb.TaskResult{TaskId: id, Output: stdout}
+	if runErr != nil {
+		result.Status = pb.TaskStatus_TASK_STATUS_ERROR
+		result.ErrorLog = combineErr(stderr, runErr)
+		e.log.Warn("задача завершилась ошибкой", slog.String("task_id", id), slog.Any("error", runErr))
+	} else {
+		result.Status = pb.TaskStatus_TASK_STATUS_SUCCESS
+		e.log.Info("задача выполнена успешно", slog.String("task_id", id))
+	}
+	e.deliver(client, result)
+}
+
+// handleFileVaultProvision дозавершает FileVault-provisioning: спрашивает пароль у
+// сотрудника в его графической сессии и выполняет то, что headless-постустановка
+// выполнить не могла.
+//
+// Любой неуспех — ERROR с причиной, включая отказ человека и таймаут. Это прямое
+// требование контракта (proto: FileVaultProvisionCommand): тихий Skip здесь
+// означал бы «оператор нажал кнопку, панель показала выполнено, диск остался без
+// эскроу» — тот же класс молчаливого вранья, что незнакомый тип задачи,
+// отчитанный успехом.
+//
+// Потолок времени — provisionTimeout, а не maxRuntime: внутри диалог, который ждёт
+// живого человека, и пять минут скриптового потолка резали бы его на середине.
+func (e *Executor) handleFileVaultProvision(client pb.AgentServiceClient, taskID string, fc *pb.FileVaultProvisionCommand) {
+	reqID := fc.GetRequestId()
+	if reqID == "" {
+		reqID = taskID
+	}
+	if e.fvProvisioner == nil {
+		e.log.Error("filevault: команда provisioning получена, но исполнитель не сконфигурирован",
+			slog.String("task_id", taskID))
+		e.deliver(client, &pb.TaskResult{
+			TaskId:   taskID,
+			Status:   pb.TaskStatus_TASK_STATUS_ERROR,
+			ErrorLog: "FileVault-provisioning недоступен на этом агенте: сборка без поддержки FileVault либо не macOS",
+		})
+		return
+	}
+
+	e.log.Info("filevault: дозавершаю provisioning по команде оператора",
+		slog.String("task_id", taskID), slog.String("request_id", reqID))
+	ctx, cancel := context.WithTimeout(e.execCtx, provisionTimeout)
+	defer cancel()
+
+	result := &pb.TaskResult{TaskId: taskID}
+	if err := e.fvProvisioner.Provision(ctx, reqID, fc.GetReason()); err != nil {
+		result.Status = pb.TaskStatus_TASK_STATUS_ERROR
+		result.ErrorLog = err.Error()
+		e.log.Warn("filevault: provisioning не завершён", slog.String("task_id", taskID), slog.Any("error", err))
+	} else {
+		result.Status = pb.TaskStatus_TASK_STATUS_SUCCESS
+		e.log.Info("filevault: provisioning завершён", slog.String("task_id", taskID))
+	}
+	e.deliver(client, result)
+}
+
+// handleScreenSession принимает приглашение на интерактивный сеанс.
+//
+// Результат задачи отдаётся по исходу ЗАПРОСА, а не по концу сеанса (§9.2 контракта).
+// Причина конкретная: FailStaleAckedTasks помечает failed любую задачу, подтверждённую
+// больше пятнадцати минут назад и не приславшую результат (единственное исключение в SQL —
+// lock). Часовой сеанс без этого правила всегда выглядел бы провалившимся, а второе
+// исключение в предикате sweep'а превратило бы его в список частных случаев.
+//
+// Дальнейшая жизнь сеанса живёт в screen_sessions на сервере, а не в строке задачи.
+func (e *Executor) handleScreenSession(client pb.AgentServiceClient, taskID string, sc *pb.ScreenSessionCommand) {
+	if e.screen == nil {
+		// Free-сборка или ОС без захвата. Молчаливый успех здесь был бы худшим исходом:
+		// оператор ждал бы кадров от агента, который физически не содержит этой фичи.
+		e.log.Error("screen: приглашение получено, но удалённый стол не собран в этом агенте",
+			slog.String("task_id", taskID))
+		e.deliver(client, &pb.TaskResult{
+			TaskId:        taskID,
+			Status:        pb.TaskStatus_TASK_STATUS_ERROR,
+			ScreenRefusal: "PLATFORM_UNSUPPORTED",
+			ErrorLog:      "удалённый рабочий стол недоступен на этом агенте: сборка без поддержки либо ОС без захвата экрана",
+		})
+		return
+	}
+
+	e.log.Info("screen: приглашение на сеанс",
+		slog.String("task_id", taskID), slog.String("session", sc.GetSessionId()),
+		slog.String("operator", sc.GetOperatorName()))
+
+	ctx, cancel := context.WithTimeout(e.execCtx, screenStartTimeout)
+	defer cancel()
+
+	refusal, err := e.screen.StartSession(ctx, taskID, sc)
+	result := &pb.TaskResult{TaskId: taskID}
+	switch {
+	case refusal != "":
+		// Отказ по потолку ОС — не сбой агента, но и не успех: сеанса не будет, и
+		// оператор обязан прочитать ПОЧЕМУ отдельным кодом, а не подстрокой в тексте.
+		result.Status = pb.TaskStatus_TASK_STATUS_ERROR
+		result.ScreenRefusal = refusal
+		if err != nil {
+			result.ErrorLog = err.Error()
+		} else {
+			result.ErrorLog = "сеанс не начат: " + refusal
+		}
+		e.log.Warn("screen: сеанс не начат", slog.String("task_id", taskID), slog.String("reason", refusal))
+	case err != nil:
+		result.Status = pb.TaskStatus_TASK_STATUS_ERROR
+		result.ErrorLog = err.Error()
+		e.log.Error("screen: сеанс не начат", slog.String("task_id", taskID), slog.Any("error", err))
+	default:
+		result.Status = pb.TaskStatus_TASK_STATUS_SUCCESS
+		result.Output = "сеанс начат"
+	}
+	e.deliver(client, result)
+}
+
+// deliver отправляет результат задачи durable-путём: через outbox-очередь, которая
+// переживает обрыв связи и рестарт агента (прежний прямой unary-вызов терял
+// результат при любом сбое отправки, а строка задачи навсегда зависала в 'acked').
+// Повторная/запоздалая доставка для сервера безопасна: CompleteTask скоупится по
+// device_id, чужой/устаревший task_id — accept-and-drop (gateway.go).
+//
+// Прямой ReportTaskResult остаётся фолбэком, когда очередь недоступна (enqueue не
+// сконфигурирован или диск отказал): best-effort попытка сейчас лучше
+// гарантированной потери. Output/ErrorLog уже обрезаны и санитайзены на источнике
+// (runScript → scriptenc), поэтому запись не встанет колом в голове FIFO
+// ResourceExhausted'ом.
+//
+// Известный потолок (общий со scripts.Runner/KindScript, дизайн outbox): очередь
+// одна FIFO на все виды отчётов, поэтому при переполнении OutboxMax результат
+// может быть вытеснен drop-oldest'ом, а head-of-line блокировка может задержать
+// его дольше серверного sweep (15 мин) → ложный 'failed', который затем
+// перезапишется верным результатом при доставке. Это лучше прежнего поведения
+// (гарантированная потеря при любом сбое отправки), а не хуже.
+//
+// Серверная сторона этого закрыта: CompleteTask поздний результат ПРИНИМАЕТ (гард
+// `status='acked'` сохранял бы ложный 'failed' навсегда и возвращал бы агенту
+// ErrTaskNotOwned — по контракту Report*-RPC это poison-pill), но исправление задним
+// числом больше не молчаливое: переход failed→completed пишется в аудит как
+// late_task_result. Корень же — общая FIFO на все виды отчётов; окончательно он
+// лечится раздельными очередями по видам, и это уже агентская сторона.
+func (e *Executor) deliver(client pb.AgentServiceClient, result *pb.TaskResult) {
+	if e.enqueue == nil {
+		e.report(client, result)
+		return
+	}
+	data, err := proto.Marshal(result)
+	if err != nil {
+		// Не должно случаться (runScript гарантирует валидный UTF-8) — но потерять
+		// результат молча нельзя, пробуем хотя бы напрямую.
+		e.log.Error("task: сериализация результата — ФОЛБЭК на прямой unary, durability деградировала",
+			slog.String("task_id", result.GetTaskId()),
+			slog.Uint64("fallback_total", e.fallbacks.Add(1)),
+			slog.Any("error", err))
+		e.report(client, result)
+		return
+	}
+	if err := e.enqueue(outbox.KindTask, data); err != nil {
+		e.log.Error("task: outbox недоступен — ФОЛБЭК на прямой unary, durability деградировала",
+			slog.String("task_id", result.GetTaskId()),
+			slog.Uint64("fallback_total", e.fallbacks.Add(1)),
+			slog.Any("error", err))
+		e.report(client, result)
+		return
+	}
+	e.log.Info("task: результат поставлен в очередь доставки", slog.String("task_id", result.GetTaskId()))
+}
+
+// handleLock применяет команду блокировки/разблокировки устройства и отчитывается
+// серверу (ReportLockStatus) для аудита и UI. lock.Manager идемпотентен по
+// request_id, поэтому повторная доставка безопасна.
+//
+// Корреляционный id: сервер шлёт его в LockCommand.request_id, но приравнивает к
+// task_id. Если поле пустое (сервер положил только task_id) — падаем на taskID,
+// чтобы идемпотентность и ReportLockStatus всё равно корректно сходились с задачей.
+//
+// lock_mode == LOCK_MODE_FILEVAULT (и НЕ unlock) — ветвится на e.revoker вместо
+// обычного оверлея (proto LockMode doc: fail-safe, 0/unknown всегда OVERLAY, так
+// что этот branch срабатывает ТОЛЬКО на явном значении 2). e.revoker == nil →
+// ошибка вместо тихой деградации в overlay — сервер уже проверил escrow.Enabled
+// перед постановкой такой задачи (handler.go lockDevice), поэтому nil здесь
+// означает рассинхрон сборки агента, а не штатный случай.
+func (e *Executor) handleLock(client pb.AgentServiceClient, taskID string, lc *pb.LockCommand) {
+	reqID := lc.GetRequestId()
+	if reqID == "" {
+		reqID = taskID
+	}
+	var (
+		err   error
+		state pb.LockState
+	)
+	switch {
+	case lc.GetUnlock():
+		if e.locker == nil {
+			e.log.Error("lock: команда разблокировки получена, но locker не сконфигурирован", slog.String("task_id", taskID))
+			return
+		}
+		err = e.locker.Unlock()
+		state = pb.LockState_LOCK_STATE_UNLOCKED
+	case lc.GetLockMode() == pb.LockMode_LOCK_MODE_FILEVAULT:
+		if e.revoker == nil {
+			// Misbuild: revoker недоступен, RevokeAndShutdown не отработает — executor
+			// сам репортит FAILED (сервер: actual-state + аудит + алерт IT), чтобы факт
+			// не потерялся тихо. Падаем в общий report-блок ниже.
+			err = fmt.Errorf("filevault revoker не сконфигурирован на этом агенте (сборка/ОС не поддерживает FileVault-лок)")
+			state = pb.LockState_LOCK_STATE_FILEVAULT_REVOKE_FAILED
+		} else {
+			// RevokeAndShutdown durably репортит САМ все три исхода — успех
+			// (FILEVAULT_REVOKED), ABORT после мутации и ABORT до мутации (оба —
+			// FILEVAULT_REVOKE_FAILED, блокирующий retry, report.go). Executor НЕ
+			// пере-репортит: иначе дубль аудита/алерта + гонка с shutdown -h now.
+			// Ошибку только логируем — отчёт уже за revoker'ом.
+			//
+			// ⚠️ Ранний return здесь верен ТОЛЬКО пока это так. До 2026-07-26
+			// pre-mutation ABORT'ы (а сегодня туда уходит каждая FileVault-команда:
+			// MDMAdminPassword намеренно nil) не репортились ни revoker'ом, ни
+			// отсюда — сервер не узнавал о неприменённом локе вообще ничего.
+			if _, rerr := e.revoker.RevokeAndShutdown(e.execCtx, reqID); rerr != nil {
+				e.log.Error("lock: filevault RevokeAndShutdown", slog.String("request_id", reqID), slog.Any("error", rerr))
+			}
+			return
+		}
+	default:
+		if e.locker == nil {
+			e.log.Error("lock: команда блокировки получена, но locker не сконфигурирован", slog.String("task_id", taskID))
+			return
+		}
+		if err = e.locker.Lock(reqID, lc.GetPasswordHash(), lc.GetReason()); err != nil {
+			// Лок НЕ поднят (пустой/битый password_hash #13, транзиентный отказ
+			// persist). НЕ репортим никакого состояния: LOCKED был бы ложью (#1.2 —
+			// панель показывает «заблокировано» при рабочей машине), а UNLOCKED
+			// стёр бы desired=locked на сервере (overlay-UNLOCKED → SetDeviceLockState
+			// '', adversarial-ревью: critical — транзиентный сбой навсегда разоружает
+			// kill-switch). Громко логируем; desired на сервере цел, pull-реконсилятор
+			// (FetchLockStatus каждые 30с) доведёт — Manager.Lock атомарен (откат при
+			// отказе), поэтому ретрай честно повторяет попытку.
+			e.log.Error("lock: применить блокировку не удалось — НЕ репортю состояние (desired цел, реконсилятор доведёт)",
+				slog.String("request_id", reqID), slog.Any("error", err))
+			return
+		}
+		state = pb.LockState_LOCK_STATE_LOCKED
+	}
+
+	details := "ok"
+	if err != nil {
+		details = err.Error()
+		e.log.Error("lock: не удалось применить команду", slog.String("request_id", reqID), slog.Any("error", err))
+	}
+	ctx, cancel := context.WithTimeout(e.execCtx, callTimeout)
+	defer cancel()
+	if _, rerr := client.ReportLockStatus(ctx, &pb.ReportLockStatusRequest{
+		RequestId:  reqID,
+		State:      state,
+		OccurredAt: time.Now().Unix(),
+		Details:    details,
+	}); rerr != nil {
+		e.log.Error("lock: ReportLockStatus", slog.String("request_id", reqID), slog.Any("error", rerr))
+	}
+}
+
+// handleDecommission обрабатывает команду вывода устройства из эксплуатации:
+// ПОДТВЕРЖДАЕТ выполнение серверу (ReportTaskResult) и лишь затем сигналит
+// рабочему циклу остановиться и снести агента.
+//
+// Порядок критичен (см. proto DecommissionCommand): отчёт уходит, ПОКА серт ещё
+// на диске — сам снос (включая удаление серта) делает cmd/agent уже после
+// graceful-остановки цикла. Отчёт шлём напрямую (не через outbox): outbox
+// умер бы вместе с состоянием при сносе, а нам нужно подтверждение здесь и
+// сейчас. Ошибка отчёта не отменяет снос: недоснесённый агент продолжал бы
+// heartbeat'ом воскрешать списанную машину — прекратить heartbeat важнее, чем
+// дождаться ack (серверная сторона всё равно отзывает серт по своей логике).
+func (e *Executor) handleDecommission(client pb.AgentServiceClient, taskID string, dc *pb.DecommissionCommand) {
+	reqID := dc.GetRequestId()
+	if reqID == "" {
+		reqID = taskID
+	}
+	if e.onDecommission == nil {
+		e.log.Error("decommission: команда получена, но обработчик не сконфигурирован — игнорирую",
+			slog.String("task_id", taskID))
+		return
+	}
+	e.log.Warn("decommission: получена команда вывода устройства из эксплуатации",
+		slog.String("task_id", taskID), slog.String("request_id", reqID), slog.String("reason", dc.GetReason()))
+
+	// Подтверждаем ДО сноса — иначе отчитываться станет нечем (серт исчезнет).
+	ctx, cancel := context.WithTimeout(e.execCtx, callTimeout)
+	if _, err := client.ReportTaskResult(ctx, &pb.TaskResult{TaskId: taskID, Status: pb.TaskStatus_TASK_STATUS_SUCCESS}); err != nil {
+		e.log.Error("decommission: подтверждение серверу не доставлено — сношусь всё равно (иначе воскрешу списанную машину)",
+			slog.String("task_id", taskID), slog.Any("error", err))
+	}
+	cancel()
+
+	// Сигналим рабочему циклу: остановиться и выполнить teardown (cmd/agent).
+	e.onDecommission(reqID, dc.GetReason())
+}
+
+// handleReboot планирует перезагрузку устройства и отчитывается о задаче.
+//
+// Порядок: СНАЧАЛА планируем в ОС, ПОТОМ отчитываемся. Обратный порядок был бы
+// ложью — отчитались успехом, а планировщик отказал (нет привилегии, уже
+// запланирована другая перезагрузка), и машина никуда не идёт. Отказ планировщика
+// поэтому уезжает как ERROR: оператор видит причину в панели, а не «выполнено» на
+// неперезагруженной машине.
+//
+// Отчёт шлём сначала ПРЯМЫМ вызовом, а не через outbox: машина уйдёт вниз через
+// секунды-минуты, и очередь может не успеть провернуть отправку. Не доехало —
+// кладём в durable-очередь, она переживёт перезагрузку и доставит после загрузки
+// (в отличие от decommission, агент здесь возвращается к жизни, поэтому такой
+// фолбэк осмысленен).
+//
+// Второй перезагрузки от повторной доставки не будет: seen-набор персистентный и
+// переживает ребут (см. proto RebootCommand) — иначе устройство циклилось бы в
+// перезагрузках, пока сервер не получит отчёт.
+func (e *Executor) handleReboot(client pb.AgentServiceClient, taskID string, rc *pb.RebootCommand) {
+	reqID := rc.GetRequestId()
+	if reqID == "" {
+		reqID = taskID
+	}
+	if e.rebooter == nil {
+		// Misbuild/неподдерживаемая ОС. Отчитываемся ОШИБКОЙ, а не молчим: иначе
+		// строка задачи навсегда зависнет в 'acked' до серверного sweep, и причина
+		// нигде не появится.
+		e.log.Error("reboot: команда получена, но планировщик не сконфигурирован",
+			slog.String("task_id", taskID), slog.String("request_id", reqID))
+		e.deliver(client, &pb.TaskResult{
+			TaskId:   taskID,
+			Status:   pb.TaskStatus_TASK_STATUS_ERROR,
+			ErrorLog: "перезагрузка недоступна на этом агенте (сборка/ОС не поддерживает)",
+		})
+		return
+	}
+
+	e.log.Warn("reboot: получена команда перезагрузки устройства",
+		slog.String("task_id", taskID), slog.String("request_id", reqID),
+		slog.Int("requested_delay_sec", int(rc.GetDelaySeconds())),
+		slog.String("reason", rc.GetReason()))
+
+	ctx, cancel := context.WithTimeout(e.execCtx, callTimeout)
+	delay, err := e.rebooter.Schedule(ctx, time.Duration(rc.GetDelaySeconds())*time.Second, rc.GetReason())
+	cancel()
+	if err != nil {
+		e.log.Error("reboot: планировщик ОС отказал — перезагрузки НЕ будет",
+			slog.String("task_id", taskID), slog.Any("error", err))
+		e.deliver(client, &pb.TaskResult{
+			TaskId:   taskID,
+			Status:   pb.TaskStatus_TASK_STATUS_ERROR,
+			ErrorLog: err.Error(),
+		})
+		return
+	}
+
+	// В Output кладём ФАКТИЧЕСКУЮ отсрочку (после округления до минут на
+	// macOS/Linux), а не запрошенную: оператор и аудит должны видеть то время,
+	// которое реально задано планировщику.
+	result := &pb.TaskResult{
+		TaskId: taskID,
+		Status: pb.TaskStatus_TASK_STATUS_SUCCESS,
+		Output: fmt.Sprintf("перезагрузка запланирована через %s", delay),
+	}
+	e.log.Warn("reboot: перезагрузка запланирована",
+		slog.String("task_id", taskID), slog.Duration("delay", delay))
+	e.reportBeforeReboot(client, result)
+}
+
+// reportBeforeReboot доставляет результат так, чтобы он не потерялся вместе с
+// уходящей вниз машиной: сначала прямой вызов, при неудаче — durable-очередь,
+// которая переживёт перезагрузку.
+func (e *Executor) reportBeforeReboot(client pb.AgentServiceClient, result *pb.TaskResult) {
+	ctx, cancel := context.WithTimeout(e.execCtx, callTimeout)
+	ack, err := client.ReportTaskResult(ctx, result)
+	cancel()
+	if err == nil && ack.GetReceived() {
+		return
+	}
+	e.log.Warn("reboot: прямой отчёт не доставлен — кладу в durable-очередь, доедет после загрузки",
+		slog.String("task_id", result.GetTaskId()), slog.Any("error", err))
+	e.deliver(client, result)
+}
+
+// handleUninstall снимает ПО и отчитывается обычным TaskResult, дополненным
+// машиночитаемым исходом (TaskResult.uninstall_outcome).
+//
+// Почему обычный TaskResult, а не отдельный отчёт-RPC (как у лока): удаление ПО —
+// разовая операция без желаемого состояния, которое надо сверять. Сервер не
+// держит для неё «desired», реконсилировать нечего, поэтому и отдельный канал
+// отчётов не нужен — задача с результатом закрывается штатным путём, а outcome
+// лишь уточняет причину для карточки и аудита.
+//
+// Соответствие исхода и TaskStatus: успех — только «снято» и «на машине и так
+// нет» (в обоих случаях намерение оператора выполнено). Всё остальное — ERROR,
+// потому что требует его решения: уточнить цель, обновить инвентарь, снять
+// вручную. Отдельно ALREADY_ABSENT НЕ схлопывается в успех молча — исход едет
+// явным кодом, иначе «удалено» и «нечего удалять» стали бы неразличимы, а с ними
+// и промах селектора, который выглядел бы как удачное удаление.
+func (e *Executor) handleUninstall(client pb.AgentServiceClient, taskID string, uc *pb.UninstallCommand) {
+	reqID := uc.GetRequestId()
+	if reqID == "" {
+		reqID = taskID
+	}
+	if e.uninstaller == nil {
+		// Misbuild/неподдержанная ОС. Отчитываемся ошибкой, а не молчим: иначе
+		// задача зависла бы в 'acked' до серверного sweep без всякой причины.
+		e.log.Error("uninstall: команда получена, но исполнитель не сконфигурирован",
+			slog.String("task_id", taskID), slog.String("request_id", reqID))
+		e.deliver(client, &pb.TaskResult{
+			TaskId:           taskID,
+			Status:           pb.TaskStatus_TASK_STATUS_ERROR,
+			ErrorLog:         "удаление ПО недоступно на этом агенте (сборка/ОС не поддерживает)",
+			UninstallOutcome: pb.UninstallOutcome_UNINSTALL_OUTCOME_NOT_REMOVABLE,
+		})
+		return
+	}
+
+	e.log.Warn("uninstall: получена команда удаления ПО",
+		slog.String("task_id", taskID), slog.String("request_id", reqID),
+		slog.String("software", uc.GetSoftwareName()), slog.String("version", uc.GetVersion()))
+
+	// Тот же потолок, что у скриптов: он согласован с грейсом остановки агента
+	// (shutdownGrace), и отдельный, более длинный, потребовал бы поднимать грейс
+	// для всего парка. Деинсталлятор, не уложившийся в него, отчитывается FAILED
+	// с явной формулировкой — не «снято».
+	ctx, cancel := context.WithTimeout(e.execCtx, maxRuntime)
+	res := e.uninstaller.Run(ctx, uninstall.Request{
+		RequestID:       reqID,
+		Name:            uc.GetSoftwareName(),
+		Version:         uc.GetVersion(),
+		UninstallID:     uc.GetUninstallId(),
+		InstallLocation: uc.GetInstallLocation(),
+		Method:          uninstallMethodName(uc.GetUninstallMethod()),
+		Scope:           uc.GetScope(),
+		Reason:          uc.GetReason(),
+	})
+	cancel()
+
+	result := &pb.TaskResult{TaskId: taskID, UninstallOutcome: res.Outcome}
+	switch res.Outcome {
+	case pb.UninstallOutcome_UNINSTALL_OUTCOME_REMOVED, pb.UninstallOutcome_UNINSTALL_OUTCOME_ALREADY_ABSENT:
+		result.Status = pb.TaskStatus_TASK_STATUS_SUCCESS
+		result.Output = res.Detail
+	default:
+		result.Status = pb.TaskStatus_TASK_STATUS_ERROR
+		result.ErrorLog = res.Detail
+	}
+	e.deliver(client, result)
+
+	// Пересбор инвентаря — только когда список ПО на машине реально изменился.
+	if res.Outcome == pb.UninstallOutcome_UNINSTALL_OUTCOME_REMOVED && e.inventoryNudge != nil {
+		e.inventoryNudge()
+	}
+}
+
+// uninstallMethodName переводит метод из контракта во внутреннее имя коллектора.
+// Незнакомое значение (новый сервер, старый агент) отображается в пустую
+// строку — «сервер метода не назвал», и агент берёт метод из своего снимка.
+// Это безопасно ровно потому, что присланный метод и так только СВЕРЯЕТСЯ:
+// исполняется всегда тот, что определил сам агент.
+func uninstallMethodName(m pb.UninstallMethod) collector.UninstallMethod {
+	switch m {
+	case pb.UninstallMethod_UNINSTALL_METHOD_MSI:
+		return collector.UninstallMSI
+	case pb.UninstallMethod_UNINSTALL_METHOD_WINDOWS_QUIET:
+		return collector.UninstallWindowsQuiet
+	case pb.UninstallMethod_UNINSTALL_METHOD_MACOS_APP_BUNDLE:
+		return collector.UninstallMacAppBundle
+	case pb.UninstallMethod_UNINSTALL_METHOD_DPKG:
+		return collector.UninstallDpkg
+	case pb.UninstallMethod_UNINSTALL_METHOD_RPM:
+		return collector.UninstallRPM
+	case pb.UninstallMethod_UNINSTALL_METHOD_PACMAN:
+		return collector.UninstallPacman
+	case pb.UninstallMethod_UNINSTALL_METHOD_APK:
+		return collector.UninstallAPK
+	default:
+		return collector.UninstallNone
+	}
+}
+
+func (e *Executor) ack(client pb.AgentServiceClient, id string) {
+	ctx, cancel := context.WithTimeout(e.execCtx, callTimeout)
+	defer cancel()
+	if _, err := client.AckTaskReceived(ctx, &pb.TaskReceivedAck{TaskId: id, ReceivedAt: time.Now().Unix()}); err != nil {
+		e.log.Error("task: AckTaskReceived", slog.String("task_id", id), slog.Any("error", err))
+	}
+}
+
+// report — прямой unary-фолбэк доставки результата (durable-очередь недоступна
+// или вытеснила эту запись). Это ПОСЛЕДНЯЯ копия результата, поэтому received —
+// часть контракта, а не только err: сервер возвращает Received:false без gRPC-
+// ошибки, когда CompleteTask не прошёл (ошибка БД и т.п., кроме ErrTaskNotOwned —
+// см. dispatchReport). На durable-пути это возвращает запись в очередь; здесь
+// другой копии нет — молча считать доставленным нельзя (#1.5), громко логируем.
+func (e *Executor) report(client pb.AgentServiceClient, result *pb.TaskResult) {
+	ctx, cancel := context.WithTimeout(e.execCtx, callTimeout)
+	defer cancel()
+	ack, err := client.ReportTaskResult(ctx, result)
+	if err != nil {
+		e.log.Error("task: ReportTaskResult (фолбэк) — результат НЕ доставлен, durable-очереди нет",
+			slog.String("task_id", result.GetTaskId()),
+			slog.Uint64("fallback_total", e.fallbacks.Load()), slog.Any("error", err))
+		return
+	}
+	if !ack.GetReceived() {
+		e.log.Error("task: сервер не подтвердил результат (received=false) на фолбэк-пути — durable-очереди нет, результат потерян",
+			slog.String("task_id", result.GetTaskId()),
+			slog.Uint64("fallback_total", e.fallbacks.Load()))
+	}
+}
+
+func combineErr(stderr string, err error) string {
+	if stderr == "" {
+		return err.Error()
+	}
+	return stderr + "\n" + err.Error()
+}

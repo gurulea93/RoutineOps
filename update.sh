@@ -1,0 +1,316 @@
+#!/bin/bash
+# Обновление self-hosted MDM ОДНОЙ командой. Две ортогональные оси апдейта:
+#   A. Сервер/web  — git pull + docker rebuild (мгновенно у деплойера).
+#   B. Агенты парка — self-update тянет новый подписанный бинарь с ЭТОГО сервера
+#      (НЕ централизованный push — это инфра деплойера).
+# Порядок: бэкап БД → git pull → пересборка (migrate-сервис накатит миграции ДО
+# старта server, fail-closed) → пересборка+публикация агентов новой версии.
+set -e
+cd "$(dirname "$0")"
+umask 077  # дампы БД не world-readable
+
+command -v docker >/dev/null 2>&1 || { echo "Docker не установлен"; exit 1; }
+if docker compose version >/dev/null 2>&1; then DC="docker compose"; else DC="docker-compose"; fi
+
+# Режим обновления — тот же признак, что в install.sh: есть Dockerfile → рядом исходники
+# (git pull + пересборка), нет → комплект покупателя (новый тег из приватного реестра).
+if [ -f Dockerfile ]; then
+  COMPOSE=docker-compose.prod.yml
+  FROM_SOURCE=1
+else
+  COMPOSE=docker-compose.ent.yml
+  FROM_SOURCE=""
+  [ -f "$COMPOSE" ] || { echo "ОШИБКА: нет ни Dockerfile, ни $COMPOSE — это не каталог установки." >&2; exit 1; }
+fi
+
+[ -f .env.prod ]          || { echo "Нет .env.prod — сначала ./install.sh"; exit 1; }
+[ -f release_ed25519.pem ] || { echo "Нет release_ed25519.pem — сначала ./install.sh"; exit 1; }
+
+# .env.prod правится руками и гитигнорится → может доехать с Windows в CRLF. Тут CR
+# падает громко (DATABASE_DSN=...sslmode=disable\r → publish-release не коннектится),
+# но чиним симметрично install.sh, а не по месту падения.
+grep -q $'\r' .env.prod && { sed -i 's/\r$//' .env.prod; echo "!! .env.prod был в CRLF (Windows) — привёл к LF"; }
+
+# Раскладка ролей БД: сервер под mdm_app (RLS реально изолирует тенантов), миграции под
+# владельцем mdm. Инсталляции до разделения ролей ехали с сервером под владельцем БД, то
+# есть с мультитенантностью, которую не защищало ничего. Тот же вызов есть в install.sh,
+# но апгрейд идёт ЗДЕСЬ и install.sh не зовёт — без этой строки починка до парка клиентов
+# не доезжает. Раскладка уже правильная → no-op.
+DSN_BEFORE=$(sed -n 's/^DATABASE_DSN=//p' .env.prod | head -1)
+bash scripts/env-db-roles.sh .env.prod || { echo "ОШИБКА: роли БД в .env.prod не приведены — обновление прервано." >&2; exit 1; }
+DSN_AFTER=$(sed -n 's/^DATABASE_DSN=//p' .env.prod | head -1)
+
+set -a; . ./.env.prod; set +a
+
+echo "=== MDM Update ==="
+CUR=$($DC -f "$COMPOSE" exec -T server ./routineops-server -version 2>/dev/null || echo "неизвестно")
+echo "Текущая версия сервера: ${CUR}"
+
+# 1. Бэкап БД ОБЯЗАТЕЛЕН перед миграциями (down-миграций нет — откат только из бэкапа).
+#    -Fc (custom format) → восстановим через pg_restore --clean --if-exists в
+#    существующую БД (plain-dump в populated БД не накатывается).
+mkdir -p backups && chmod 700 backups
+PG=$($DC -f "$COMPOSE" ps -q postgres)
+if [ -n "$PG" ]; then
+  BK="backups/db-$(date +%Y%m%d-%H%M%S).dump"
+  docker exec "$PG" pg_dump -U mdm -Fc mdm > "$BK"
+  echo "Бэкап БД: ${BK}"
+else
+  echo "⚠ postgres не запущен — бэкап пропущен (первый запуск?)"
+fi
+
+# 2. Новая версия. Из исходников — git. Из образов — номером выпуска в аргументе
+#    (./update.sh 2.13.0): теги в реестре неизменяемы и :latest там нет намеренно,
+#    поэтому «обнови» без номера — это «перетяни тот же тег», то есть no-op. Номер
+#    выпуска приходит от вендора вместе с уведомлением о релизе.
+if [ -n "$FROM_SOURCE" ]; then
+  git fetch --tags --quiet || true
+  git pull --ff-only
+  export VERSION="$(cat VERSION)"
+else
+  # Номер ПОКА ТОЛЬКО В ПАМЯТИ — на диск он ляжет ниже, после успешного pull.
+  export VERSION="${1:-$(cat VERSION)}"
+  if [ -z "${1:-}" ]; then
+    echo "Версия не указана — остаюсь на v${VERSION} и перетяну тот же тег."
+    echo "  Обновление: ./update.sh <версия выпуска>, например ./update.sh 2.13.0"
+  fi
+fi
+echo "Новая версия: v${VERSION}"
+
+# 3. Выкат. migrate-сервис накатит pending-миграции ДО старта server.
+#    Из образов тянем ЯВНО и до up: опечатка в номере или не выданный покупателю выпуск
+#    обязаны падать здесь, а не на половине пересозданного деплоя.
+if [ -z "$FROM_SOURCE" ]; then
+  $DC -f "$COMPOSE" pull
+  # 🔴 Номер выпуска пишем на диск ТОЛЬКО ПОСЛЕ успешного pull. Запись до него оставляла
+  # установку врущей о себе: `./update.sh 9.9.9` падал (образов нет, контейнеры остались
+  # на прежнем выпуске — это правильно), но VERSION и .env уже говорили 9.9.9. Дальше
+  # любой голый `./update.sh` рапортовал «остаюсь на v9.9.9» и тянул несуществующий тег
+  # снова, а `docker compose ps` показывал теги, которых в реестре нет. Само не чинилось.
+  echo "$VERSION" > VERSION
+  # .env compose'а обязан догнать новую версию — иначе ручная диагностика после
+  # обновления показывала бы теги прошлого выпуска (см. install.sh).
+  printf 'VERSION=%s\nROUTINEOPS_REGISTRY=%s\n' "$VERSION" "$ROUTINEOPS_REGISTRY" > .env
+fi
+$DC -f "$COMPOSE" up -d ${FROM_SOURCE:+--build}
+
+# Сменился DSN сервера (разделение ролей выше) — контейнер держит СТАРЫЙ в памяти:
+# env_file читается на старте, а пересборка образа его не меняет, поэтому обычный up
+# может оставить сервер под прежней ролью и починка выглядела бы применённой, не будучи ею.
+if [ "$DSN_BEFORE" != "$DSN_AFTER" ]; then
+  echo "DSN сервера изменился — пересоздаю server..."
+  $DC -f "$COMPOSE" up -d --force-recreate server
+fi
+
+# 4. Сборка + публикация агентов новой версии (self-update подхватит парк за <interval>).
+#    Подпись — локальным per-deployer приватником; RegisterAgentRelease делает UPSERT
+#    (повтор той же версии = no-op, не падение). В build-контейнер отдаём только нужное.
+#    RELEASE_PUBKEY контейнеру НЕ передаём: в бинарь он больше не вшивается (см. ниже),
+#    а серверу он приезжает из .env.prod, которую этот скрипт только читает.
+PG=$($DC -f "$COMPOSE" ps -q postgres)
+NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$PG" | awk '{print $1}')
+# Публикация агентов ОТДЕЛЕНА от деплоя сервера: сервер и веб уже подняты выше (шаг 3),
+# и отказ публикации не должен их откатывать. Иначе серверный хотфикс становится заложником
+# агентской версии — например, перевыпуск того же номера с другим sha256 теперь законно
+# отклоняется (версии неизменяемы, RegisterAgentRelease), и без этой развязки такой отказ
+# ронял бы весь деплой. Отказ ГРОМКИЙ (exit 1 с объяснением), но сервер остаётся на новой версии.
+publish_agents() {
+  # Из образов: бинари уже собраны у мейнтейнера, версию агента несёт сам образ
+  # (тег образа = версия ПРОДУКТА). Подпись остаётся пер-деплойной — приватник
+  # приезжает монтированием каталога, ровно как в сборочном контейнере ниже.
+  if [ -z "$FROM_SOURCE" ]; then
+    docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
+      -e DATABASE_DSN="$DATABASE_DSN" \
+      -e RELEASE_CHANNEL="${RELEASE_CHANNEL:-stable}" \
+      "${ROUTINEOPS_REGISTRY}/routineops/agents:${VERSION}"
+    return
+  fi
+
+docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
+  -e DATABASE_DSN="$DATABASE_DSN" \
+  -e BUILD_TAGS="${BUILD_TAGS:-}" \
+  -e DARWIN_AGENT="${DARWIN_AGENT:-}" \
+  -e ENTERPRISE_MSI="${ENTERPRISE_MSI:-}" \
+  -e ENTERPRISE_PKG="${ENTERPRISE_PKG:-}" \
+  -e RELEASE_CHANNEL="${RELEASE_CHANNEL:-stable}" \
+  golang:1.26-alpine sh -c '
+    set -e
+    V=$(cat AGENT_VERSION)  # версия АГЕНТА (не продукта): агент версионируется отдельно от сервера
+
+    # Канал выкатки. Канареечная схема (Q-52) уже была в publish-release, но штатного пути
+    # к ней не вело: update.sh всегда публиковал в stable, то есть «обкатать на группе
+    # машин» означало звать publish-release руками мимо деплоя. Механизм, к которому не
+    # ведёт штатный путь, в поле не существует.
+    CH="${RELEASE_CHANNEL:-stable}"
+    case "$CH" in
+      stable|beta) ;;
+      *) echo "ОШИБКА: RELEASE_CHANNEL=$CH — ожидается stable|beta" >&2; exit 1 ;;
+    esac
+    [ "$CH" = stable ] || echo "  канал выкатки: $CH (парк на stable не двигается)"
+    # PE-версия для Windows-VERSIONINFO: только semver-часть, иначе 0.0.0 (ср. WINVER в Makefile).
+    WINVER=$(echo "$V" | grep -Eo "^[0-9]+\.[0-9]+\.[0-9]+" || echo 0.0.0)
+    WV_MAJ=${WINVER%%.*}; WV_REST=${WINVER#*.}; WV_MIN=${WV_REST%%.*}; WV_PAT=${WV_REST#*.}
+
+    # darwin здесь НЕТ: macOS-агенту нужен cgo (Cocoa-замок + Keychain), а
+    # `CGO_ENABLED=0 GOOS=darwin` молча собирает заглушки по тегам `!darwin || !cgo`
+    # — парк получил бы агента без оверлея блокировки. Публикуем prebuilt ниже.
+    # Редакция АГЕНТА обязана совпадать с редакцией инсталляции. Раньше здесь
+    # собиралось безусловно без тегов, поэтому enterprise-сервер раздавал парку
+    # open-core агента: FileVault там не выключен, а НЕ СКОМПИЛИРОВАН — оператор-путь
+    # provisioning отвечал бы отказом на каждой машине, кроме тех, куда пакет
+    # поставили руками.
+    TAGSFLAG=""
+    if [ -n "$BUILD_TAGS" ]; then
+      TAGSFLAG="-tags $BUILD_TAGS"
+      echo "  редакция агента: $BUILD_TAGS (из BUILD_TAGS в .env.prod)"
+    fi
+
+    for pair in "windows amd64" "linux amd64" "linux arm64"; do
+      # shellcheck disable=SC2086
+      set -- $pair; OS=$1; ARCH=$2
+      echo "  → $OS/$ARCH"
+
+      # Windows требует того же, что и `make build-win`, иначе парк получит битый агент:
+      #   * .syso с манифестом Common Controls — без него трей на lxn/walk падает;
+      #   * -H windowsgui — иначе трей в юзер-сессии открывает консольное окно,
+      #     закрытие которого убивает агента;
+      #   * числовой PE-VERSIONINFO — по нему Windows Installer решает перезапись exe.
+      # .syso в .gitignore (версионный артефакт), в клоне его нет — генерим здесь.
+      EXTRA_LDFLAGS=""
+      if [ "$OS" = windows ]; then
+        go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0 \
+          -64 -arm=false -o cmd/agent/rsrc_windows_amd64.syso \
+          -manifest cmd/agent/agent.manifest \
+          -ver-major "$WV_MAJ" -ver-minor "$WV_MIN" -ver-patch "$WV_PAT" -ver-build 0 \
+          -product-ver-major "$WV_MAJ" -product-ver-minor "$WV_MIN" -product-ver-patch "$WV_PAT" -product-ver-build 0 \
+          -file-version "${WINVER}.0" -product-version "${WINVER}" \
+          -company RoutineOps -product-name "RoutineOps Agent" -description "RoutineOps Agent" \
+          -internal-name RoutineOps-agent -original-name RoutineOps-agent.exe \
+          cmd/agent/versioninfo.json
+        EXTRA_LDFLAGS="-H windowsgui"
+      fi
+
+      # Бинари ДЖЕНЕРИК (без -X main.releasePubKey) — ровно как в install.sh:122.
+      # Вшитый ключ АВТОРИТЕТНЕЕ полученного при enroll (resolveUpdatePubKeyB64), поэтому
+      # раньше каждый деплой раздавал парку deployment-specific агентов: универсальный MSI
+      # переставал быть универсальным, а при потере приватника пропадал единственный путь
+      # восстановления (ре-энролл с новым ключом — вшитый бы его перебил).
+      # Ключ self-update агент берёт из enroll-ответа: сервер отдаёт RELEASE_PUBKEY из .env.prod.
+      GOOS=$OS GOARCH=$ARCH CGO_ENABLED=0 go build -trimpath $TAGSFLAG \
+        -ldflags "-s -w -X main.version=${V} ${EXTRA_LDFLAGS}" \
+        -o /tmp/agent_${OS}_${ARCH} ./cmd/agent
+
+      # Убираем сразу: .syso линкуется в ЛЮБУЮ windows-сборку, и root-овладелец
+      # файла в примонтированном рабочем каталоге мешал бы `make` у деплойера.
+      if [ "$OS" = windows ]; then rm -f cmd/agent/rsrc_windows_amd64.syso; fi
+
+      # Редакция — ПО СОБРАННОМУ БИНАРЮ, до подписи и публикации. Строчкой выше
+      # редакцию задаёт переменная, а переменную можно забыть (перенос окружения,
+      # свежий .env.prod, опечатка) — и парк молча обновится на open-core агента.
+      # Гейт fail-closed, при расхождении деплой падает здесь, а не в поле.
+      sh scripts/agent-edition-guard.sh "$BUILD_TAGS" "/tmp/agent_${OS}_${ARCH}" "$OS/$ARCH"
+
+      go run ./cmd/publish-release -binary /tmp/agent_${OS}_${ARCH} \
+        -version "v${V}" -os "$OS" -arch "$ARCH" -key release_ed25519.pem -channel "$CH"
+    done
+
+    # macOS: prebuilt из репо (собран мейнтейнером на маке с cgo), подписываем его
+    # ключом ЭТОГО деплойера. Сборка и подпись развязаны — publish-release берёт
+    # любой файл. sha256 сверяем до подписи: подписать битый бинарь = раздать его.
+    #
+    # РЕДАКЦИЯ. Лежащий в репозитории prebuilt ВСЕГДА open-core, и это не оплошность:
+    # enterprise-бинарь нельзя коммитить, его ловит гейт публичного среза
+    # (scripts/export-free.sh §V4c распаковывает бинарные артефакты). Значит на
+    # enterprise-инсталляции публиковать его нельзя — иначе парк маков обновится на
+    # агента, где FileVault не выключен, а не скомпилирован. Enterprise-бинарь
+    # приходит из приватного релиз-канала и указывается через DARWIN_AGENT
+    # (путь ОТНОСИТЕЛЬНО каталога деплоя — контейнер видит только его).
+    PREBUILT=build/darwin/agent_darwin_arm64
+    case "$BUILD_TAGS" in
+      *enterprise*)
+        if [ -z "$DARWIN_AGENT" ]; then
+          echo "ОШИБКА: инсталляция enterprise (BUILD_TAGS=$BUILD_TAGS), а darwin-агент в репозитории — open-core." >&2
+          echo "  Публикация macOS отменена: маки получили бы агента БЕЗ FileVault (не выключен, а не собран)." >&2
+          echo "  Возьмите enterprise-бинарь из приватного релиз-канала, положите в каталог деплоя" >&2
+          echo "  вместе с файлами .sha256 и .version и укажите путь: DARWIN_AGENT=enterprise/agent_darwin_arm64 ./update.sh" >&2
+          exit 1
+        fi
+        if [ ! -f "$DARWIN_AGENT" ]; then
+          echo "ОШИБКА: DARWIN_AGENT=$DARWIN_AGENT не найден в каталоге деплоя." >&2
+          exit 1
+        fi
+        # Проверяем, что это ДЕЙСТВИТЕЛЬНО enterprise-сборка, а не переименованный
+        # open-core бинарь. Проверка та же, что у windows/linux выше: единственное
+        # определение редакции на все четыре цели. Раньше здесь искался darwin-only
+        # токен — на windows/linux тот же гейт был бы красным на исправном дереве.
+        # Обе фичи едут одним тегом, поэтому одного кросс-платформенного токена хватает.
+        sh scripts/agent-edition-guard.sh "$BUILD_TAGS" "$DARWIN_AGENT" "darwin/arm64 (частный канал)"
+        PREBUILT="$DARWIN_AGENT"
+        echo "  darwin: enterprise-бинарь из $DARWIN_AGENT"
+        ;;
+      *)
+        # Open-core инсталляция: enterprise-бинарь здесь публиковать нельзя — это
+        # раздача закрытого кода всему парку. Отсутствие prebuilt тут НЕ ошибка:
+        # ниже это штатно вырождается в «macOS-релиз не опубликован» с предупреждением,
+        # поэтому гейт (он fail-closed на ненайденном файле) зовём только на существующем.
+        if [ -f "$PREBUILT" ]; then
+          sh scripts/agent-edition-guard.sh "$BUILD_TAGS" "$PREBUILT" "darwin/arm64 (prebuilt из репо)"
+        fi
+        ;;
+    esac
+    if [ -f "$PREBUILT" ] && [ -f "$PREBUILT.sha256" ]; then
+      echo "  → darwin/arm64 ($PREBUILT)"
+      ( cd "$(dirname "$PREBUILT")" && sha256sum -c "$(basename "$PREBUILT").sha256" ) || {
+        echo "ОШИБКА: sha256 prebuilt darwin-бинаря не сошлась — публикация отменена" >&2
+        exit 1
+      }
+      # Вшитая версия обязана совпасть с VERSION: иначе агент качает "v${V}",
+      # а после рестарта рапортует старую → петля обновления каждые 6ч.
+      BAKED=$(cat "$PREBUILT.version" 2>/dev/null || echo "")
+      if [ "$BAKED" != "v${V}" ]; then
+        echo "ОШИБКА: prebuilt собран как '${BAKED:-неизвестно}', а VERSION=v${V}." >&2
+        echo "Мейнтейнеру: пересобрать на маке (make release-darwin) и закоммитить." >&2
+        exit 1
+      fi
+      go run ./cmd/publish-release -binary "$PREBUILT" \
+        -version "v${V}" -os darwin -arch arm64 -key release_ed25519.pem -channel "$CH"
+    else
+      echo "  ⚠ darwin/arm64: $PREBUILT отсутствует — macOS-релиз НЕ опубликован."
+      echo "    Маки останутся на текущей версии. Собрать: make pkg-mac-native НА маке."
+    fi
+
+    # Канонические установщики (releases/RoutineOps-agent.{msi,pkg} → кнопки «Скачать» в
+    # панели и скрипты миграции с инкумбента). Логика вынесена в отдельный скрипт: внутри
+    # `docker run … sh -c` её нельзя ни прогнать, ни проверить, а правило про редакцию
+    # артефактов слишком дорого стоит, чтобы жить непроверяемым (scripts/test-update-installer-edition.sh).
+    sh scripts/publish-installers.sh
+  '
+}
+
+# 🔴 Ветки здесь были ПЕРЕПУТАНЫ с 15.08 (12571d1): `if ! docker run …; then :; else
+# <ОТКАЗ>; exit 1; fi` означало ровно обратное задуманному — УСПЕШНАЯ публикация печатала
+# «ПУБЛИКАЦИЯ АГЕНТОВ ОТКАЗАЛА» и роняла выкат, а настоящий отказ проглатывался молча и
+# деплой рапортовал «Готово» без единого опубликованного агента. В поле не стреляло
+# только потому, что августовские выкаты шли шагами вручную, мимо update.sh.
+if publish_agents
+then
+  :
+else
+  echo "" >&2
+  echo "⚠️  ПУБЛИКАЦИЯ АГЕНТОВ ОТКАЗАЛА. Сервер и веб уже подняты на v${VERSION} (шаг 3) и НЕ откачены." >&2
+  echo "   Частая причина: перевыпуск версии с другим sha256 — версии неизменяемы, продвижение меняет только канал." >&2
+  echo "   Установщики (кнопки «Скачать») этим прогоном НЕ обновлены. Разберите публикацию отдельно и повторите." >&2
+  exit 1
+fi
+
+echo ""
+echo "Готово. Сервер на v${VERSION}; парк подтянет агентов self-update'ом за <interval>."
+if [ -n "$FROM_SOURCE" ]; then
+  echo "Откат сервера: git checkout <старый-tag> && ${DC} -f ${COMPOSE} up -d --build"
+else
+  # Теги в реестре неизменяемы: прежний выпуск никуда не делся, откат — это его номер.
+  echo "Откат сервера: ./update.sh <прежняя версия>"
+fi
+echo "Откат БД (при несовместимости схемы): docker exec -i \$(${DC} -f ${COMPOSE} ps -q postgres) \\"
+echo "  pg_restore -U mdm -d mdm --clean --if-exists < backups/<файл>.dump"
+echo "Агенты назад не даунгрейдятся — битый релиз чинится версией ВПЕРЁД (vX.Y.Z+1)."

@@ -1,0 +1,172 @@
+//go:build windows
+
+package admin
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+
+	"golang.org/x/sys/windows"
+)
+
+type osPriv struct{}
+
+func newOSPrivilegeManager() PrivilegeManager { return osPriv{} }
+
+// adminGroupName возвращает локализованное имя встроенной группы администраторов
+// по well-known SID S-1-5-32-544 (RU «Администраторы», DE «Administratoren», ...).
+// Хардкод "Administrators" ломал `net localgroup` на локализованной Windows:
+// группы с таким именем нет → System error 1376 → exit status 2.
+func adminGroupName() (string, error) {
+	sid, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return "", fmt.Errorf("well-known SID администраторов: %w", err)
+	}
+	name, _, _, err := sid.LookupAccount("")
+	if err != nil {
+		return "", fmt.Errorf("имя группы по SID %s: %w", sid, err)
+	}
+	return name, nil
+}
+
+// runNet запускает `net` и при ошибке возвращает её вместе с выводом утилиты —
+// иначе наверх уходил бы голый "exit status 2" без причины (см. silent failure
+// в manager.grant).
+func runNet(args ...string) error {
+	out, err := exec.Command("net", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("net %s: %w (%s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// Grant добавляет пользователя в локальную группу администраторов (нужны права админа).
+// Уже-член группы (system error 1378) — успех: иначе заявка на уже-админа
+// крутилась бы вечно, не выставляя granted_at и не снимая улики.
+func (o osPriv) Grant(user string) error {
+	group, err := adminGroupName()
+	if err != nil {
+		return err
+	}
+	if err := runNet("localgroup", group, user, "/add"); err != nil {
+		if isAlreadyLocalGroupMember(err) {
+			return nil
+		}
+		// Решает ФАКТ, а не текст ошибки: состав группы читается построчно и от
+		// языка системы не зависит, тогда как формулировка «уже входит в группу»
+		// у каждой локали своя, а номер 1378 попадает в текст лишь потому, что
+		// `net` печатает его отдельной строкой. Ровно на локализации Windows это
+		// место уже ломалось однажды (1376 → adminGroupName по well-known SID),
+		// поэтому текстовый разбор здесь — быстрый путь, а не единственный.
+		if member, ierr := o.IsAdmin(user); ierr == nil && member {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// isAlreadyLocalGroupMember — быстрый путь для «пользователь уже в группе».
+//
+// Русская формулировка снята с живой Windows (`net helpmsg 1378`):
+// «Указанная учетная запись уже входит в эту группу». Прежний вариант «уже
+// является членом» не встречается ни в одной локали и был мёртвой веткой —
+// на русской системе спасал только номер в выводе `net`.
+func isAlreadyLocalGroupMember(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "1378") ||
+		strings.Contains(s, "already a member") ||
+		strings.Contains(s, "уже входит в эту группу")
+}
+
+// Revoke убирает пользователя из группы администраторов.
+func (osPriv) Revoke(user string) error {
+	group, err := adminGroupName()
+	if err != nil {
+		return err
+	}
+	return runNet("localgroup", group, user, "/delete")
+}
+
+// IsAdmin сообщает, состоит ли пользователь в группе администраторов прямо сейчас.
+// `net localgroup <group>` печатает список членов между строкой из дефисов и
+// "The command completed successfully"; сравниваем без учёта регистра.
+func (osPriv) IsAdmin(user string) (bool, error) {
+	group, err := adminGroupName()
+	if err != nil {
+		return false, err
+	}
+	out, err := exec.Command("net", "localgroup", group).CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("net localgroup %s: %w (%s)", group, err, strings.TrimSpace(string(out)))
+	}
+	target := strings.ToLower(strings.TrimSpace(user))
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.ToLower(strings.TrimSpace(line)) == target {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// queryConsoleUserName возвращает Win32_ComputerSystem.UserName как есть
+// (DOMAIN\user) либо ошибку опроса. Общий источник для инвентаря и admin-выдачи,
+// которые по-разному трактуют ОТКАЗ (см. ниже).
+func queryConsoleUserName() (string, error) {
+	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-CimInstance Win32_ComputerSystem).UserName").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// osConsoleUserFull — интерактивный пользователь для ИНВЕНТАРЯ в исходной форме
+// DOMAIN\user (домен не отбрасываем — по нему учётка матчится с каталогом).
+// Второй результат — успешность пробы. При отказе опроса — ("", false), НЕ
+// %USERNAME%: служба работает под LocalSystem, где env дал бы "SYSTEM" —
+// выдуманное значение уехало бы на сервер в PII-поле как «текущий пользователь».
+// false отличает отказ WMI от честного «за консолью никого» ("", true) — иначе
+// транзиентный сбой выглядел бы для сервера как логаут (см. ConsoleUser).
+func osConsoleUserFull() (string, bool) {
+	u, err := queryConsoleUserName()
+	if err != nil {
+		return "", false
+	}
+	return u, true
+}
+
+// osUserSID — строковый SID учётки по имени DOMAIN\user (LookupAccountName).
+// Деривация от УЖЕ доложенного логина, не отдельная проба сессии: SID в снимке
+// гарантированно принадлежит тому же пользователю, что console_user (см.
+// ConsoleIdentity). LSA резолвит доменные учётки и без связи с DC — из
+// локального кэша для всех, кто хоть раз входил на машину. Тип сверяется:
+// группа/алиас/машина с совпавшим именем не уедет как пользовательский SID.
+// Отказ → "" (сервер деградирует на резолв логина через каталог).
+func osUserSID(account string) string {
+	sid, _, accType, err := windows.LookupSID("", account)
+	if err != nil || accType != windows.SidTypeUser {
+		return ""
+	}
+	return sid.String()
+}
+
+// osConsoleUser — интерактивный пользователь БЕЗ домена для ВЫДАЧИ временной
+// админки (`net localgroup` ждёт голое имя локальной учётки). При отказе опроса
+// сохраняется прежний env-фолбэк: тут неверное имя лишь безвредно уронит
+// net localgroup, наружу (в инвентарь/каталог) оно не уходит.
+func osConsoleUser() string {
+	u, err := queryConsoleUserName()
+	if err != nil {
+		return os.Getenv("USERNAME")
+	}
+	if i := strings.LastIndex(u, `\`); i >= 0 {
+		u = u[i+1:] // DOMAIN\user -> user
+	}
+	return u
+}

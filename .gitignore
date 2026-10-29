@@ -1,0 +1,138 @@
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+bin/
+agent/bin/
+server/bin/
+
+# Собранные командные бинари в КОРНЕ: `go build ./cmd/...` кладёт их именно сюда, и
+# именно так в репозиторий уехали publish-release (14 МБ), publish-escrow-recipient
+# (13 МБ) и routineops (9 МБ) — артефакт сборки неотличим в диффе от исходника, потому
+# что дифф его не показывает вовсе. Перечислены поимённо и с ведущим слэшем:
+# `agent` и `server` в корне — КАТАЛОГИ с кодом, шаблон без якоря выключил бы их.
+/publish-release
+/publish-escrow-recipient
+/routineops
+/routineops-license
+/routineops-unseal
+/seeddev
+/mockserver
+
+# Состояние агента (runtime)
+*.seen
+forbidden_software.txt
+.policy-*.tmp
+agent_outbox/
+
+# Node / React
+web/node_modules/
+web/dist/
+web/build/
+web/.env
+web/.env.local
+
+# Env files
+.env
+.env.local
+*.env
+.env.dev
+!.env.dev.example
+.env.prod
+!.env.prod.example
+
+# Бэкапы БД (снимаются update.sh перед миграциями)
+backups/
+
+# Local config (contains secrets)
+config.local.yaml
+config.local.yml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code local skills config (личный тулинг, не часть проекта)
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Certificates (никогда не коммитим)
+*.pem
+*.crt
+*.key
+certs/
+
+# ChartDB exports (если храним временно)
+*.chartdb.json
+
+# Бинари релизов агента (раздаются сервером)
+releases/
+
+# Enterprise-лицензия и пароль активации (rw-том сервера; секреты деплоя).
+# Якорь к корню обязателен: без ведущего слэша шаблон матчит ЛЮБОЙ каталог с таким
+# именем на любой глубине — и выкинул бы из репозитория пакет internal/license.
+/license/
+
+# Конфиг каталога (LDAP/AD) с bind-паролем — rw-том сервера, секрет деплоя.
+# Якорь к корню по той же причине, что и у /license/: иначе шаблон выкинул бы
+# пакет internal/server/directory.
+/directory/
+
+# Записи сеансов удалённого стола — rw-том сервера (SCREEN_DIR). Содержимое:
+# видеозапись экрана сотрудника, то есть персональные данные и потенциально
+# секреты. В репозиторий такое не попадает ни при каких условиях.
+/screen-recordings/
+
+# MSI/PKG build artifacts (не коммитить — большие бинарники).
+# Исключение — КАНОНИЧЕСКИЕ универсальные инсталляторы и prebuilt darwin-бинарь:
+# их нельзя собрать на Linux-проде (WiX нужен Windows, cgo нужен macOS), поэтому
+# мейнтейнер собирает их один раз на релиз и кладёт в git. install.sh раздаёт
+# инсталляторы через /downloads, update.sh подписывает darwin-бинарь ключом деплойера.
+build/msi/mdm-agent.exe
+build/msi/*.msi
+!build/msi/RoutineOps-agent.msi
+build/pkg/*.pkg
+!build/pkg/RoutineOps-agent.pkg
+
+# Windows .syso — версионный билд-артефакт (manifest + PE-VERSIONINFO),
+# генерится `make syso-win`/`build-win` из cmd/agent/versioninfo.json + VERSION.
+cmd/agent/rsrc_windows_amd64.syso
+
+# encrypted backup of release signing key
+release_ed25519.pem*
+
+# Локальные артефакты и рабочие файлы (не для репозитория)
+/mdm-agent-v*.msi
+/mdm-agent-v*.pkg
+/agent_darwin_arm64
+/server_bin
+/publish-release-linux
+web/test-results/
+
+# nfpm staging (генерится pkg-* целями, уникальный per arch+format)
+build/nfpm/stage-*/
+# Сборочные контексты доставки без исходников: в agents-image лежат собранные агенты и
+# publish-release, в kit — архив покупателя. И то и другое пересобирается скриптами.
+build/agents-image/
+build/kit/
+# Скриншоты и логи прогона стенда экрана блокировки (scripts/test-lock-linux.sh)
+build/test/lock-linux/out/
+cmd/agent/rsrc_windows_arm64.syso
+
+# Настройки IDE-сессии (Cursor): содержат рабочий контекст с адресами стендов —
+# в срез такое ехать не должно, leak-скан на них падает.
+.cursor/
+
+# Артефакты Playwright: отчёты и трассы прогонов, не исходники.
+web/test-results/
+web/playwright-report/

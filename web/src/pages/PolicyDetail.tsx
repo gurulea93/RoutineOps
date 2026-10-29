@@ -1,0 +1,183 @@
+import { useEffect, useState } from "react"
+import { useTranslation } from "react-i18next"
+import { useNavigate, useParams } from "react-router-dom"
+import { ChevronLeft, ChevronRight } from "lucide-react"
+import api, { PolicyRule, PolicyDeviceCompliance, DeviceGroup } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table"
+import { toast } from "@/lib/toast"
+import { formatDistanceToNow } from "@/lib/time"
+
+// Разрез софт-правила по устройствам: кто в области действия, кто pass, кто fail
+// и что именно совпало в инвентаре. Для allowed-правил вердикта нет (агент их не
+// проверяет) — колонка показывает справку «установлено/нет».
+export default function PolicyDetail() {
+  const { t } = useTranslation()
+  const { id } = useParams<{ id: string }>()
+  const navigate = useNavigate()
+  const [rule, setRule] = useState<PolicyRule | null>(null)
+  const [rows, setRows] = useState<PolicyDeviceCompliance[]>([])
+  const [groups, setGroups] = useState<DeviceGroup[]>([])
+  const [loading, setLoading] = useState(true)
+  // Ошибка загрузки ≠ «политика не найдена»: не приписываем удаление при упавшем API.
+  const [loadFailed, setLoadFailed] = useState(false)
+
+  useEffect(() => {
+    if (!id) return
+    // Флаг отмены: при back/forward ответ старого id не должен перезаписать новый.
+    let stale = false
+    Promise.all([
+      // Отдельного GET /policies/{id} нет — правило достаём из общего списка.
+      api.get<PolicyRule[]>("/policies"),
+      api.get<PolicyDeviceCompliance[]>(`/policies/${id}/compliance`),
+    ]).then(([r, c]) => {
+      if (stale) return
+      setRule((r.data ?? []).find((x) => x.id === id) ?? null)
+      setRows(c.data ?? [])
+    }).catch(() => {
+      if (stale) return
+      setLoadFailed(true)
+      toast({ title: t("policyDetail.failedToLoadThe2"), variant: "destructive" })
+    }).finally(() => { if (!stale) setLoading(false) })
+    // Группы нужны только для имени в подзаголовке — best-effort, не валит страницу.
+    api.get<DeviceGroup[]>("/device-groups")
+      .then((g) => { if (!stale) setGroups(g.data ?? []) })
+      .catch(() => {})
+    return () => { stale = true }
+  }, [id])
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-48 text-muted-foreground text-sm">{t("policyDetail.loading")}</div>
+  }
+
+  const back = (
+    <button
+      type="button"
+      onClick={() => navigate("/policies")}
+      className="flex items-center gap-1.5 self-start text-sm text-muted-foreground hover:text-foreground transition-colors"
+    >
+      <ChevronLeft className="h-4 w-4" strokeWidth={2} />
+      {t("policies.backToPolicies")}
+    </button>
+  )
+
+  if (!rule) {
+    return (
+      <div className="flex flex-col gap-5">
+        {back}
+        <div className="glass px-5 py-8 text-center text-sm text-muted-foreground">
+          {loadFailed ? t("policyDetail.failedToLoadThe") : t("policyDetail.policyNotFoundIt")}
+        </div>
+      </div>
+    )
+  }
+
+  const forbidden = rule.rule_type === "forbidden"
+  const fail = rows.filter((r) => r.installed).length
+  const pass = rows.length - fail
+
+  const scope = rule.device_id
+    ? t("policyDetail.deviceScope", { id: rule.device_id.slice(0, 8) })
+    : rule.group_id
+      ? t("policyDetail.groupScope", { name: groups.find((g) => g.id === rule.group_id)?.name ?? rule.group_id.slice(0, 8) })
+      : t("policyDetail.globalTheWholeFleet")
+
+  return (
+    <div className="flex flex-col gap-5">
+      {back}
+
+      <div>
+        <div className="flex items-center gap-3 mb-1 flex-wrap">
+          <h1 className="text-xl font-semibold font-mono text-foreground">{rule.software_name}</h1>
+          <Badge variant={forbidden ? "destructive" : "success"}>
+            {forbidden ? t("policyDetail.denied") : t("policyDetail.allowed")}
+          </Badge>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {scope}
+          {rule.platforms && rule.platforms.length > 0 && rule.platforms.length < 3 && (
+            <> · {rule.platforms.join(", ")}</>
+          )}
+          {" · "}{t("policyDetail.updated")}{" "}{formatDistanceToNow(rule.updated_at)}
+        </p>
+
+        {/* Сводка. Для allowed-правил pass/fail не считаются — агент проверяет только forbidden. */}
+        {forbidden ? (
+          <div className="flex items-center gap-6 mt-3 text-[13px]">
+            <span className="text-soft">{t("policyDetail.inScope")} <span className="text-foreground font-medium tabular-nums">{rows.length}</span></span>
+            <span className="text-emerald-600 dark:text-emerald-400">Pass: <span className="font-medium tabular-nums">{pass}</span></span>
+            <span className={fail > 0 ? "text-red-600 dark:text-red-400 font-medium" : "text-muted-foreground"}>
+              Fail: <span className="tabular-nums">{fail}</span>
+            </span>
+          </div>
+        ) : (
+          <p className="text-xs text-muted-foreground mt-3">
+            {t("policyDetail.allowRuleHint")}
+          </p>
+        )}
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="glass px-5 py-8 text-center text-sm text-muted-foreground">
+          {t("policyDetail.noDevices")}
+          {rule.group_id && " " + t("policyDetail.checkGroup")}
+          {rule.platforms && rule.platforms.length > 0 && rule.platforms.length < 3 && " " + t("policyDetail.checkPlatforms")}
+        </div>
+      ) : (
+        <div className="glass overflow-hidden">
+          <Table>
+            <TableHeader>
+              <TableRow className="border-t-0 hover:bg-transparent">
+                <TableHead className="text-xs">{t("policyDetail.device")}</TableHead>
+                <TableHead className="text-xs">{t("policyDetail.os")}</TableHead>
+                <TableHead className="text-xs">{t("policyDetail.foundInTheInventory")}</TableHead>
+                <TableHead className="text-xs">{forbidden ? t("policyDetail.verdict") : t("policyDetail.installed")}</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((r) => (
+                <TableRow
+                  key={r.device_id}
+                  onClick={() => navigate(`/devices/${r.device_id}`)}
+                  className="cursor-pointer glass-hover"
+                >
+                  <TableCell className="px-4 py-3 font-medium text-sm text-foreground">{r.hostname}</TableCell>
+                  <TableCell className="px-4 py-3 text-xs text-muted-foreground">{r.os || "—"}</TableCell>
+                  <TableCell className="px-4 py-3 text-xs font-mono text-soft">
+                    {r.installed
+                      ? <>
+                          {r.matched_software}
+                          {r.matched_version && <span className="text-muted-foreground"> {r.matched_version}</span>}
+                          {r.matched_scope === "user" && (
+                            <span
+                              className="ml-2 font-sans text-[11px] text-amber-600 dark:text-amber-500"
+                              title={t("policyDetail.installedIntoAUser")}
+                            >
+                              {t("policyDetail.inUserProfile")}
+                            </span>
+                          )}
+                        </>
+                      : <span className="text-muted-foreground font-sans">—</span>}
+                  </TableCell>
+                  <TableCell className="px-4 py-3">
+                    {forbidden ? (
+                      <Badge variant={r.installed ? "destructive" : "success"}>
+                        {r.installed ? "Fail" : "Pass"}
+                      </Badge>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">{r.installed ? t("policyDetail.yes") : t("policyDetail.no")}</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="px-4 py-3 w-8">
+                    <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" strokeWidth={2} />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </div>
+  )
+}

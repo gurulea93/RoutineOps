@@ -1,0 +1,1358 @@
+syntax = "proto3";
+
+package routineops;
+
+option go_package = "github.com/Floodww/RoutineOps/proto";
+
+// =============================================================================
+// АРХИТЕКТУРНЫЕ РЕШЕНИЯ (зафиксированы)
+// =============================================================================
+//
+// [ADR-1] Идентификация агента — только по mTLS-сертификату.
+//   device_id ОТСУТСТВУЕТ в сообщениях agent→server. Сервер определяет
+//   device_id из отпечатка сертификата TLS-соединения. Это единственный
+//   источник истины. Доверять полю из тела сообщения нельзя — скомпрометированный
+//   агент мог бы подставить чужой device_id.
+//
+// [ADR-4] Правила версионирования контракта.
+//   Агент поддерживает самообновление — в проде одновременно могут работать
+//   разные версии агента. Обязательные правила при изменении .proto:
+//     - Никогда не менять номер существующего поля;
+//     - Никогда не удалять поле — только пометить deprecated, потом reserved;
+//     - Новые поля добавлять только в конец;
+//     - Никогда не переиспользовать освободившиеся номера (для этого — reserved).
+//
+// [ADR-5] Граница heartbeat vs инвентаризация.
+//   Connect-стрим: ТОЛЬКО факт "я живой" + текущий IP. Часто, дёшево.
+//   ReportInventory: полные данные (железо, ПО, процессы, пользователи).
+//   Редко, по таймеру. Никогда не смешивать эти потоки.
+//
+// =============================================================================
+
+// ====== Heartbeat ======
+// Агент → Сервер. device_id не передаётся — сервер берёт его из mTLS-сертификата.
+
+message HeartbeatRequest {
+  reserved 1;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  string ip_address = 2;
+  int64 timestamp = 3;
+  // outbox_unavailable — durable-очередь агента недоступна на запись/чтение
+  // (отказ дискового ввода-вывода, права на каталог состояния).
+  //
+  // Едет именно в heartbeat, а не отдельным отчётом, ПОТОМУ ЧТО отчитываться
+  // об этом больше нечем: outbox и есть канал доставки отчётов, статусов лока и
+  // security-событий. Когда он мёртв, всё перечисленное умирает разом и молча —
+  // сервер видит живое устройство, у которого просто «ничего не происходит».
+  // Ровно так проявился полевой баг 2.5.1 на Windows: единственным внешним
+  // признаком был залипший статус блокировки в панели, и заметили его глазами.
+  //
+  // Heartbeat идёт отдельным стримом и от состояния очереди не зависит, поэтому
+  // остаётся единственным работающим каналом для этого признака.
+  bool outbox_unavailable = 4;
+  // degraded_detail — причина для оператора (текст ошибки ввода-вывода).
+  // Заполняется только вместе с флагом; пустая строка при взведённом флаге
+  // допустима (причину не удалось получить), но флаг без причины лучше, чем
+  // молчание.
+  string degraded_detail = 5;
+}
+
+// ====== Инвентаризация устройства ======
+// Агент → Сервер. Отдельный вызов, редкий. См. ADR-5.
+
+message DeviceInfo {
+  reserved 1;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  string hostname = 2;
+  string os = 3;
+  string os_version = 4;
+  string cpu = 5;
+  int64 ram = 6;
+  string disk = 7;
+  string ip_address = 8;
+  string mac_address = 9;
+  string serial_number = 10;
+  string agent_version = 11; // версия агентского бинаря (ldflags main.version) — для видимости раскатки
+
+  // Расширение инвентаря (2026-07). Общий принцип: недоступное на данной ОС
+  // значение — ПУСТАЯ строка / 0 («не знаю»), а не выдуманный false — поэтому
+  // трёхзначные признаки едут строкой "true"/"false"/"", а не proto3-bool,
+  // который не отличает false от «не собрано».
+  string arch            = 12; // архитектура CPU: amd64 / arm64 (runtime.GOARCH)
+  string console_user    = 13; // кто сейчас за консолью; Windows — DOMAIN\user
+                               // (домен сохранён: только по нему учётка матчится
+                               // с каталогом); "" = за консолью никого
+  string disk_encryption = 14; // системный том: "enabled"/"disabled"/"" (unknown).
+                               // macOS FileVault / Windows BitLocker / Linux LUKS
+  string os_patch_date   = 15; // дата последнего установленного обновления ОС,
+                               // ISO "2006-01-02"; "" = неизвестно (Linux: нет
+                               // универсального сигнала — всегда "")
+  int64  boot_time       = 16; // unix-время загрузки ОС; 0 = неизвестно. Именно
+                               // момент загрузки, а не uptime: uptime менялся бы
+                               // в каждом отчёте и убил бы delta-подавление
+  string disk_free       = 17; // свободно на системном томе, человекочитаемо
+  string domain_joined   = 18; // "true"/"false"/""; Windows — Win32_ComputerSystem
+                               // .PartOfDomain, macOS/Linux — заведомое "false"
+  string tpm             = 19; // TPM присутствует: "true"/"false"/"" — Windows
+  string secure_boot     = 20; // Secure Boot включён: "true"/"false"/"" — Windows
+                               // (legacy BIOS = "false": UEFI-защиты заведомо нет)
+  // capabilities — что этот бинарь УМЕЕТ, а не какой он версии.
+  //
+  // Версии недостаточно (§9.17 контракта): free-сборка агента той же версии физически не
+  // содержит удалённого стола — файлы вырезаны тегом, а не выключены флагом. Сервер,
+  // проверяющий только agent_version, поставил бы такому агенту сеанс, и оператор смотрел
+  // бы на «ждём агента» до самого таймаута. Пример значения: "screen_session".
+  repeated string capabilities = 22;
+
+  string console_user_sid = 21; // стабильный SID интерактивного пользователя (Windows) —
+                               // ключ матча с каталогом (objectSid), rename-proof в отличие
+                               // от console_user-логина. "" = неизвестно / не Windows /
+                               // локальный юзер вне каталога. Заполняет агент (Тинки).
+}
+
+// UninstallMethod — чем агент СМОЖЕТ снять это ПО, если оператор попросит.
+// Заполняет агент по факту сбора инвентаря: только он видит, есть ли тихий
+// деинсталлятор. UNSPECIFIED = удалять нечем (fail-safe, как и в остальных
+// командах: нулевое значение никогда не деструктивно). Сервер по этому полю
+// решает, показывать ли действие «удалить», но авторитетный отказ всё равно за
+// агентом в момент выполнения.
+enum UninstallMethod {
+  UNINSTALL_METHOD_UNSPECIFIED = 0;
+  UNINSTALL_METHOD_MSI = 1;              // Windows Installer: msiexec /x {ProductCode} /qn
+  UNINSTALL_METHOD_WINDOWS_QUIET = 2;    // Windows: QuietUninstallString из реестра
+  UNINSTALL_METHOD_MACOS_APP_BUNDLE = 3; // macOS: снос .app + pkgutil --forget
+  UNINSTALL_METHOD_DPKG = 4;             // Linux: apt-get remove
+  UNINSTALL_METHOD_RPM = 5;              // Linux: dnf/yum remove
+  UNINSTALL_METHOD_PACMAN = 6;           // Linux: pacman -R
+  UNINSTALL_METHOD_APK = 7;              // Linux: apk del
+}
+
+message SoftwareItem {
+  string software_name = 1;
+  string version = 2;
+  // Поля ниже добавлены под два пункта роадмапа: удаление ПО из интерфейса
+  // (нужен машинный ключ цели — по человекочитаемому имени одноимённые продукты
+  // разных вендоров резолвятся в чужую запись) и сканирование на CVE (без
+  // вендора и архитектуры CPE/purl детерминированно не построить).
+  //
+  // ВАЖНО (инвариант хэша инвентаря, см. inventory.hashReport): каждое поле
+  // обязано быть СТАБИЛЬНЫМ между снимками, пока машина не изменилась — весь
+  // SoftwareItem входит в хэш целиком. Поэтому здесь сознательно НЕТ даты
+  // установки и времени изменения файлов: их формат разъезжается между
+  // источниками, и волатильное поле молча вернуло бы отправку инвентаря каждые
+  // 5 минут по всему парку, без ошибки и следа в логах.
+  string vendor = 3;           // издатель/мейнтейнер; "" = источник не отдал
+  string install_location = 4; // путь установки; для purl-fallback и адресного сноса
+  string arch = 5;             // x86_64 / arm64 / i386 / noarch; "" = неизвестно
+  string uninstall_id = 6;     // машинный ключ цели: ProductCode/имя подключа, bundle id, имя пакета
+  UninstallMethod uninstall_method = 7;
+  // scope — установлено на машину ("machine") или в профиль пользователя
+  // ("user"). Per-user установки видны, но снять их из-под LocalSystem/root
+  // нельзя — оператор должен это понимать, а политика запрещённого ПО обязана
+  // их учитывать (иначе установка в профиль обходит детект).
+  string scope = 8;
+}
+
+message InventoryReport {
+  reserved 1;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  DeviceInfo device_info = 2;
+  repeated SoftwareItem software = 3;
+}
+
+message InventoryAck {
+  bool received = 1;
+}
+
+// ====== Задачи (Command Listener) ======
+
+enum TaskPriority {
+  TASK_PRIORITY_UNSPECIFIED = 0;
+  TASK_PRIORITY_LOW = 1;
+  TASK_PRIORITY_MEDIUM = 2;
+  TASK_PRIORITY_HIGH = 3;
+}
+
+// Сервер → Агент.
+message Task {
+  string task_id = 1;
+  reserved 2;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  string script_content = 3;
+  string platform = 4;  // macOS / Windows
+  TaskPriority priority = 5;
+  LockCommand lock = 6; // если задано — это команда блокировки устройства, а не скрипт
+  DecommissionCommand decommission = 7; // если задано — полное самоудаление агента, а не скрипт/лок
+  RebootCommand reboot = 8; // если задано — перезагрузка устройства, а не скрипт/лок/снос
+  UninstallCommand uninstall = 9; // если задано — удаление ПО, а не скрипт/лок/снос/ребут
+  FileVaultProvisionCommand filevault_provision = 10; // если задано — дозавершение provisioning FileVault
+  ScreenSessionCommand screen_session = 11; // если задано — приглашение на интерактивный сеанс (ADR-8)
+}
+
+// UninstallCommand — удаление установленного ПО из карточки устройства. Едет в
+// Task поверх Connect-стрима, переиспользуя доставку/ack/идемпотентность задач.
+//
+// ГЛАВНОЕ СВОЙСТВО КОНТРАКТА: поля ниже — СЕЛЕКТОР ЦЕЛИ, а не инструкция к
+// исполнению. Агент НЕ выполняет присланную строку деинсталлятора и вообще не
+// принимает от сервера никаких команд ОС: он заново снимает инвентарь, находит
+// в СВОЁМ свежем снимке запись по этому селектору и выполняет тот метод, который
+// его собственный коллектор считает применимым. Иначе канал задач стал бы вторым
+// путём произвольного исполнения на устройстве — уже поверх скриптов, но без их
+// подписи, аудита и потолков.
+//
+// Второе следствие того же решения: инвентарь на сервере всегда чуть устарел
+// (снимок раз в 5 минут). Селектор, который больше не сходится со свежим
+// снимком, — это не «удали что-нибудь похожее», а отказ TARGET_CHANGED: между
+// снимком и командой ПО могли обновить, и снос по одному лишь имени снял бы не
+// ту версию либо одноимённый продукт другого вендора.
+message UninstallCommand {
+  string request_id = 1; // id заявки (идемпотентность/аудит; сервер приравнивает к task_id)
+  // Селектор цели — ровно те поля SoftwareItem, которые сервер получил от этого
+  // же агента. software_name обязателен, остальные уточняют: пустое поле
+  // означает «сервер этого не знает», а не «подходит любое».
+  string software_name = 2;
+  string version = 3;
+  string uninstall_id = 4;      // ProductCode/имя подключа, имя пакета; на macOS пусто
+  string install_location = 5;  // путь установки; на macOS это и есть ключ цели
+  // uninstall_method — СВЕРКА, не приказ: агент сравнивает присланный метод с
+  // тем, что определил сам, и при расхождении отказывает (TARGET_CHANGED).
+  // Расхождение значит, что запись на машине изменилась после снимка.
+  UninstallMethod uninstall_method = 6;
+  string scope = 7;             // "machine"/"user" из того же снимка; сверяется так же
+  string reason = 8;            // причина для аудита
+}
+
+// UninstallOutcome — исход удаления, машиночитаемо. TaskStatus (SUCCESS/ERROR)
+// для этой команды слишком груб: оператору нужно различать «снято», «на машине
+// и так нет», «цель разъехалась с инвентарём» и «сносить нечем» — это разные
+// действия, а не разные формулировки одной ошибки.
+//
+// Отдельно про STILL_PRESENT: успешный код возврата деинсталлятора НЕ означает,
+// что ПО снято (msiexec возвращает 0 на отложенный до перезагрузки снос,
+// pkgutil --forget вообще только чистит квитанцию). Поэтому агент после
+// исполнения снимает инвентарь ЗАНОВО и отчитывается по факту, а не по exit-коду.
+enum UninstallOutcome {
+  UNINSTALL_OUTCOME_UNSPECIFIED = 0;    // не uninstall-задача (обычный скрипт/лок/ребут)
+  UNINSTALL_OUTCOME_REMOVED = 1;        // снято, подтверждено повторным снимком
+  UNINSTALL_OUTCOME_ALREADY_ABSENT = 2; // на машине не найдено ничего с таким именем
+  UNINSTALL_OUTCOME_TARGET_CHANGED = 3; // имя есть, но версия/ключ/метод разошлись со снимком
+  UNINSTALL_OUTCOME_AMBIGUOUS = 4;      // селектор подходит нескольким записям — не гадаем
+  UNINSTALL_OUTCOME_NOT_REMOVABLE = 5;  // тихого деинсталлятора нет (SIP, per-user под Windows, …)
+  UNINSTALL_OUTCOME_SELF_PROTECTED = 6; // цель — сам агент; снос агента идёт только decommission'ом
+  UNINSTALL_OUTCOME_FAILED = 7;         // деинсталлятор отработал с ошибкой
+  UNINSTALL_OUTCOME_STILL_PRESENT = 8;  // деинсталлятор сказал «ок», а ПО осталось в снимке
+}
+
+// DecommissionCommand — вывод устройства из эксплуатации: агент сносит СЕБЯ
+// целиком (служба, серт+ключ+CA, конфиг, состояние, бинарь). Едет в Task
+// (переиспользует доставку/ack/идемпотентность). Порядок на агенте: агент
+// ПОДТВЕРЖДАЕТ выполнение обычным ReportTaskResult (по task_id сервер знает, что
+// это decommission-задача) ДО сноса серта — иначе отчитываться будет уже нечем;
+// сервер по подтверждению помечает устройство списанным и ОТЗЫВАЕТ серт.
+//
+// КРИТИЧНО (серверная сторона): пока серт жив, агент шлёт heartbeat, а
+// сервер на неизвестный отпечаток СОЗДАЁТ устройство заново (UpsertDeviceHeartbeat)
+// — недоснесённый агент воскресил бы списанную машину. Поэтому сервер обязан
+// отозвать серт И отказываться воскрешать списанные устройства. Агент со своей
+// стороны немедленно прекращает heartbeat (выходит из рабочего цикла).
+message DecommissionCommand {
+  string request_id = 1; // id заявки (идемпотентность/аудит; сервер приравнивает к task_id)
+  string reason     = 2; // причина списания (для аудита)
+}
+
+// RebootCommand — перезагрузка устройства по команде оператора (доделать
+// установку обновлений, вывести машину из подвисшего состояния). Едет в Task
+// поверх Connect-стрима: при заданном Task.reboot агент обрабатывает
+// перезагрузку вместо запуска скрипта, переиспользуя доставку/ack/идемпотентность
+// задач.
+//
+// Идемпотентность здесь критичнее, чем у остальных команд: агент ПЕРЕЖИВАЕТ
+// перезагрузку, и если отчёт о выполнении не доехал до ухода машины вниз, сервер
+// передоставит задачу уже ПОСЛЕ загрузки. Набор выполненных task_id
+// персистентный (tasks.seen лежит в защищённом каталоге состояния и переживает
+// ребут), поэтому повторная доставка второй перезагрузки не вызывает — иначе
+// устройство уходило бы в цикл ребутов, пока сервер не получит отчёт.
+message RebootCommand {
+  string request_id = 1; // id заявки (идемпотентность/аудит; сервер приравнивает к task_id)
+  string reason     = 2; // текст сотруднику в предупреждении ОС + аудит
+  // delay_seconds — отсрочка, за которую сотрудник успевает сохранить работу.
+  // 0 (поле не задано) = ДЕФОЛТ АГЕНТА, а НЕ «сейчас»: нулевое значение никогда
+  // не должно быть самым деструктивным вариантом. Отрицательные и абсурдно
+  // большие значения агент приводит к границам сам (см. internal/agent/reboot).
+  // Гранулярность зависит от планировщика ОС: Windows принимает секунды, macOS
+  // и Linux — целые минуты, поэтому там отсрочка округляется ВВЕРХ (в сторону
+  // большего предупреждения, не меньшего).
+  int32 delay_seconds = 3;
+}
+
+// FileVaultProvisionCommand — дозавершение FileVault-provisioning на уже
+// энролленном маке по команде оператора из админки. Едет в Task поверх
+// Connect-стрима, переиспользуя доставку/ack/идемпотентность задач.
+//
+// Зачем вообще команда, если есть подкоманда `agent filevault-provision`.
+// Headless-постустановка идёт под installd без TTY, поэтому пароль держателя
+// Secure Token там взять неоткуда и provisioning пропускается. Единственной
+// альтернативой был визит к каждой машине с терминалом — на парке это не
+// раскатка. Задача переносит ровно тот же интерактив в графическую сессию
+// сотрудника, а не наделяет службу правом взять пароль самостоятельно.
+//
+// Пароль НЕ едет с сервера и не едет НА сервер: агент спрашивает его у
+// сотрудника локально. Сервер отдаёт только повод для диалога.
+//
+// Задача одна на устройство (сервер: ON CONFLICT DO NOTHING, см.
+// storage.CreateFileVaultProvisionTask): иначе нетерпеливый оператор
+// насоздавал бы очередь диалогов, которые вылезут сотруднику один за другим.
+//
+// Отказ обязан быть ГРОМКИМ и с причиной («нет консольного пользователя»,
+// «FileVault выключен», «сотрудник отменил диалог», «таймаут ожидания»), а не
+// Skip в никуда: молчаливый успех по этой задаче — тот же класс тихого вранья,
+// что и незнакомый тип задачи, отчитанный как completed.
+message FileVaultProvisionCommand {
+  string request_id = 1; // id заявки (идемпотентность/аудит; сервер приравнивает к task_id)
+  string reason     = 2; // текст, который увидит сотрудник в диалоге
+}
+
+// LockCommand — блокировка/разблокировка машины сотрудника (нарушение ИБ/увольнение:
+// запереть ноут, пока не сдаст). Едет в Task поверх Connect-стрима: при заданном
+// Task.lock агент обрабатывает блокировку вместо запуска скрипта (переиспользуя
+// доставку/ack/идемпотентность задач). Разблокировка ОФФЛАЙН: сервер шлёт
+// bcrypt-ХЕШ пароля (не плейнтекст), агент сверяет введённый пароль локально;
+// плейнтекст показывается только в админке.
+message LockCommand {
+  string request_id    = 1; // id заявки (идемпотентность/отчёт)
+  bool   unlock        = 2; // true → разблокировать; false → заблокировать
+  string password_hash = 3; // bcrypt-хеш пароля разблокировки (только при блокировке)
+  string reason        = 4; // текст для сотрудника на экране замка
+  // FileVault-лок (enterprise). FAIL-SAFE: 0/unknown => OVERLAY (легаси/дефолт);
+  // деструктив требует ЯВНОГО LOCK_MODE_FILEVAULT=2.
+  LockMode        lock_mode              = 5; // 0/UNSPECIFIED => OVERLAY
+  repeated string filevault_target_users = 6; // RecordName; пусто => целевых определяет агент
+  // поле 7 свободно
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_SUCCESS = 1;
+  TASK_STATUS_ERROR = 2;
+}
+
+// Агент → Сервер.
+message TaskResult {
+  string task_id = 1;
+  reserved 2;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  TaskStatus status = 3;
+  string error_log = 4; // заполняется только если status = ERROR
+  string output = 5;    // stdout скрипта
+  // uninstall_outcome заполняется ТОЛЬКО для Task.uninstall; для остальных задач
+  // остаётся UNSPECIFIED. Status при этом сохраняет обычный смысл (успех/ошибка),
+  // чтобы уже написанная серверная обработка задач работала без изменений, —
+  // outcome лишь уточняет ПОЧЕМУ, для карточки устройства и аудита.
+  UninstallOutcome uninstall_outcome = 6;
+  // screen_refusal — код отказа стартовать интерактивный сеанс (WAYLAND_UNSUPPORTED,
+  // NO_CONSOLE_USER, SCREEN_RECORDING_DENIED, ...). Заполняется ТОЛЬКО для
+  // Task.screen_session при status=ERROR.
+  //
+  // Отдельное поле, а не текст в error_log: §1 контракта требует, чтобы отказ доезжал
+  // до оператора КОДОМ, иначе первая же переформулировка сообщения ломает отрисовку, и
+  // «удалёнка не работает» приходит багрепортом вместо строки «на этой машине Wayland».
+  string screen_refusal = 7;
+}
+
+message TaskResultAck {
+  bool received = 1;
+}
+
+// Агент → Сервер. Подтверждение доставки задачи — ОТДЕЛЬНО от результата
+// выполнения. Позволяет серверу отличить "не доставлено" от "доставлено,
+// но не выполнено". Агент ОБЯЗАН обрабатывать повторные доставки идемпотентно
+// (Asynq даёт at-least-once; особенно критично для операций выдачи прав).
+message TaskReceivedAck {
+  string task_id = 1;
+  reserved 2;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  int64 received_at = 3;
+}
+
+message TaskReceivedAckResponse {
+  bool acknowledged = 1;
+}
+
+// ====== Алерты ИБ (Security Monitor) ======
+
+enum AlertType {
+  ALERT_TYPE_UNSPECIFIED = 0;
+  ALERT_TYPE_FORBIDDEN_SOFTWARE = 1;
+  ALERT_TYPE_UNAUTHORIZED_INSTALL = 2;
+  ALERT_TYPE_UNAUTHORIZED_SETTINGS_CHANGE = 3;
+  // Попытка снять блокировку в обход демона: непривилегированный пользователь
+  // записал «разблокировано» в user-writable файл состояния при РАБОТАЮЩЕЙ
+  // службе (находка 1.3). Событие сообщает о ПОПЫТКЕ, а не о результате: агент
+  // пере-утверждает лок и продолжает работать. Подделка при ОСТАНОВЛЕННОЙ
+  // службе этого события не даёт — обнаруживать её в тот момент некому; она
+  // всплывает при следующем старте агента как обычное пере-запирание.
+  //
+  // Details собирается агентом ТОЛЬКО из фиксированного словаря + число
+  // (см. lock.TamperKind). Класть туда содержимое подделанного файла или
+  // request_id НЕЛЬЗЯ: файл пишет ровно тот, против кого событие (он мог бы
+  // писать текст алерта о себе, а оверсайзом — глушить его через
+  // MaxRecvMsgSize), а request_id на pull-пути равен bcrypt-хешу живого пароля
+  // разблокировки. Устройство и активный лок сервер знает по mTLS-серту и
+  // devices.lock_request_id.
+  //
+  // Дедуп ОБЯЗАТЕЛЕН на стороне агента: сторож тикает раз в секунду, а
+  // security — protected-класс outbox'а, где свежая запись вытесняет
+  // старейшую protected (internal/agent/outbox: enforceLimit). Событие на
+  // каждый тик выдавило бы из очереди loss-sensitive отчёты — см.
+  // lock.Manager.SetTamperReporter.
+  ALERT_TYPE_LOCK_TAMPER = 4;
+  // Улики сессии админ-прав не пришли: базовая линия снята, а финального отчёта нет.
+  // Поднимается СЕРВЕРНЫМ свипером, не агентом — в том и смысл, что событие про
+  // молчание подотчётной стороны не может зависеть от её же отчёта. Покрывает и
+  // досрочный отзыв из панели (status='revoked'), а не только истёкшие заявки:
+  // досрочный отзыв — самый подозрительный сценарий, ИТ что-то заметил, и молчание
+  // именно там не должно быть невидимым.
+  ALERT_TYPE_ADMIN_SESSION_EVIDENCE_GAP = 5;
+}
+
+// Агент → Сервер.
+message SecurityEvent {
+  reserved 1;           // было device_id — удалено по ADR-1
+  reserved "device_id";
+  AlertType alert_type = 2;
+  string details = 3;
+  int64 occurred_at = 4;
+  string admin_access_request_id = 5; // опционально, если событие во время активной админки
+}
+
+message SecurityEventAck {
+  bool received = 1;
+}
+
+// ====== Политики ПО (Software Policy) ======
+// Общий контракт (ADR-4).
+//
+// Агент периодически запрашивает действующие правила ПО (разрешено/запрещено),
+// кэширует их локально в файл и применяет в Security Monitor даже без связи с
+// сервером (CONTEXT §7). device_id не передаётся — сервер определяет устройство
+// по mTLS-сертификату (ADR-1) и возвращает правила для него: глобальные
+// (software_policy_rules.device_id IS NULL) + переопределения этого устройства.
+
+enum PolicyRuleType {
+  POLICY_RULE_TYPE_UNSPECIFIED = 0;
+  POLICY_RULE_TYPE_ALLOWED = 1;
+  POLICY_RULE_TYPE_FORBIDDEN = 2;
+}
+
+message SoftwarePolicyRule {
+  string software_name = 1;
+  PolicyRuleType rule_type = 2;
+}
+
+// Агент → Сервер.
+message FetchPolicyRequest {
+  // Версия политики у агента — unix-время max(updated_at) набора правил. Если
+  // равно серверной версии, сервер отвечает unchanged=true без списка. 0 = нет
+  // кэша (вернуть полный набор).
+  int64 known_version = 1;
+}
+
+// Сервер → Агент.
+message FetchPolicyResponse {
+  repeated SoftwarePolicyRule rules = 1;
+  int64 version = 2;   // unix-время max(updated_at) текущего набора (для кэша)
+  bool unchanged = 3;  // true => known_version актуальна, rules не возвращены
+}
+
+// ====== Временные права администратора (Этап 4) ======
+// Общий контракт (ADR-4).
+//
+// Флоу: сотрудник на устройстве запрашивает временные админ-права
+// (RequestAdminAccess) → IT-админ одобряет/отклоняет в веб-интерфейсе (это REST
+// web→server: POST /api/v1/admin-access-requests/{id}/respond, НЕ в этом proto) →
+// агент узнаёт решение и срок (FetchAdminStatus, pull, как FetchPolicy) → агент
+// применяет права и сообщает факт применения/сброса (ReportAdminAccess; напр.
+// сброс при логауте → revoked_at). Длительность задаёт сервер по политике
+// (system_settings/роль), возвращает готовый expires_at. device_id во всех
+// сообщениях НЕ передаётся — сервер берёт из mTLS-серта (ADR-1). Маппится на
+// таблицу admin_access_requests.
+
+enum AdminAccessStatus {
+  ADMIN_ACCESS_STATUS_UNSPECIFIED = 0;
+  ADMIN_ACCESS_STATUS_PENDING     = 1; // заявка создана, ждёт решения IT-админа
+  ADMIN_ACCESS_STATUS_APPROVED    = 2; // одобрено, права действуют до expires_at
+  ADMIN_ACCESS_STATUS_REJECTED    = 3;
+  ADMIN_ACCESS_STATUS_EXPIRED     = 4; // истёк срок (pending_expires_at или expires_at)
+  ADMIN_ACCESS_STATUS_REVOKED     = 5; // снято (логаут пользователя или вручную)
+}
+
+// Агент → Сервер: сотрудник на устройстве запросил временные права.
+message RequestAdminAccessRequest {
+  string reason       = 1; // обоснование от пользователя
+  int64  requested_at = 2;
+}
+message RequestAdminAccessResponse {
+  string request_id = 1;        // admin_access_requests.id
+  AdminAccessStatus status = 2; // обычно PENDING
+}
+
+// Агент → Сервер: узнать текущий статус прав для устройства (pull).
+// Возвращает ПОСЛЕДНЮЮ активную заявку устройства (PENDING или APPROVED). Если
+// активной заявки нет — request_id="" и status=ADMIN_ACCESS_STATUS_UNSPECIFIED.
+// Несколько одновременно активных заявок недопустимы — это ответственность
+// сервера; агент всегда видит ровно одну.
+message FetchAdminStatusRequest {}
+message FetchAdminStatusResponse {
+  string request_id = 1;        // "" если активной заявки нет
+  AdminAccessStatus status = 2; // UNSPECIFIED если активной заявки нет
+  int64 granted_at = 3;         // когда права выданы (если APPROVED)
+  int64 expires_at = 4;         // до когда действуют
+
+  // Собирать ли улики сессии (аудит выданных админ-прав). Нулевое значение = НЕ
+  // собирать, и это не осторожность, а требование раскатки: агент самообновляется,
+  // поэтому «агент впереди сервера» — поведение по умолчанию, а codes.Unimplemented
+  // НЕ входит в терминальный список reportErr (cmd/agent/main.go). Новый агент против
+  // старого сервера копил бы записи вечно, и FIFO-очередь заблокировала бы ИБ-алерты,
+  // статусы лока и сам ReportAdminAccess. Аудит-фича не имеет права уронить отчётный
+  // канал, поэтому молчание сервера читается как «не собирать».
+  //
+  // Источник — глобальная настройка system_settings.collect_admin_session_changes
+  // (рядом с admin_request_timeout_minutes). Ответ идёт по устройству (mTLS-серт),
+  // поэтому политика на группу, если однажды понадобится, меняет только сервер и это
+  // поле не двигает.
+  bool collect_session_changes = 5;
+  // Период промежуточных окон, сек. 0 = дефолт агента (1800). Значения <300 сервер
+  // клампит сам: кламп держит тот, кто выдаёт число, иначе он жил бы в двух
+  // реализациях сразу и разъехался бы при первой правке.
+  int32 snapshot_interval_sec = 6;
+}
+
+// Агент → Сервер: агент сообщает фактическое применение/снятие прав
+// (напр. сброс при логауте — сервер проставит revoked_at).
+message ReportAdminAccessRequest {
+  string request_id = 1;
+  AdminAccessStatus status = 2; // APPROVED (применено) / REVOKED (снято)
+  int64  occurred_at = 3;
+  string details = 4; // напр. "revoked on user logout"
+
+  // Снята ли базовая линия улик к моменту выдачи прав. Это ЗАЩЁЛКА решения: агент
+  // фиксирует флаг сервера на t0 и до конца сессии его не переспрашивает, иначе
+  // выключение настройки посреди сессии оставило бы снятую базовую линию без
+  // финального окна — то есть выключатель сам производил бы «дыру в уликах».
+  //
+  // Сервер по этому полю и отличает «улик не ждём» от «улики пропали»: свипер
+  // поднимает алерт только там, где базовая линия снята, а финального отчёта нет.
+  // Текущее значение настройки для этого не годится — по нему включение задним
+  // числом обвиняло бы старые сессии, а выключение стирало бы настоящие дыры.
+  bool baseline_captured = 5;
+}
+message ReportAdminAccessResponse {
+  bool received = 1;
+}
+
+// ====== Улики сессии админ-прав (аудит выданных прав) ======
+// Контракт улик сессии админ-прав (дельта определений ПО и служб).
+//
+// Фиксируется ИЗМЕНЕНИЕ ОПРЕДЕЛЕНИЙ (запись инвентаря ПО, определение службы), а не
+// runtime-состояние. running/stopped не входит вовсе — не как фильтр, а как
+// конструкция: иначе один ребут внутри сессии давал бы полную «дельту» по всем службам
+// парка. Список процессов не собирается: перечисление процессов сотрудника — наблюдение
+// за человеком, а не подотчётность выданных прав, и живой процесс без персистентного
+// следа в разбор инцидента всё равно не попадёт.
+
+enum AdminChangeKind {
+  ADMIN_CHANGE_KIND_UNSPECIFIED                = 0;
+  ADMIN_CHANGE_KIND_SOFTWARE_INSTALLED         = 1;
+  ADMIN_CHANGE_KIND_SOFTWARE_REMOVED           = 2;
+  ADMIN_CHANGE_KIND_SOFTWARE_UPDATED           = 3;
+  ADMIN_CHANGE_KIND_SERVICE_INSTALLED          = 4;
+  ADMIN_CHANGE_KIND_SERVICE_REMOVED            = 5;
+  ADMIN_CHANGE_KIND_SERVICE_START_TYPE_CHANGED = 6;
+  ADMIN_CHANGE_KIND_SERVICE_ACCOUNT_CHANGED    = 7;
+  ADMIN_CHANGE_KIND_SERVICE_DEFINITION_CHANGED = 8;
+}
+
+// Атрибуция — КЛЮЧ СОРТИРОВКИ, а не обвинение: она отвечает «на что смотреть первым»,
+// и UI обязан формулировать её как «за время сессии на устройстве появилось X», а не
+// «пользователь установил X».
+//
+// UNSPECIFIED никогда не значит «человек»: неизвестность выражается явным UNKNOWN,
+// чтобы ни старый сервер, ни битая запись не читались как обвинение.
+enum ChangeAttribution {
+  CHANGE_ATTRIBUTION_UNSPECIFIED       = 0;
+  CHANGE_ATTRIBUTION_HUMAN_LIKELY      = 1;
+  CHANGE_ATTRIBUTION_BACKGROUND_LIKELY = 2;
+  CHANGE_ATTRIBUTION_UNKNOWN           = 3;
+}
+
+enum CollectionHealth {
+  COLLECTION_HEALTH_UNSPECIFIED = 0;
+  COLLECTION_HEALTH_OK          = 1;
+  COLLECTION_HEALTH_PARTIAL     = 2;
+  COLLECTION_HEALTH_FAILED      = 3;
+  COLLECTION_HEALTH_UNSUPPORTED = 4;
+}
+
+// Полнота улик. Нужна ровно затем, чтобы «улик нет» не читалось как «ничего не было»:
+// пустая дельта при COMPLETE означает «изменений не было», при любом другом значении —
+// «мы не знаем». Отсутствие улик обязано быть событием, а не тишиной.
+enum EvidenceCompleteness {
+  EVIDENCE_COMPLETENESS_UNSPECIFIED = 0;
+  EVIDENCE_COMPLETENESS_COMPLETE    = 1;
+  EVIDENCE_COMPLETENESS_NO_BASELINE = 2;
+  EVIDENCE_COMPLETENESS_PARTIAL     = 3;
+  EVIDENCE_COMPLETENESS_TRUNCATED   = 4;
+  EVIDENCE_COMPLETENESS_STALE_FINAL = 5;
+}
+
+message AdminSessionChange {
+  AdminChangeKind   kind               = 1;
+  string            subject            = 2;  // имя записи ПО / службы
+  string            display_name       = 3;
+  // identity_key — устойчивый ключ записи (для ПО «имя+вендор», для службы её имя).
+  // По нему считается атрибуция: новый ключ = новый продукт, тот же ключ с другой
+  // версией = обновление фоном.
+  string            identity_key       = 4;
+  string            old_value          = 5;
+  string            new_value          = 6;
+  string            vendor             = 7;
+  string            scope              = 8;  // каталог/область определения службы
+  ChangeAttribution attribution        = 9;
+  string            attribution_reason = 10; // напр. version_bump_same_key
+  int64             observed_at        = 11;
+}
+
+message ReportAdminSessionChangesRequest {
+  string                      request_id      = 1;
+  int32                       window_seq      = 2;
+  int64                       window_start    = 3;
+  int64                       window_end      = 4;
+  // КУМУЛЯТИВНО от базовой линии t0, а не от предыдущего окна, и базовая линия за
+  // сессию не перебазируется. Следствие: потеря промежуточного окна самоизлечивается
+  // следующим, а финальное окно всегда несёт полную дельту сессии. Инкрементальные
+  // окна давали бы обратное — одна потерянная запись превращается в невидимую дыру,
+  // поверх которой панель уверенно рисует полный список.
+  repeated AdminSessionChange changes         = 5;
+  bool                        final           = 6;
+  bool                        truncated       = 7;
+  // Полный объём до урезания. Урезание идёт по значимости (human_likely → unknown →
+  // background_likely), поэтому панель обязана показывать «N из total_changes», а не
+  // выдавать урезанный список за полный.
+  int32                       total_changes   = 8;
+  bool                        rebooted        = 9;
+  bool                        baseline_lost   = 10;
+  CollectionHealth            software_health = 11;
+  CollectionHealth            services_health = 12;
+  EvidenceCompleteness        completeness    = 13;
+  int64                       snapshot_at     = 14; // ≠ window_end при stale_final
+}
+
+message ReportAdminSessionChangesResponse {
+  bool received = 1;
+}
+
+// ====== Скрипт-политики (Этап 5) — общий контракт ======
+// Аналог FetchPolicy, но для исполняемых скрипт-политик с триггерами.
+//
+// Предлагаемый флоу: IT-админ в вебе создаёт скрипты и привязывает их к
+// устройствам/группам (REST: /api/v1/scripts, /api/v1/script-policies,
+// /api/v1/device-groups — НЕ в этом proto). Агент периодически тянет СВОЙ
+// эффективный набор скрипт-политик (FetchScriptPolicies, pull, как FetchPolicy),
+// кэширует и исполняет по триггеру (cron / событие / on_connect), затем шлёт
+// результат (ReportScriptResult, через устойчивую очередь — терять нельзя).
+// device_id не передаётся — сервер резолвит устройство по mTLS-серту (ADR-1) и
+// САМ вычисляет эффективные политики: прямые привязки устройства + привязки его
+// групп. Агент в членство групп не лезет.
+//
+// РЕШЕНИЯ по обсуждавшимся вопросам:
+//   1) script_content — inline (RMM-скрипты небольшие; лимит gRPC 4МБ с запасом;
+//      при изменении не перетягивается лишний раз благодаря version/unchanged).
+//   2) Эффективный набор резолвит СЕРВЕР по mTLS-серту (ADR-1): прямые привязки
+//      устройства + привязки его групп. Агент группы/членство не видит.
+//   3) Отдельный ReportScriptResult (у скрипт-политик нет task_id; есть policy_id
+//      + run_id, отдельные stdout/stderr и метки времени запуска).
+//   4) event_trigger — enum ScriptEventType (фикс-набор), расширяется аддитивно.
+//   5) on_connect — запуск на установку стрима, дедуп по policy_id+version
+//      (персистентно у агента), реконнекты не перезапускают скрипт.
+
+enum ScriptTrigger {
+  SCRIPT_TRIGGER_UNSPECIFIED = 0;
+  SCRIPT_TRIGGER_SCHEDULE    = 1; // по cron-выражению (поле cron)
+  SCRIPT_TRIGGER_EVENT       = 2; // по событию ОС (поле event_trigger)
+  SCRIPT_TRIGGER_ON_CONNECT  = 3; // при установке Connect-стрима
+}
+
+// События ОС для trigger=EVENT. Расширять только в конец (ADR-4).
+enum ScriptEventType {
+  SCRIPT_EVENT_TYPE_UNSPECIFIED    = 0;
+  SCRIPT_EVENT_TYPE_LOGIN          = 1;
+  SCRIPT_EVENT_TYPE_LOGOUT         = 2;
+  SCRIPT_EVENT_TYPE_NETWORK_CHANGE = 3;
+}
+
+message ScriptPolicy {
+  string policy_id              = 1; // script_policies.id
+  string name                   = 2;
+  string script_content         = 3; // inline (решение 1)
+  string interpreter            = 4; // "shell" | "powershell" | "python"
+  ScriptTrigger trigger         = 5;
+  string cron                   = 6; // при trigger=SCHEDULE, напр. "0 */6 * * *"
+  ScriptEventType event_trigger = 7; // при trigger=EVENT (решение 4)
+  int64  timeout_seconds        = 8; // потолок на один запуск
+  int64  updated_at             = 9; // unix; max по набору = version
+}
+
+// Агент → Сервер: тянем эффективный набор скрипт-политик устройства.
+message FetchScriptPoliciesRequest {
+  // Версия у агента — unix max(updated_at) набора. Равна серверной → unchanged=true
+  // без списка. 0 = нет кэша (вернуть полный набор).
+  int64 known_version = 1;
+}
+message FetchScriptPoliciesResponse {
+  repeated ScriptPolicy policies = 1;
+  int64 version   = 2; // unix max(updated_at) текущего набора (для кэша)
+  bool  unchanged = 3; // true => known_version актуальна, policies не возвращены
+}
+
+// Агент → Сервер: результат одного запуска скрипт-политики (через outbox).
+message ScriptResult {
+  string policy_id   = 1;
+  string run_id      = 2; // идемпотентность запуска (uuid, генерит агент)
+  int32  exit_code   = 3;
+  string stdout      = 4;
+  string stderr      = 5;
+  int64  started_at  = 6;
+  int64  finished_at = 7;
+  ScriptTrigger trigger = 8; // чем был инициирован запуск
+}
+message ScriptResultAck {
+  bool received = 1;
+}
+
+// ====== Сервис ======
+
+// ── FileVault recovery-key escrow (enterprise) ──
+// Эскроу recovery-ключа на энроллменте. Сервер хранит ТОЛЬКО непрозрачный
+// шифртекст (sealed_key) и расшифровать его НЕ может; расшифровка — офлайн, вне
+// сервера. Схема запечатывания и хранения приватного ключа — enterprise-деталь.
+enum RecoveryKeyType {
+  RECOVERY_KEY_TYPE_UNSPECIFIED       = 0;
+  RECOVERY_KEY_TYPE_FILEVAULT_PRK     = 1;
+  RECOVERY_KEY_TYPE_SECONDARY_CREDENTIAL = 2;
+}
+// device_id НЕ передаём (ADR-1: идентичность из mTLS-cert). sealed_key — bytes, НЕ
+// string: никакого base64/армора на проводе, чтобы случайно не залогировать.
+message EscrowRecoveryKeyRequest {
+  string          request_id       = 1;
+  RecoveryKeyType key_type         = 2;
+  // Непрозрачный запечатанный ENVELOPE, НЕ сырой секрет. Формат plaintext и схема
+  // запечатывания — enterprise-деталь (сервер расшифровать не может); envelope
+  // самоверифицируется офлайн при reveal. bytes, НЕ string: никакого base64/армора
+  // на проводе, чтобы случайно не залогировать.
+  bytes           sealed_key       = 3;
+  // fpr использованного recipient — сервер сверяет с pinned. Формула (канон):
+  // fpr = hex(sha256(canonical recipient.String()))[:32] — реализация
+  // internal/server/crypto.Fingerprint; агент ИМПОРТИТ её, не реализует сам.
+  // recipient для Encrypt и fpr обязаны браться из ОДНОГО распарсенного объекта.
+  string          escrow_pubkey_id = 4;
+  int64           created_at       = 5;
+}
+message EscrowRecoveryKeyResponse {
+  bool   stored    = 1; // true ТОЛЬКО после устойчивого DB COMMIT
+  string escrow_id = 2;
+}
+
+// ====== Удалённый рабочий стол (ADR-8, docs/remote-desktop-contract.md) ======
+//
+// Ф1 — только просмотр (watch-only): ни клавиатуры, ни мыши, ни передачи файлов.
+// Поток идёт агент → сервер → браузер (ретрансляция), потому что запись сеанса обязана
+// делать сторона, у которой нет интереса её подделать (§2 контракта).
+//
+// ADR-8 дословно: интерактивный сеанс — ОТДЕЛЬНЫЙ стрим на ОТДЕЛЬНОМ соединении, и ни
+// одного кадра без зарегистрированного сеанса. Кадры никогда не смешиваются с heartbeat
+// (продолжение ADR-5), session_id не авторизует НИКОГДА (личность — только CN mTLS,
+// ADR-1), а область сеанса enforce'ит агент по приглашению, а не сервер по флагам в
+// управляющих сообщениях.
+
+// Сервер → Агент: приглашение на сеанс. Едет полем Task.screen_session поверх
+// Connect-стрима — переиспользуются доставка, ack и идемпотентность по task_id.
+//
+// Приглашение НЕ является каналом кадров: в gRPC стрим всегда открывает клиент,
+// поэтому приглашение и стрим — два разных механизма (§3.2).
+message ScreenSessionCommand {
+  // session_id — идентификатор сеанса на сервере. Агент возвращает его в hello, но
+  // ПРАВ он не даёт: сервер сверяет screen_sessions.device_id с device_id из
+  // сертификата стрима (§9.18). Знание чужого session_id не даёт ничего.
+  string session_id = 1;
+
+  // profile — имя профиля потолков ("low" в Ф1). Неизвестное имя не роняет сеанс:
+  // агент берёт low и сообщает об этом событием, иначе рассинхрон версий выглядел бы
+  // как «почему-то мыльно» без единой строки в журнале.
+  string profile = 2;
+
+  // displays — какие экраны разрешено показывать. ПУСТОЙ список означает «только
+  // основной», а не «все»: умолчание в пользу большего доступа — ровно та ошибка,
+  // против которой написан §9.10.
+  repeated int32 displays = 3;
+
+  // allow_input — сеанс с УПРАВЛЕНИЕМ (Ф3). Объявляется ОДИН РАЗ, в приглашении, и
+  // расширить область по ходу сеанса нельзя ничем: сеанс наблюдения не превращается в
+  // сеанс управления на лету (§4 п.5, §9.10). Вернуть управление можно — это сужение
+  // (SessionControl.narrow), и оно необратимо: взять снова = новый сеанс с новой
+  // строкой аудита.
+  //
+  // Агент, у которого ввод объявлен, но внедрять его нечем (ОС без поддержки, сборка
+  // без CGO на macOS, нет разрешения Accessibility), ОТКАЗЫВАЕТ в сеансе кодом
+  // INPUT_UNAVAILABLE / ACCESSIBILITY_DENIED, а не понижается молча до просмотра:
+  // оператор, чья мышь не двигается, ищет проблему в сети, а не в разрешениях.
+  bool allow_input = 4;
+
+  // consent_required — режим тенанта. false (unattended) — решение владельца от
+  // 03.08.2026: согласие не является условием первого кадра. Резидентная плашка
+  // «за вашим экраном наблюдают» показывается в ОБОИХ режимах и флага отключения не
+  // имеет (§4).
+  bool consent_required = 5;
+
+  string operator_name = 6; // кто смотрит — для плашки и диалога согласия
+  string reason         = 7; // повод оператора; обязателен, показывается сотруднику
+
+  int32 max_duration_sec    = 8; // 0 = потолок агента (час)
+  int32 consent_timeout_sec = 9; // молчание сотрудника = отказ (режим consent_required)
+
+  // maintenance — сеанс в РЕЖИМЕ ОБСЛУЖИВАНИЯ (§9.11 / §4, решено 13.08.2026). Защищённый
+  // рабочий стол (UAC, Ctrl+Alt+Del) и экран блокировки становятся УПРАВЛЯЕМЫ, а не паузят
+  // кадры и не рвут сеанс: захват и ввод следуют за Winlogon. Объявляется ОДИН РАЗ в
+  // приглашении, как allow_input, и на лету не расширяется.
+  //
+  // ОТДЕЛЬНАЯ способность screen_maintenance, а не производная allow_input: печатать в
+  // UAC/на локскрин под учёткой сотрудника строго выше по привилегии. Приглашение с
+  // maintenance к агенту без этой способности сервер отбивает 409 agent_no_maintenance ДО
+  // создания сеанса — иначе агент принял бы его и умер бы, встретив защищённый стол по
+  // старой (Ф1) таблице трактовок. maintenance подразумевает allow_input: управлять нечем,
+  // если ввод не разрешён.
+  bool maintenance = 10;
+
+  // transport — чем едут кадры (Этап B, docs/REMOTE_DESKTOP_B_DESIGN.md §3). Пусто или
+  // "rsf1" — тайлы RSF1 в SessionFrame, как раньше; "webrtc" — видео по PeerConnection к
+  // серверу, сигнализация в SessionSignal на этом же стриме сеанса. Строкой, а не enum, по
+  // той же причине, что причины завершения. Сервер выбирает webrtc ТОЛЬКО для агента со
+  // способностью screen_webrtc_<codec>: агент старше поля его не увидит и пойдёт по RSF1.
+  string transport = 11;
+
+  // video_codec — "vp8" | "h264"; пусто для rsf1. Неизвестный агенту кодек — отказ сеанса
+  // кодом, а не молчаливое понижение до RSF1: решение о транспорте принимает сервер.
+  string video_codec = 12;
+
+  // ice_servers — STUN/TURN для PeerConnection агента (transport="webrtc"). Нужны в режиме
+  // p2p_preferred: без STUN агент за NAT не узнает свой внешний адрес, без TURN не будет
+  // запасного пути. В relay_only пусто — сервер достижим напрямую. Учётные данные TURN —
+  // короткоживущие, выданы на этот сеанс; агент их не хранит.
+  repeated IceServer ice_servers = 13;
+}
+
+message IceServer {
+  repeated string urls       = 1; // "stun:host:3478", "turn:host:3478?transport=udp"
+  string          username   = 2;
+  string          credential = 3;
+}
+
+// ====== Поток сеанса ======
+//
+// Причины завершения ездят СТРОКАМИ, а не proto-enum, и это осознанно. Enum превращает
+// причину, которой не знает вторая сторона, в UNSPECIFIED — то есть теряет ровно ту
+// информацию, ради которой §1 контракта требует «каждый отказ виден оператором отдельным
+// кодом, а не пустым экраном». Канонический список — internal/agent/screen (EndReason),
+// серверные причины: VIEWER_GONE, DEVICE_CUT_OFF, OPERATOR_REVOKED, AGENT_GONE.
+
+// Агент → Сервер.
+message SessionUp {
+  oneof msg {
+    SessionHello hello = 1;
+    SessionFrame frame = 2;
+    SessionEnd   end   = 3;
+    SessionStats stats = 4;
+    ControlState control = 5; // Ф3: честный признак применяемости ввода (11.08.2026)
+    FrameFlow    frames  = 6; // §9.11: выдача кадров приостановлена/возобновлена (12.08.2026)
+    SecureDesktop secure = 7; // §9.21 п.4: интервал показа защищённого стола (14.08.2026)
+    SessionSignal signal = 8; // Этап B: WebRTC-сигнализация (transport="webrtc")
+  }
+}
+
+// WebRTC-сигнализация сеанса (Этап B). Едет по стриму ScreenSession, а не отдельным RPC:
+// стрим уже аутентифицирован mTLS, поэтому отпечаток DTLS сервера в sdp_answer агент получает
+// по доверенному каналу, а PeerConnection привязан к сеансу, чей device_id совпал с CN.
+// session_id и здесь не авторизует ничего.
+message SessionSignal {
+  oneof msg {
+    string       sdp_offer        = 1; // агент → сервер
+    string       sdp_answer       = 2; // сервер → агент
+    IceCandidate ice              = 3; // в обе стороны
+    // keyframe_request — сервер → агент, аналог PLI/FIR: новый зритель или потеря пакетов.
+    // Для RSF1 то же самое делает SessionControl.request_keyframe.
+    bool         keyframe_request = 4;
+  }
+}
+
+message IceCandidate {
+  string candidate       = 1;
+  string sdp_mid         = 2;
+  uint32 sdp_mline_index = 3;
+}
+
+// Агент → Сервер: показывается ли оператору ЗАЩИЩЁННЫЙ рабочий стол прямо сейчас (§9.21 п.4).
+//
+// 🔴 Это ИНТЕРВАЛ, и он существует отдельно от гранта именно поэтому. Код аудита на выдачу
+// режима обслуживания штампует РАЗРЕШЕНИЕ в момент создания сеанса — он не говорит, был ли
+// защищённый стол реально показан и когда. Сеанс обслуживания может не встретить ни одного
+// UAC, а может встретить их несколько подряд. Окно неатрибутируемости §9.21 п.4 — это окно, в
+// котором на экране оператора могли быть ПАРОЛИ; собранное из гранта, оно растянулось бы на
+// весь сеанс и переоценило бы ровно тот факт, ради которого заведено.
+//
+// Источник — ЗАХВАТ, а не проба стола: пара active=true/false ставится там, где поток съёмки
+// привязался к столу Winlogon и с него пошли кадры. Проба отвечает на вопрос, что происходит
+// на МАШИНЕ; отчёт обязан описывать то, что оператор ВИДЕЛ, а между этим есть зазор (привязка
+// может не удаться — тогда стол защищённый, а оператор смотрит в замерший кадр).
+//
+// Конец окна — РАНЬШЕЕ из выхода и конца сеанса, как у окна передачи управления: захватчик,
+// убитый на защищённом столе, своего active=false не пришлёт, и закрыть окно тогда обязан
+// сервер по концу сеанса. Молчание здесь читается как «защищённый стол не показывали»: агент
+// старше этого поля на защищённый стол не переходит вовсе — он его паузит (FrameFlow).
+//
+// В Ф1 не приезжает никогда по построению: там захват за Winlogon не следует.
+message SecureDesktop {
+  bool active = 1;
+  // Имя стола, С КОТОРОГО началось окно ("Winlogon", "Screen-saver"). Пусто при active=false:
+  // интервал именуется своим началом. Строкой, а не enum — по той же причине, что причины
+  // завершения: незнакомое имя обязано доехать текстом, а не стать UNSPECIFIED.
+  string desktop = 2;
+  // at_ms — часы АГЕНТА, только для упорядочивания (как в ControlState и FrameFlow).
+  // Проставляются в момент САМОГО пересечения, а не отправки: петля может стоять в захвате,
+  // начавшемся до пересечения, и время отправки открыло бы окно позже кадра, снятого раньше.
+  int64 at_ms = 3;
+}
+
+// Агент → Сервер: приостановлена ли ВЫДАЧА КАДРОВ прямо сейчас (§9.11).
+//
+// Отдельное состояние сеанса, а не поле ControlState, и разница здесь не в оформлении.
+// ControlState описывает применимость ВВОДА, а §9.11 — выдачу КАДРОВ, и в СМОТРОВОМ сеансе
+// первого нет вовсе: маяк туда не уходит, заявить «управление не действует» нельзя (снять
+// это заявление на возврате будет нечем — «неизвестно» на проводе не выражается, а
+// effective=true в смотровом сеансе ложь). То есть замерший на паузе экран оставался бы без
+// объяснения ровно в том виде сеанса, где кроме кадров ничего и нет.
+//
+// Это ФАКТ О ВЫХОДЕ, а не заявление о возможности, и именно поэтому он честно снимается:
+// paused=true → paused=false выразимо в обоих видах сеанса. В сеансе с управлением едет
+// РЯДОМ с ControlState, а не вместо: «кадры приостановлены» и «ввод не доходит» — два
+// разных факта, которые на защищённом столе лишь совпали.
+//
+// Молчание здесь читается как «кадры идут», и это НЕ та же ошибка, что молчание
+// ControlState. Агент старше этого поля паузы не делает вовсе — он на защищённом столе
+// заканчивал сеанс, — и панель получит не тишину, а SessionEnd.
+message FrameFlow {
+  bool paused = 1;
+  // Почему приостановлены. Пусто при paused=false. Строкой по той же причине, что причины
+  // завершения. Сегодня единственное значение: "SECURE_DESKTOP".
+  string reason = 2;
+  // at_ms — часы АГЕНТА, только для упорядочивания на сервере (как в ControlState).
+  // Проставляется в момент САМОГО ФАКТА (наблюдателем за столом), а не в момент отправки:
+  // петля кадров может стоять в захвате, который начался до паузы, и время отправки
+  // поставило бы паузу позже кадра, снятого раньше неё.
+  int64 at_ms = 3;
+}
+
+// Агент → Сервер: применяется ли ввод ПРЯМО СЕЙЧАС (Ф3).
+//
+// Едет при СМЕНЕ состояния — не на каждый кадр и не на каждое событие: оператор должен
+// видеть честный признак «управление действует / не действует», а не мигание. effective=false
+// закрывает ровно тот провал, из-за которого SendInput отвечает успехом в пустоту (потеря
+// входного рабочего стола, UIPI): панель ГАСИТ признак control, а не показывает управление,
+// которого нет. Права оно не даёт и авторизацией не является — только сообщает, доходит ли ввод.
+//
+// Инвариант панели (её решение, зафиксировано контрактом): ОТСУТСТВИЕ ControlState — это НЕ
+// «управление работает», а «состояние неизвестно». Агент старше этого поля не пришлёт его
+// никогда, и молчание, прочитанное как успех, оставило бы ложный зелёный на всём парке до
+// обновления. Однократный effective=true при выдаче управления и есть признак «агент умеет».
+message ControlState {
+  bool effective = 1;
+  // Почему не действует. Пусто при effective=true. Строкой, не enum — по той же причине, что
+  // причины завершения: код, которого не знает вторая сторона, обязан доехать текстом, а не
+  // стать UNSPECIFIED. Значения: "DESKTOP_LOST" | "INPUT_REJECTED" | "SECURE_DESKTOP".
+  string reason = 2;
+  // at_ms — часы АГЕНТА, поэтому годятся ТОЛЬКО для упорядочивания на сервере. Оператору
+  // показывается время СЕРВЕРА: сбитые часы на машине сотрудника иначе выглядят как события
+  // из будущего. Долговременный след (журнал сеанса) тоже проставляет сервер своим временем.
+  int64 at_ms = 3;
+}
+
+// Первое сообщение стрима. Сервер до его прихода не знает, к какому сеансу привязать
+// стрим, и не принимает ни одного кадра.
+message SessionHello {
+  string session_id    = 1;
+  int32  width         = 2; // геометрия ПОСЛЕ даунскейла профиля
+  int32  height        = 3;
+  string profile       = 4; // фактически применённый профиль
+  int32  display_id    = 5;
+  string agent_version = 6;
+  // profile_fallback — запрошенный профиль не опознан, взят low.
+  bool   profile_fallback = 7;
+}
+
+// Кадр или его часть.
+//
+// Единица передачи — НЕ кадр: серверный MaxRecvMsgSize(4 MiB) общий на весь grpc.Server,
+// и трогать его нельзя (это анти-OOM защита всех мелких RPC). Поэтому кадр при
+// необходимости режется на части по 256 KiB, и склеивает их сервер по last_part.
+message SessionFrame {
+  uint32 seq            = 1; // номер КАДРА, строго возрастает; пропуски — норма
+  bool   keyframe       = 2; // полное обновление всех тайлов
+  bool   last_part      = 3; // последняя часть этого кадра
+  bytes  payload        = 4; // канонический бинарный кадр (screen.FramePayload)
+  int64  captured_at_ms = 5;
+}
+
+// Терминальное событие: агент закрывает сеанс сам.
+message SessionEnd {
+  string reason = 1; // EndReason агента
+  string detail = 2; // для разбора, не для авторизации решений
+}
+
+// Телеметрия сеанса. Отдельно от кадров, потому что классы вытеснения в outbox у них
+// разные: терминальные события protected, телеметрия evictable (§9.20).
+message SessionStats {
+  uint32 frames  = 1;
+  uint64 bytes   = 2;
+  uint32 stalls  = 3; // сколько раз бюджет полосы упёрся в потолок паузы
+  uint32 dropped = 4; // кадров выброшено по «latest frame wins»
+}
+
+// Сервер → Агент.
+message SessionDown {
+  oneof msg {
+    SessionAccepted accepted = 1;
+    SessionControl  control  = 2;
+    SessionInput    input    = 3;
+    SessionSignal   signal   = 4; // Этап B: WebRTC-сигнализация (transport="webrtc")
+  }
+}
+
+// Сеанс принят: строка сеанса и строка аудита закоммичены (§9.3). До этого сообщения
+// агент не имеет права отдать ни одного кадра.
+message SessionAccepted {
+  int64 server_time_ms = 1;
+}
+
+// Управляющее сообщение. НИКОГДА не расширяет права: narrow может только сузить
+// область, и агент сверяет это сам (§9.10).
+message SessionControl {
+  bool   request_keyframe = 1; // подключился новый зритель / зритель отстал
+  bool   stop             = 2;
+  string stop_reason      = 3; // VIEWER_GONE / OPERATOR_REVOKED / DEVICE_CUT_OFF / ...
+  ScreenScope narrow      = 4;
+}
+
+message ScreenScope {
+  repeated int32 displays    = 1;
+  bool           allow_input = 2;
+}
+
+// ====== Управление (Ф3) ======
+//
+// Ввод оператора едет ВНИЗ по тому же стриму сеанса, а не отдельным RPC: у ввода и кадров
+// обязан быть один порядок и один момент смерти. Отдельный канал давал бы клики, доехавшие
+// после конца сеанса, — то есть ввод в машину, которую оператору больше не показывают.
+//
+// Транспорт браузер → сервер — обычный POST батчами (§3.3, поправка Ф3): WebSocket нужен
+// был для потока ВНИЗ, а ввод идёт ВВЕРХ, и long-poll тут ни при чём. Цена — половина
+// интервала батча к задержке; выигрыш — ни новой зависимости, ни правки nginx и CSP.
+message SessionInput {
+  repeated InputEvent events = 1;
+
+  // Геометрия кадра, в котором оператор ЦЕЛИЛСЯ. Координаты событий — пиксели этого
+  // кадра, а не рабочего стола: агент знает и вырезку, и масштаб, а браузер — только
+  // то, что нарисовано на холсте. Пересчёт на стороне, у которой есть обе системы
+  // координат, — единственный способ не промахнуться мимо кнопки на даунскейле.
+  int32 frame_width  = 2;
+  int32 frame_height = 3;
+
+  // release_all — отпустить всё зажатое немедленно.
+  //
+  // Обязательная часть контракта, а не удобство: потерянное key_up оставляет сотруднику
+  // залипший Ctrl или зажатую кнопку мыши на его собственной машине. Шлётся при возврате
+  // управления, при паузе и при закрытии вкладки; агент делает то же самое сам при любом
+  // конце сеанса.
+  bool release_all = 4;
+
+  int64 sent_at_ms = 5;
+}
+
+// Одно событие ввода.
+//
+// kind — строка, а не enum, по той же причине, что и причины завершения: событие,
+// которого не знает эта версия агента, обязано быть ПРОПУЩЕНО с записью в журнал, а не
+// превратиться в UNSPECIFIED и быть исполненным как что-то другое.
+//
+// Значения: "mouse_move" | "mouse_down" | "mouse_up" | "wheel" | "key_down" | "key_up" |
+// "text".
+message InputEvent {
+  string kind = 1;
+
+  int32 x = 2; // пиксели кадра из frame_width/frame_height
+  int32 y = 3;
+
+  // button — 0 левая, 1 средняя, 2 правая. Нумерация browser'ная (MouseEvent.button):
+  // перекладывать её в свою на сервере значило бы завести третью систему нумерации
+  // между двумя существующими.
+  int32 button = 4;
+
+  int32 wheel_x = 5; // «клики» колеса, а не пиксели: пиксели у каждой ОС свои
+  int32 wheel_y = 6;
+
+  // code — ФИЗИЧЕСКАЯ клавиша в терминах W3C KeyboardEvent.code ("KeyA", "Enter",
+  // "ShiftLeft"). Именно физическая, а не символ: раскладка на машине сотрудника своя, и
+  // «нажать ту же кнопку» переносимо, а «нажать букву Ы» — нет.
+  string code = 7;
+
+  // text — печатный ввод как ТЕКСТ. Едет отдельно от клавиш, потому что символ,
+  // набранный через IME или мёртвую клавишу, физической клавише не соответствует вовсе.
+  // В журнал ввода печатные символы по умолчанию НЕ пишутся (§9.21 п.6) — только их
+  // количество.
+  string text = 8;
+}
+
+// Агент → Сервер: durable-событие сеанса.
+//
+// Зачем отдельный unary-RPC, когда есть SessionEnd в стриме: стрим и умирает первым.
+// Агент, у которого оборвалась сеть или который перезагрузился, обязан всё равно
+// доставить, ЧЕМ кончился сеанс, — иначе в журнале останется «AGENT_GONE» на каждом
+// сетевом моргании, и отличить обрыв от отказа сотрудника будет нечем. Поэтому
+// терминальные события едут через durable-очередь агента (outbox.KindScreenSession,
+// protected), а телеметрия — через ту же ручку, но вытесняемым видом
+// (KindScreenTelemetry): её потеря стоит дырки в графике, а не потери улики (§9.20).
+message ScreenEvent {
+  string session_id = 1;
+  string kind       = 2; // "end" | "consent" | "telemetry"
+  string reason     = 3; // EndReason для kind="end"
+  string detail     = 4;
+  int64  at_ms      = 5;
+  SessionStats stats = 6; // только для kind="telemetry"
+}
+
+message ScreenEventAck {
+  bool received = 1;
+}
+
+service AgentService {
+  // Постоянный стрим: heartbeat → сервер, задачи ← сервер. (ADR-5)
+  rpc Connect(stream HeartbeatRequest) returns (stream Task);
+
+  // Подтверждение доставки задачи агенту (до выполнения).
+  rpc AckTaskReceived(TaskReceivedAck) returns (TaskReceivedAckResponse);
+
+  rpc ReportInventory(InventoryReport) returns (InventoryAck);
+  rpc ReportTaskResult(TaskResult) returns (TaskResultAck);
+  rpc ReportSecurityEvent(SecurityEvent) returns (SecurityEventAck);
+
+  // Синхронизация политик ПО (запрещённое/разрешённое) для Security Monitor.
+  // Pull: агент тянет при старте; версия — unix max(updated_at) (см. FetchPolicyResponse).
+  rpc FetchPolicy(FetchPolicyRequest) returns (FetchPolicyResponse);
+
+  // Временные права администратора (Этап 4). Одобрение IT-админом — через REST.
+  rpc RequestAdminAccess(RequestAdminAccessRequest) returns (RequestAdminAccessResponse);
+  rpc FetchAdminStatus(FetchAdminStatusRequest) returns (FetchAdminStatusResponse);
+  rpc ReportAdminAccess(ReportAdminAccessRequest) returns (ReportAdminAccessResponse);
+
+  // Улики сессии админ-прав: окна дельты ПО и служб за время выданных прав.
+  // Приём append-only и скоупится по устройству из mTLS-серта (ADR-1): request_id из
+  // тела сверяется на принадлежность ЭТОМУ устройству, иначе, зная чужой id, любое
+  // устройство дописывало бы улики в чужую заявку.
+  rpc ReportAdminSessionChanges(ReportAdminSessionChangesRequest) returns (ReportAdminSessionChangesResponse);
+
+  // Скрипт-политики (Этап 5). Pull эффективного набора + отчёт о выполнении
+  // (как FetchPolicy + ReportTaskResult).
+  rpc FetchScriptPolicies(FetchScriptPoliciesRequest) returns (FetchScriptPoliciesResponse);
+  rpc ReportScriptResult(ScriptResult) returns (ScriptResultAck);
+
+  // Блокировка устройства: агент подтверждает применение/снятие (аудит + UI).
+  rpc ReportLockStatus(ReportLockStatusRequest) returns (ReportLockStatusResponse);
+
+  // Реконсиляция блокировки (pull): переживает потерю push-команды и ребут —
+  // Task.lock едет РАЗ по Connect-стриму, сверки нет, поэтому после рестарта
+  // агента desired-состояние сервера может разойтись с локальным lock.json.
+  // Агент периодически сверяет их (как FetchAdminStatus).
+  rpc FetchLockStatus(FetchLockStatusRequest) returns (FetchLockStatusResponse);
+
+  // Эскроу recovery-ключа FileVault (enterprise). СИНХРОННЫЙ: stored=true ТОЛЬКО
+  // после устойчивого сохранения. Реальная ошибка (Unavailable/FailedPrecondition) —
+  // агент ретраит и НЕ запускает деструктив, если escrow не подтверждён. НЕ через outbox.
+  rpc EscrowRecoveryKey(EscrowRecoveryKeyRequest) returns (EscrowRecoveryKeyResponse);
+
+  // Вооружение FileVault-лока (enterprise, PULL). Транзит секрета, который оператор
+  // расшифровал офлайн (cmd/mdm-unseal): сервер держит плейнтекст ТОЛЬКО в RAM с TTL,
+  // вооружает его ЧЕЛОВЕК (POST /devices/{id}/lock/arm, requireHuman + аудит ФАКТА
+  // вооружения, никогда — значения).
+  //
+  // Почему отдельный pull-RPC, а не поле в Task: (1) секрет в Task лёг бы at-rest в БД
+  // и в очередь; (2) FILEVAULT-команда самозаживает ТОЛЬКО реконсиляцией — reconcile
+  // зовёт RevokeAndShutdown на каждом тике, никакого Task там уже нет, поэтому push-only
+  // вооружение сломало бы ровно тот путь, ради которого реконсиляция и написана.
+  //
+  // Эскроу остаётся server-blind везде, КРОМЕ окна вооружения: на arm-time плейнтекст
+  // сознательно проходит через сервер и живёт у него в RAM. Границы дыры — только RAM,
+  // только TTL, только человеком.
+  rpc FetchLockSecrets(FetchLockSecretsRequest) returns (FetchLockSecretsResponse);
+
+  // Манифест обновления для КАНАЛА этого устройства (Q-52, миграция 065).
+  //
+  // Почему отдельный RPC, а не параметр к публичной REST-ручке /api/v1/agent/version.
+  // Ответ теперь зависит от того, КТО спрашивает: канал — свойство групп устройства.
+  // У REST-ручки аутентификации нет вовсе, то есть личность спрашивающего там взять
+  // неоткуда, а device_id из query-строки — ровно то, что запрещает ADR-1. Здесь
+  // устройство выводится из CN mTLS-серта, как во всех остальных pull-RPC.
+  //
+  // REST-ручка остаётся и отдаёт канал stable. Это и есть нужное поведение
+  // совместимости: агенты до этой версии умеют ходить только туда и потому не могут
+  // случайно попасть под канареечную выкатку.
+  rpc FetchUpdateManifest(FetchUpdateManifestRequest) returns (FetchUpdateManifestResponse);
+
+  // Интерактивный сеанс: кадры → сервер, управление ← сервер (ADR-8, enterprise).
+  //
+  // Почему отдельный стрим, а не поле в Connect: HTTP/2 мультиплексирует стримы одного
+  // соединения, и крупные DATA-фреймы кадров дают head-of-line blocking — heartbeat начал
+  // бы опаздывать ровно тогда, когда сеанс идёт. Поэтому агент открывает этот стрим на
+  // ОТДЕЛЬНОМ grpc.ClientConn (§3.2 контракта), а ADR-5 остаётся выполненным: кадры в
+  // HeartbeatRequest не кладутся.
+  //
+  // Инициатор — агент, потому что в gRPC стрим всегда открывает клиент. Приглашение едет
+  // навстречу, полем Task.screen_session.
+  rpc ScreenSession(stream SessionUp) returns (stream SessionDown);
+
+  // Durable-события сеанса: чем кончился, было ли согласие, телеметрия.
+  // Едет через outbox и переживает обрыв стрима и перезагрузку агента.
+  rpc ReportScreenEvent(ScreenEvent) returns (ScreenEventAck);
+}
+
+// Агент → Сервер: какой бинарь ставить этому устройству.
+//
+// os/arch приходят ОТ АГЕНТА и не выводятся из инвентаря сознательно: это GOOS/GOARCH
+// самого работающего бинаря, а он может не совпадать с железом (amd64-сборка под
+// Rosetta на arm64-маке). Привилегий эти поля не несут — сузить их подделкой нельзя,
+// канал берётся не отсюда.
+message FetchUpdateManifestRequest {
+  string os   = 1; // GOOS работающего бинаря
+  string arch = 2; // GOARCH работающего бинаря
+}
+message FetchUpdateManifestResponse {
+  string version            = 1;
+  string url                = 2; // откуда качать; тот же сервер, та же приватная CA
+  string sha256             = 3; // hex
+  string signature          = 4; // ed25519 над sha256(бинарь) — легаси, агент её не проверяет
+  string manifest_signature = 5; // ed25519 над каноном version\nos\narch\nsha256 (SEC-3)
+  // channel — из какого канала выдан манифест. Диагностика, а НЕ управление: агент
+  // не выбирает канал и не должен его помнить, иначе появился бы второй источник
+  // правды о том, где машина находится. Годен только для лога и разбора.
+  string channel = 6;
+}
+
+// Агент → Сервер: подтверждение применения/снятия блокировки (для аудита и UI).
+message ReportLockStatusRequest {
+  string    request_id  = 1;
+  LockState state       = 2;
+  int64     occurred_at = 3; // unix
+  string    details     = 4;
+}
+enum LockState {
+  LOCK_STATE_UNSPECIFIED       = 0;
+  LOCK_STATE_LOCKED            = 1; // overlay: окно; filevault: ПОДТВЕРЖДЁН после ребута
+  LOCK_STATE_UNLOCKED          = 2; // снят (сервером или верным паролем)
+  LOCK_STATE_FILEVAULT_REVOKED = 3; // filevault: токен снят + PRK заэскроен; РЕБУТ НУЖЕН; ещё НЕ эффективен
+  LOCK_STATE_FILEVAULT_REVOKE_FAILED = 4; // filevault: revoke НЕ завершён (partial/ABORT/misbuild) — деструктив мог частично примениться; требует ручного разбора IT; desired НЕ трогать
+  LOCK_STATE_LOCK_FAILED             = 5; // overlay: лок НЕ применился (оверлей не поднялся / состояние не записалось); агент откатился и ретраит, машина ОСТАЁТСЯ РАБОЧЕЙ; desired НЕ трогать
+  // 6 и 7 — PRE-MUTATION отказы FileVault-вооружения: НИЧЕГО не тронуто, машина
+  // рабочая, деструктив не начинался. Переиспользовать REVOKE_FAILED=4 нельзя — он
+  // значит «деструктив мог частично примениться» и поднимал бы IT по нетронутому
+  // устройству каждый тик реконсиляции (~30с).
+  LOCK_STATE_FILEVAULT_NOT_ARMED       = 6; // вооружения нет: не вооружали / TTL истёк / сервер рестартовал (vault в RAM) / инстанс не тот. Действие: вооружить заново. desired НЕ трогать
+  LOCK_STATE_FILEVAULT_SECRET_MISMATCH = 7; // секрет доставлен, но НЕ совпал с заэскроенным НА ЭТОМ устройстве (сверка по ЛОКАЛЬНОМУ дайджесту, ADR-F23). АЛЕРТ: вооружили не тем или эскроу разъехалось. Действие: reveal актуальной строки эскроу. desired НЕ трогать
+}
+
+// LockMode — режим блокировки. FAIL-SAFE: 0 НИКОГДА не FILEVAULT.
+// Агент трактует 0/unknown как OVERLAY; деструктив (revoke Secure Token) требует
+// ЯВНОГО значения 2. LockState (actual) не трогаем — это ОТДЕЛЬНАЯ ось (режим vs состояние).
+enum LockMode {
+  LOCK_MODE_UNSPECIFIED = 0; // == OVERLAY (легаси/безопасный дефолт)
+  LOCK_MODE_OVERLAY     = 1; // текущее полноэкранное окно
+  LOCK_MODE_FILEVAULT   = 2; // ДЕСТРУКТИВ: revoke Secure Token → после ребута том закрыт
+}
+message ReportLockStatusResponse {
+  bool received = 1;
+}
+
+// Агент → Сервер: узнать ЖЕЛАЕМОЕ состояние блокировки устройства (pull,
+// реконсиляция). password_hash — bcrypt-хеш пароля разблокировки; уникален на
+// каждую блокировку (сервер генерирует новый случайный пароль при каждом lock),
+// поэтому агент использует его и как идентичность конкретного лок-инстанса
+// (сверка "это тот же лок, что уже применён/только что снят локально"), и как
+// request_id для Manager.Lock — отдельного поля не заводим.
+message FetchLockStatusRequest {}
+message FetchLockStatusResponse {
+  bool   locked        = 1;
+  string password_hash = 2; // bcrypt; непусто только при locked=true
+  string reason        = 3; // текст для сотрудника на экране замка; только при locked=true
+  // reconcile-путь FileVault: без этих полей потерянный push тихо
+  // деградировал бы в оверлей. lock_mode=0 => OVERLAY (fail-safe).
+  LockMode        lock_mode              = 4;
+  // ADVISORY: серверного хранилища списка сейчас нет — сервер всегда шлёт ПУСТО.
+  // Пусто => целевых пользователей определяет агент (семантика = LockCommand).
+  // Непустой список — опциональный таргетинг будущего (потребует миграцию + wiring).
+  repeated string filevault_target_users = 5;
+}
+
+// Агент → Сервер: забрать секреты вооружения для КОНКРЕТНОГО лок-инстанса.
+// device_id в теле НЕТ — устройство авторизуется mTLS-сертом (CN, ADR-1).
+message FetchLockSecretsRequest {
+  // request_id ТОГО ЖЕ лок-инстанса, что агент уже держит (bcrypt-хеш пароля
+  // разблокировки — он же идентичность лока, см. FetchLockStatusResponse).
+  //
+  // Сервер обязан отдавать секрет ТОЛЬКО когда у ЭТОГО устройства есть АКТИВНЫЙ
+  // desired-лок с lock_mode=FILEVAULT И request_id совпадает. Одного mTLS мало:
+  // без сверки инстанса протухший повторный запрос слил бы СВЕЖЕЕ вооружение.
+  string request_id = 1;
+}
+
+// Сервер → Агент. Плейнтекст живёт ТОЛЬКО в памяти агента — на диск не пишется,
+// в argv не попадает (системные утилиты вызываются в prompt-режиме, секрет уходит
+// им через stdin), в лог не идёт.
+message FetchLockSecretsResponse {
+  // Единственный гейт «есть ли в ответе секреты». Отдельного bool armed НЕТ
+  // намеренно: два источника истины про одно и то же рано или поздно разъезжаются.
+  ArmStatus status = 1;
+
+  // Пусто => провайдер не устанавливается вовсе, и Revoke уходит в ABORT ДО
+  // мутации (существующие гарды RevokeConfig.MDMAdminPassword/PersonalRecoveryKey).
+  string mdmadmin_password     = 2;
+  string personal_recovery_key = 3;
+
+  // ДАЙДЖЕСТА ЗДЕСЬ НЕТ И НЕ ДОЛЖНО БЫТЬ. Сверка «тот ли это секрет» идёт по
+  // дайджесту, который агент записал САМ в момент эскроу (ADR-F23): проверять
+  // server-supplied секрет server-supplied дайджестом против недоверенного
+  // сервера — не доказательство. Не добавлять сюда поле «для удобства».
+}
+
+// Почему статус, а не голое «armed/не armed»: сервер РАЗЛИЧАЕТ две причины отказа
+// (escrow.ErrNotArmed / escrow.ErrRequestMismatch), и различие ценно для разбора.
+// Но в LockState они схлопываются ОБЕ в NOT_ARMED, и это не небрежность:
+//   • действие оператора одинаково — вооружить живой лок;
+//   • REQUEST_MISMATCH самозаживает за один тик. Reconciler.tick перечитывает
+//     FetchLockStatus КАЖДЫЙ раз и несёт в ревок свежий password_hash
+//     (reconcile.go), поэтому устаревший request_id не может залипнуть;
+//   • отдельное состояние в панели требовало бы от IT реакции на гонку, которая
+//     рассосётся сама, — ровно та ошибка, за которую забракован REVOKE_FAILED
+//     в роли «не вооружено».
+// Различие агент кладёт в details ReportLockStatus — для чтения человеком, не как
+// ось состояния.
+enum ArmStatus {
+  ARM_STATUS_UNSPECIFIED      = 0; // FAIL-CLOSED: старый/незнакомый сервер => трактовать как NOT_ARMED, НИЧЕГО не мутировать
+  ARM_STATUS_ARMED            = 1; // секреты в ответе
+  ARM_STATUS_NOT_ARMED        = 2; // вооружения нет: не вооружали / TTL истёк / рестарт сервера (vault в RAM)
+  ARM_STATUS_REQUEST_MISMATCH = 3; // вооружение есть, но под ДРУГОЙ lock-инстанс — гонка, проходит на следующем тике
+}

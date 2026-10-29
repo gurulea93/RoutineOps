@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MSI-инсталлятор MDM-агента для Windows (WiX v4).
+
+  Что делает:
+    1. Кладёт RoutineOps-agent.exe и ca.crt в "%ProgramFiles%\RoutineOps".
+    2. Если задан ENROLL_TOKEN — под LocalSystem (deferred CA) выполняет
+       `agent enroll ... -cert-source keystore -install-service`: получает
+       идентичность, кладёт её в Windows Cert Store, регистрирует службу в SCM
+       с автозапуском и recovery-перезапуском (нужным для self-update).
+    3. При удалении — снимает службу (`agent uninstall`).
+
+  Тихая установка (как в тест-плане):
+    msiexec /i agent.msi /quiet ENROLL_TOKEN=<uuid> ENROLL_URL=https://host:8081/api/v1/enroll
+
+  Сборка (см. README.md): wix build с -d Version/AgentExe/CaCert.
+
+  ⚠️ ЭТОТ ФАЙЛ НЕ ЕДЕТ В ПОЛЕ. Канонический источник боевого MSI —
+  build/msi/mdm-agent.wxs (собирается build/msi/build-msi.ps1); здесь другой
+  профиль установки (keystore-вариант, без SERVER_ADDR), он нужен как валидатор
+  авторинга в CI.
+
+  UpgradeCode ниже НАМЕРЕННО отличается от боевого, и менять это нельзя. Совпади
+  они — MSI, собранный в CI, стал бы для Windows апгрейдом боевой установки и,
+  случайно попав в releases, подменил бы рабочего агента на парке другим профилем.
+  Расхождение закреплено гейтом «гейт UpgradeCode» в .github/workflows/ci.yml:
+  он падает, если коды сравняли.
+
+  enroll-CA сделана через Directory+ExeCommand с маршалингом значения в deferred
+  через одноимённый SetProperty (стандартный приём WiX), без util-расширения.
+  Return="ignore": если сервер недоступен/токен не задан, раскладка файлов всё
+  равно завершается (службу можно до-зарегистрировать вручную `agent enroll`).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="RoutineOps Agent"
+           Manufacturer="RoutineOps"
+           Version="$(var.Version)"
+           UpgradeCode="7c2f6a4e-9b1d-4c33-8a52-3e9d1f0b6a71"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="Уже установлена более новая версия [ProductName]." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Адрес enroll-эндпоинта по умолчанию; перекрывается из командной строки msiexec. -->
+    <Property Id="ENROLL_URL" Value="https://localhost:8081/api/v1/enroll" />
+    <!-- Одноразовый токен энроллмента; Secure=yes => виден deferred-CA под LocalSystem. -->
+    <Property Id="ENROLL_TOKEN" Secure="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RoutineOps" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AgentFiles" Directory="INSTALLFOLDER">
+      <Component Id="AgentExe">
+        <File Id="agentExe" Source="$(var.AgentExe)" Name="RoutineOps-agent.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="CaCert">
+        <File Id="caCrt" Source="$(var.CaCert)" Name="ca.crt" KeyPath="yes" />
+      </Component>
+      <!-- Скрипт ручного снятия — на диск, а не «есть в репозитории». Нужен ровно там,
+           где штатное удаление недоступно (взведена tamper-protection, служба не
+           снимается, безопасный режим), то есть там, где искать его в браузере и
+           копировать текстом — худший из возможных вариантов: копипаст ломает переносы
+           строк, и cmd.exe разбирает файл со сдвигом. -->
+      <Component Id="UninstallScript">
+        <File Id="uninstallBat" Source="$(var.UninstallBat)" Name="uninstall.bat" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="RoutineOps Agent" Level="1">
+      <ComponentGroupRef Id="AgentFiles" />
+    </Feature>
+
+    <!-- enroll + регистрация службы (только при установке с токеном). -->
+    <SetProperty Id="DoEnroll"
+                 Sequence="execute"
+                 Before="DoEnroll"
+                 Condition="ENROLL_TOKEN AND NOT Installed"
+                 Value="&quot;[INSTALLFOLDER]RoutineOps-agent.exe&quot; enroll -enroll-url &quot;[ENROLL_URL]&quot; -token &quot;[ENROLL_TOKEN]&quot; -ca &quot;[INSTALLFOLDER]ca.crt&quot; -cert-source keystore -install-service" />
+    <CustomAction Id="DoEnroll"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="[DoEnroll]"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <!-- снятие службы при полном удалении. -->
+    <SetProperty Id="DoUninstall"
+                 Sequence="execute"
+                 Before="DoUninstall"
+                 Condition="REMOVE=&quot;ALL&quot;"
+                 Value="&quot;[INSTALLFOLDER]RoutineOps-agent.exe&quot; uninstall" />
+    <CustomAction Id="DoUninstall"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="[DoUninstall]"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="DoEnroll" After="InstallFiles" Condition="ENROLL_TOKEN AND NOT Installed" />
+      <Custom Action="DoUninstall" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

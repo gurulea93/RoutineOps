@@ -1,0 +1,16 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  // Сборки тут нет (files: []), но shadcn CLI читает paths из корневого
+  // tsconfig.json. Без этого дубля он не резолвит "@/..." и кладёт
+  // добавленные компоненты в каталог "./@/components".
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}

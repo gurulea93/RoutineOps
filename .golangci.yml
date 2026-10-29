@@ -1,0 +1,36 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+  exclusions:
+    paths:
+      - "web/node_modules"
+      - vendor
+    generated: lax
+    rules:
+      - path: ".*\\.pb\\.go$"
+        linters:
+          - govet
+          - staticcheck
+          - ineffassign
+          - unused
+      # lParam в WH_KEYBOARD_LL — указатель на KBDLLHOOKSTRUCT, переданный ОС;
+      # чтение через unsafe.Pointer(uintptr) — канонический и неизбежный идиом.
+      - path: "internal/agent/lockui/lockui_windows.go"
+        text: "unsafeptr"
+        linters:
+          - govet
+  settings:
+    staticcheck:
+      checks:
+        - "all"
+        - "-SA1019" # deprecated: proto-gen-go их много, шумят без пользы
+        - "-ST1000" # package-level doc comment: косметика, не проверяем
+
+issues:
+  max-same-issues: 0

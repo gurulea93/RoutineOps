@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX v4/v5 источник установщика MDM-агента.
+
+  Один универсальный MSI на все устройства; персональный enrollment-токен
+  передаётся при установке как property (см. build-msi.ps1 и docs):
+
+    msiexec /i RoutineOps-agent.msi /qn ^
+      ENROLL_URL="https://host/api/v1/enroll" ^
+      ENROLL_TOKEN="<одноразовый токен устройства>" ^
+      CA_URL="https://host/ca.crt" ^
+      SERVER_ADDR="host:50051"
+
+  MSI лишь раскладывает бинарь и прописывает автозапуск трея; службу ставит,
+  СТАРТУЕТ, хардерит и энроллит сам агент (переиспользуется код agent enroll
+  -install-service). Он же сразу поднимает трей в активной сессии и чистит легаси
+  (C:\mdm-extract) — после одного `msiexec /qn` поднимаются и служба, и трей, без
+  ребута/релогина (см. cmd/agent/main.go runEnroll).
+  Сборка: build-msi.ps1 (нужно расширение WixToolset.Util.wixext для WixQuietExec).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="RoutineOps Agent"
+           Manufacturer="RoutineOps"
+           Version="$(var.Version)"
+           UpgradeCode="42488912-25F8-4C42-AE88-DF4D50E17832"
+           Scope="perMachine"
+           Codepage="65001"
+           Compressed="yes">
+
+    <!-- Schedule пиним явно (=дефолт WiX): старый продукт удаляется СРАЗУ после
+         InstallValidate — раньше, чем новый EnrollExec (After=InstallFiles). Так при
+         апгрейде UnenrollExec старой версии (stop+delete службы) отрабатывает до того,
+         как новая версия создаст/стартует службу, и итог апгрейда — служба есть и
+         запущена. Не полагаемся на неявный дефолт в критичном для поля пути. -->
+    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия RoutineOps Agent."
+                  Schedule="afterInstallValidate" />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="MdmIcon" SourceFile="icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="MdmIcon" />
+
+    <!-- Параметры энроллмента (public). Без ENROLL_URL/TOKEN/SERVER_ADDR установка прервётся. -->
+    <Property Id="ENROLL_URL" Secure="yes" />
+    <Property Id="ENROLL_TOKEN" Secure="yes" />
+    <Property Id="CA_URL" Secure="yes" />
+    <!-- CA_SHA256 — hex sha256-пин CA-бандла. Универсальный MSI НЕ вшивает CA: агент
+         качает его по CA_URL и сверяет с этим пином (TOFU без пина отклоняется, SEC-1).
+         Пин отдаёт веб-UI в команде msiexec (device-create → ca_sha256). -->
+    <Property Id="CA_SHA256" Secure="yes" />
+    <!-- Адрес gRPC-сервера (host:port). Прокидывается в enroll как -server, иначе
+         служба ушла бы в дефолт localhost:55443 и устройство не подключилось бы. -->
+    <Property Id="SERVER_ADDR" Secure="yes" />
+
+    <Launch Condition="Installed OR (ENROLL_URL AND ENROLL_TOKEN AND CA_URL AND CA_SHA256 AND SERVER_ADDR)"
+            Message="Задайте ENROLL_URL, ENROLL_TOKEN, CA_URL, CA_SHA256 и SERVER_ADDR: msiexec /i RoutineOps-agent.msi ENROLL_URL=... ENROLL_TOKEN=... CA_URL=... CA_SHA256=... SERVER_ADDR=host:50051" />
+
+    <!-- Второй гейт: свойства энроллмента ПЕРЕДАНЫ, но enroll в этом прогоне не выполнится.
+         Условие выше при Installed=true проходит по ЛЕВОЙ части, то есть на уже
+         зарегистрированном продукте набор из пяти свойств не проверяется вовсе, а
+         EnrollExec (NOT Installed OR REINSTALL) пропускается: msiexec отдаёт 0 при нулевом
+         результате — ни установки, ни ошибки.
+
+         🔴 Поймано в поле. Ручное снятие (uninstall.bat) снимает службу, файлы и ключи, но
+         MSI-регистрацию не трогало — продукт оставался числиться установленным при пустом
+         диске. Повтор той же команды msiexec уходил в maintenance и молча ничего не делал.
+         Причину чинит батник (он теперь зовёт `RoutineOps-agent.exe msi-unregister`), а этот
+         гейт — сеть безопасности: он же ловит и повтор enroll на ЗДОРОВОЙ машине командой
+         из веб-UI, в которой REINSTALL нет.
+
+         Почему безопасно на удалении. LaunchConditions выполняется и при REMOVE=ALL — это
+         классические грабли, из-за них первое условие и начинается с `Installed OR`. Защит
+         здесь две, и они независимы: `NOT REMOVE` и — главное — пустая OR-группа, потому
+         что командная строка удаления enroll-свойств не несёт. Полагаться на один
+         `NOT REMOVE` нельзя: LaunchConditions идёт на seq 100, а REMOVE в UI-потоке
+         («Изменить/Удалить» в ARP) вычисляется только на InstallValidate (seq 1400). У пяти
+         свойств нет значений по умолчанию в таблице Property (они только в
+         SecureCustomProperties), поэтому на любом maintenance/repair-прогоне без командной
+         строки OR-группа пуста и гейт выстрелить не может.
+
+         Message — поле Formatted, поэтому [ProductCode] раскроется в реальный GUID. Длина
+         ограничена 255 символами (тип l255 в _Validation). Под /qn текст на экран не
+         попадает — он уходит в /l*v-лог и в журнал Windows «Приложение» (источник
+         MsiInstaller), см. docs/field-troubleshooting.md. -->
+    <Launch Condition="NOT (Installed AND NOT REINSTALL AND NOT REMOVE AND (ENROLL_URL OR ENROLL_TOKEN OR CA_URL OR CA_SHA256 OR SERVER_ADDR))"
+            Message="RoutineOps Agent уже зарегистрирован: этот запуск ничего не установит и enroll не выполнит. Повторите ту же команду с REINSTALL=ALL REINSTALLMODE=vomus. Если агента на диске нет, сначала снимите запись: msiexec /x [ProductCode] /qn" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RoutineOps">
+        <Component Id="AgentExe" Guid="1B812CD8-2957-464D-8B71-FE6363DBCE27">
+          <File Id="mdm_agent.exe" Name="RoutineOps-agent.exe" Source="mdm-agent.exe" KeyPath="yes" />
+        </Component>
+        <!-- CA НЕ вшит: MSI универсален (один на все деплои, лежит в репо). Агент качает
+             CA по CA_URL и пинит по CA_SHA256 (TOFU без пина отклоняется, SEC-1); пин
+             доставляется в команде msiexec из доверенного веб-UI. Deployment-специфики
+             в MSI больше нет — ключ self-update агент тоже берёт из enroll-ответа. -->
+        <!-- Скрипт ручного снятия агента.
+             🔴 Кладётся В КАТАЛОГ УСТАНОВКИ, а не «лежит в репозитории на всякий
+             случай». Штатный путь удаления — «Установка и удаление программ» либо
+             `RoutineOps-agent.exe uninstall`; батник нужен там, где штатный путь
+             недоступен: взведена tamper-protection, служба не снимается, машина в
+             безопасном режиме. Пока файла не было на диске, администратору приходилось
+             искать его в исходниках на GitHub и копировать из браузера — а копипаст
+             ломает переносы строк, и cmd.exe разбирает файл со сдвигом (поймано в поле).
+             Файл в каталоге установки этот этап убирает целиком. -->
+        <Component Id="UninstallScript" Guid="*">
+          <File Id="uninstall.bat" Name="uninstall.bat" Source="uninstall.bat" KeyPath="yes" />
+        </Component>
+        <!-- Автозапуск трея в сессии любого вошедшего пользователя (per-user UI). -->
+        <Component Id="TrayAutostart" Guid="*">
+          <RegistryValue Root="HKLM"
+                         Key="Software\Microsoft\Windows\CurrentVersion\Run"
+                         Name="RoutineOpsTray" Type="string"
+                         Value="&quot;[INSTALLFOLDER]RoutineOps-agent.exe&quot; tray"
+                         KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="RoutineOps Agent" Level="1">
+      <ComponentRef Id="AgentExe" />
+      <ComponentRef Id="UninstallScript" />
+      <ComponentRef Id="TrayAutostart" />
+    </Feature>
+
+    <!-- == Энроллмент при установке (deferred, в контексте SYSTEM) ==
+         Агент сам качает CA по CA_URL, получает серт по токену, ставит/стартует и
+         хардерит службу, поднимает трей и чистит легаси. CustomActionData задаётся
+         type-51 SetProperty c Id == Id экшена.
+
+         Return="ignore" (НЕ "check"): сбой энроллмента (битый токен, сервер
+         недоступен, token already used) НЕ откатывает уже разложенные файлы —
+         иначе Program Files оставался пустым (полевой баг v22). enroll
+         идемпотентен: при валидном серте повторный запуск не дёргает токен, при
+         существующей службе — переставляет её. Итог enroll смотреть в логе службы /
+         по онлайн-статусу устройства (код возврата msiexec его не отражает).
+
+         Повторная попытка enroll после сбоя: на ТОЙ ЖЕ версии MSI обычный
+         `msiexec /i` уходит в maintenance (Installed=true) и экшен с одним только
+         `NOT Installed` НЕ сработал бы — поэтому условие включает REINSTALL:
+         `msiexec /i RoutineOps-agent.msi REINSTALL=ALL REINSTALLMODE=vomus ENROLL_TOKEN=…`.
+         (Апгрейд на новую версию тоже доводит установку: новый ProductCode →
+         Installed=false.) -->
+    <SetProperty Id="EnrollExec" Sequence="execute" Before="EnrollExec"
+                 Value="&quot;[INSTALLFOLDER]RoutineOps-agent.exe&quot; enroll -enroll-url &quot;[ENROLL_URL]&quot; -token &quot;[ENROLL_TOKEN]&quot; -ca-url &quot;[CA_URL]&quot; -ca-sha256 &quot;[CA_SHA256]&quot; -server &quot;[SERVER_ADDR]&quot; -install-service" />
+    <CustomAction Id="EnrollExec" DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- == Снятие службы при удалении (deferred, до удаления файлов) == -->
+    <SetProperty Id="UnenrollExec" Sequence="execute" Before="UnenrollExec"
+                 Value="&quot;[INSTALLFOLDER]RoutineOps-agent.exe&quot; uninstall" />
+    <CustomAction Id="UnenrollExec" DllEntry="WixQuietExec64"
+                  BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- После копирования файлов на свежей установке/обновлении ИЛИ при ремонте
+           (REINSTALL), чтобы повторный enroll с новым токеном доводил установку,
+           не уходя в no-op в maintenance-режиме. На удалении (REMOVE=ALL) — нет. -->
+      <Custom Action="EnrollExec" After="InstallFiles"
+              Condition="NOT Installed OR (REINSTALL AND NOT REMOVE)" />
+      <!-- При полном удалении — до удаления файлов (бинарь ещё на месте). -->
+      <Custom Action="UnenrollExec" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

@@ -1,0 +1,182 @@
+//go:build screen
+
+package screen
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"time"
+
+	"github.com/Floodww/RoutineOps/internal/screenframe"
+)
+
+// Процесс захвата (agent screen-worker). Живёт в графической сессии сотрудника, от его
+// имени; со службой говорит только через stdin/stdout (wire.go).
+//
+// Порядок старта неизменен: захватчик открыт → плашка «экран просматривается» поднята →
+// hello. Кадр без плашки невозможен по построению: до hello служба не открывает стрим к
+// серверу, а плашка, которую не удалось показать, — это отказ NOTICE_UNAVAILABLE.
+
+// Notice — плашка наблюдения. Close снимает её; до Close она обязана держаться поверх окон.
+type Notice interface{ Close() }
+
+// WorkerConfig — параметры процесса захвата.
+type WorkerConfig struct {
+	Profile     string
+	Operator    string
+	Reason      string
+	MaxDuration time.Duration // 0 → час
+
+	// KeyframeEvery — периодический ключевой кадр: страхует зрителя от накопленной
+	// ошибки, даже если запрос ключевого кадра потерялся. 0 → 30 с.
+	KeyframeEvery time.Duration
+
+	NewCapturer func() (Capturer, error)
+	ShowNotice  func(operator, reason string) (Notice, error)
+}
+
+// RunWorker ведёт сеанс до конца и возвращает его причину. Последнее сообщение в out —
+// всегда msgEnd (если out ещё пишется).
+func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Writer) EndReason {
+	if cfg.MaxDuration <= 0 {
+		cfg.MaxDuration = time.Hour
+	}
+	if cfg.KeyframeEvery <= 0 {
+		cfg.KeyframeEvery = 30 * time.Second
+	}
+	end := func(r EndReason, detail string) EndReason {
+		_ = writeJSONMsg(out, msgEnd, wireEnd{Reason: string(r), Detail: detail})
+		return r
+	}
+
+	if cfg.NewCapturer == nil || cfg.ShowNotice == nil {
+		return end(ReasonCaptureUnsupported, "worker built without capture/notice")
+	}
+	capt, err := cfg.NewCapturer()
+	if err != nil {
+		return end(reasonOf(err, ReasonCaptureFailed), err.Error())
+	}
+	defer capt.Close()
+
+	notice, err := cfg.ShowNotice(cfg.Operator, cfg.Reason)
+	if err != nil {
+		return end(ReasonNoticeUnavailable, err.Error())
+	}
+	defer notice.Close()
+
+	prof, fallback := ProfileByName(cfg.Profile)
+	srcW, srcH := capt.Size()
+	enc := NewTileEncoder(srcW, srcH, prof)
+	if err := writeJSONMsg(out, msgHello, wireHello{
+		Width: enc.W, Height: enc.H, Profile: prof.Name, ProfileFallback: fallback,
+	}); err != nil {
+		return ReasonWorkerLost
+	}
+
+	ctl := readControl(in)
+	tick := time.NewTicker(time.Second / time.Duration(prof.FPS))
+	defer tick.Stop()
+	deadline := time.NewTimer(cfg.MaxDuration)
+	defer deadline.Stop()
+	statsTick := time.NewTicker(10 * time.Second)
+	defer statsTick.Stop()
+
+	var (
+		seq     uint32
+		lastKey time.Time
+		wantKey = true
+		stats   wireStats
+	)
+	for {
+		select {
+		case <-ctx.Done():
+			return end(ReasonWorkerLost, "worker context done")
+		case <-deadline.C:
+			return end(ReasonMaxDuration, "")
+		case c, ok := <-ctl.ch:
+			if !ok {
+				// Служба закрыла канал (умерла или закрыла нас). Писать некому.
+				return ReasonWorkerLost
+			}
+			if c.stop != "" {
+				return end(EndReason(c.stop), "")
+			}
+			wantKey = true
+		case <-statsTick.C:
+			if err := writeJSONMsg(out, msgStats, stats); err != nil {
+				return ReasonWorkerLost
+			}
+		case <-tick.C:
+			pix, stride, err := capt.Capture()
+			if err != nil {
+				return end(reasonOf(err, ReasonCaptureFailed), err.Error())
+			}
+			key := wantKey || time.Since(lastKey) >= cfg.KeyframeEvery
+			tiles, err := enc.Encode(pix, stride, key)
+			if err != nil {
+				return end(ReasonCaptureFailed, "jpeg: "+err.Error())
+			}
+			seq++
+			parts, err := screenframe.Split(seq, key, uint16(enc.W), uint16(enc.H), tiles, screenframe.MaxPartBytes)
+			if err != nil {
+				return end(ReasonProtocolError, err.Error())
+			}
+			now := time.Now().UnixMilli()
+			for i, p := range parts {
+				if err := writeFrameMsg(out, wireFrame{Seq: seq, Keyframe: key, Last: i == len(parts)-1,
+					CapturedMs: now, Payload: p}); err != nil {
+					return ReasonWorkerLost
+				}
+				stats.Bytes += uint64(len(p))
+			}
+			stats.Frames++
+			if key {
+				wantKey, lastKey = false, time.Now()
+			}
+		}
+	}
+}
+
+func reasonOf(err error, def EndReason) EndReason {
+	var re *ReasonError
+	if errors.As(err, &re) {
+		return re.Reason
+	}
+	return def
+}
+
+type control struct{ stop string }
+
+type controlReader struct{ ch chan control }
+
+// readControl читает команды службы. Канал закрывается на EOF/ошибке.
+func readControl(in io.Reader) *controlReader {
+	cr := &controlReader{ch: make(chan control, 4)}
+	go func() {
+		defer close(cr.ch)
+		for {
+			typ, body, err := readMsg(in)
+			if err != nil {
+				return
+			}
+			switch typ {
+			case msgKeyframe:
+				select {
+				case cr.ch <- control{}:
+				default: // запрос уже в очереди
+				}
+			case msgStop:
+				var s wireStop
+				_ = json.Unmarshal(body, &s)
+				if s.Reason == "" {
+					s.Reason = string(ReasonStopped)
+				}
+				cr.ch <- control{stop: s.Reason}
+				return
+			}
+		}
+	}()
+	return cr
+}
