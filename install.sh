@@ -298,7 +298,7 @@ else
 echo "Сборка + публикация агентов v$(cat AGENT_VERSION) (подпись per-deployer ключом)..."
 docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
   -e DATABASE_DSN="$DATABASE_DSN" -e RELEASE_PUBKEY="$RELEASE_PUBKEY" \
-  -e BUILD_TAGS="${BUILD_TAGS:-}" -e DARWIN_AGENT="${DARWIN_AGENT:-}" \
+  -e BUILD_TAGS="${BUILD_TAGS:-}" -e DARWIN_AGENT="${DARWIN_AGENT:-}" -e SKIP_DARWIN="${SKIP_DARWIN:-}" \
   -e ENTERPRISE_MSI="${ENTERPRISE_MSI:-}" -e ENTERPRISE_PKG="${ENTERPRISE_PKG:-}" \
   golang:1.26-alpine sh -c '
     set -e
@@ -401,13 +401,18 @@ docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
       # Вшитая версия обязана совпасть с VERSION: иначе агент качает "v${V}",
       # а после рестарта рапортует старую → петля обновления каждые 6ч.
       BAKED=$(cat "$PREBUILT.version" 2>/dev/null || echo "")
-      if [ "$BAKED" != "v${V}" ]; then
-        echo "ОШИБКА: prebuilt собран как '${BAKED:-неизвестно}', а VERSION=v${V}." >&2
-        echo "Мейнтейнеру: пересобрать на маке (make release-darwin) и закоммитить." >&2
-        exit 1
-      fi
-      go run ./cmd/publish-release -binary "$PREBUILT" \
+      if [ "$BAKED" != "v${V}" ] && [ "${SKIP_DARWIN:-}" = "1" ]; then
+        # Мак в парке нет (или обновляется отдельно): версию prebuilt не подгоняем, macOS не публикуем.
+        echo "  ⚠ darwin/arm64: prebuilt собран как ${BAKED:-неизвестно}, а VERSION=v${V} — macOS не публикуется (SKIP_DARWIN=1)."
+      else
+        if [ "$BAKED" != "v${V}" ]; then
+          echo "ОШИБКА: prebuilt собран как '${BAKED:-неизвестно}', а VERSION=v${V}." >&2
+          echo "Мейнтейнеру: пересобрать на маке (make release-darwin) и закоммитить." >&2
+          exit 1
+        fi
+        go run ./cmd/publish-release -binary "$PREBUILT" \
         -version "v${V}" -os darwin -arch arm64 -key release_ed25519.pem
+      fi
     else
       echo "  ⚠ darwin/arm64: $PREBUILT отсутствует — macOS self-update недоступен."
     fi
