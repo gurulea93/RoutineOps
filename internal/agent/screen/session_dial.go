@@ -3,6 +3,7 @@
 package screen
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -39,12 +40,18 @@ func dialSession(d *transport.Dialer, s *session, h wireHello, agentVersion stri
 	if err != nil {
 		return fail(ReasonTransportLost, fmt.Errorf("dial: %w", err))
 	}
-	stream, err := pb.NewAgentServiceClient(conn).ScreenSession(s.ctx)
+	// У стрима СВОЙ контекст, не s.ctx. s.end отменяет s.ctx на любом исходе, а SessionEnd и
+	// последние SessionStats уходят уже ПОСЛЕ s.end (finishSession): со стримом на s.ctx они
+	// всегда падали бы с Canceled. Стрим отменяет только close(), и finishSession зовёт его
+	// всегда — поэтому каждый путь выхода из сеанса обязан дойти до finishSession.
+	sctx, scancel := context.WithCancel(context.Background())
+	stream, err := pb.NewAgentServiceClient(conn).ScreenSession(sctx)
 	if err != nil {
+		scancel()
 		_ = conn.Close()
 		return fail(ReasonTransportLost, fmt.Errorf("open stream: %w", err))
 	}
-	ss := &sessionStream{AgentService_ScreenSessionClient: stream, close: func() { s.cancel(); _ = conn.Close() }}
+	ss := &sessionStream{AgentService_ScreenSessionClient: stream, close: func() { scancel(); s.cancel(); _ = conn.Close() }}
 
 	err = stream.Send(&pb.SessionUp{Msg: &pb.SessionUp_Hello{Hello: &pb.SessionHello{
 		SessionId: s.id, Width: int32(h.Width), Height: int32(h.Height),
@@ -65,6 +72,8 @@ func dialSession(d *transport.Dialer, s *session, h wireHello, agentVersion stri
 	}()
 	select {
 	case err = <-got:
+	case <-s.ctx.Done(): // сеанс закрыли, пока ждали ответ (остановка службы)
+		err = s.ctx.Err()
 	case <-time.After(acceptTimeout):
 		err = fmt.Errorf("no SessionAccepted within %s", acceptTimeout)
 	}
