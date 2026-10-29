@@ -403,3 +403,10 @@ func (st store) inputEvent(ctx context.Context, q storage.TenantScope, sessionID
 		FROM screen_sessions WHERE id = $1::uuid`, sessionID, kind, detail, events, offsetMs)
 	return err
 }
+
+// adminCount — сколько it_admin в тенанте (RLS ограничивает выборку текущим).
+func (st store) adminCount(ctx context.Context, q storage.TenantScope) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, `SELECT count(*) FROM users WHERE role = 'it_admin'`).Scan(&n)
+	return n, err
+}

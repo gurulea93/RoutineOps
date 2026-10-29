@@ -529,14 +529,22 @@ func (s *Service) httpSetGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	// Выдать право смотреть записи самому себе нельзя: разделение обязанностей. Отозвать
-	// у себя — можно, это сужение.
-	if req.CanView && target == userID {
-		writeErr(w, http.StatusForbidden, "self_grant")
-		return
-	}
+	// Выдать право смотреть записи самому себе нельзя, пока в тенанте есть другой
+	// it_admin: разделение обязанностей. Единственному администратору (домашняя лаборатория,
+	// малый офис) выдать больше некому, и без исключения записи были бы недоступны вовсе;
+	// такая выдача пишется в аудит с пометкой self_grant. Отозвать у себя — можно всегда.
+	selfGrant := req.CanView && target == userID
 	var g *grant
 	err := s.st.scoped(r.Context(), tenantID, func(ctx context.Context, q storage.TenantScope) error {
+		if selfGrant {
+			n, err := s.st.adminCount(ctx, q)
+			if err != nil {
+				return err
+			}
+			if n > 1 {
+				return errSelfGrant
+			}
+		}
 		var err error
 		if g, err = s.st.setGrant(ctx, q, target, req.CanView); err != nil {
 			return err
@@ -545,9 +553,11 @@ func (s *Service) httpSetGrant(w http.ResponseWriter, r *http.Request) {
 			return errViewerRole
 		}
 		return s.cfg.DB.WriteAuditLog(ctx, userID, email, "screen_recording_grant", "user", target,
-			map[string]any{"can_view_session_recording": g.CanView})
+			map[string]any{"can_view_session_recording": g.CanView, "self_grant": selfGrant})
 	})
 	switch {
+	case errors.Is(err, errSelfGrant):
+		writeErr(w, http.StatusForbidden, "self_grant")
 	case errors.Is(err, ErrNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
 	case errors.Is(err, errViewerRole):
@@ -558,6 +568,8 @@ func (s *Service) httpSetGrant(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, g)
 	}
 }
+
+var errSelfGrant = errors.New("screen: self grant while another it_admin exists")
 
 var errViewerRole = errors.New("screen: grant requires it_admin")
 
