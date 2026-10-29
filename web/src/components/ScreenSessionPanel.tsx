@@ -173,6 +173,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // без предупреждения. Свой сеанс оператор обрывает себе же и тут же начинает заново.
   const [confirmStop, setConfirmStop] = useState<ScreenSession | null>(null)
   const [watchRec, setWatchRec] = useState<string | null>(null)
+  const [confirmDelSession, setConfirmDelSession] = useState<ScreenSession | null>(null)
   const [confirmDelRec, setConfirmDelRec] = useState<ScreenSession | null>(null)
 
   // Запрошено ли управление ДО начала сеанса. Отдельный флаг от `live.control`: первый —
@@ -604,6 +605,16 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // закрывший вкладку, терял единственный способ его остановить, а второй администратор
   // видел идущее наблюдение и ничего не мог с ним сделать. Сторож закрыл бы сеанс сам,
   // но через минуту без зрителя (§9.9) — целая минута чужого экрана.
+  const deleteSession = async (id: string) => {
+    setError("")
+    try {
+      await api.delete(`/screen-sessions/${id}`)
+    } catch (e) {
+      setError(errMessage(e))
+    }
+    void loadJournal()
+  }
+
   const deleteRecording = async (id: string) => {
     setError("")
     try {
@@ -1024,6 +1035,11 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                     )}
                   </>
                 )}
+                {s.status === "ended" && (
+                  <Button size="sm" variant="outline" onClick={() => setConfirmDelSession(s)}>
+                    {t("screenSession.deleteSession")}
+                  </Button>
+                )}
               </div>
             </div>
             )
@@ -1067,6 +1083,18 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         }}
       />
       {watchRec && <RecordingPlayer sessionId={watchRec} onClose={() => setWatchRec(null)} />}
+      <ConfirmDialog
+        open={confirmDelSession !== null}
+        onOpenChange={(open) => !open && setConfirmDelSession(null)}
+        title={t("screenSession.deleteSessionTitle")}
+        description={t("screenSession.deleteSessionBody")}
+        confirmLabel={t("screenSession.deleteSession")}
+        destructive
+        onConfirm={() => {
+          if (confirmDelSession) void deleteSession(confirmDelSession.id)
+          setConfirmDelSession(null)
+        }}
+      />
       <ConfirmDialog
         open={confirmDelRec !== null}
         onOpenChange={(open) => !open && setConfirmDelRec(null)}

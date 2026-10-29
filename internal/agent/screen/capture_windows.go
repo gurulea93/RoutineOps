@@ -28,6 +28,9 @@ var (
 	pCreateDIBSection   = gdi32.NewProc("CreateDIBSection")
 	pSelectObject       = gdi32.NewProc("SelectObject")
 	pBitBlt             = gdi32.NewProc("BitBlt")
+	pGetCursorInfo      = user32.NewProc("GetCursorInfo")
+	pGetIconInfo        = user32.NewProc("GetIconInfo")
+	pDrawIconEx         = user32.NewProc("DrawIconEx")
 	pDeleteObject       = gdi32.NewProc("DeleteObject")
 	pDeleteDC           = gdi32.NewProc("DeleteDC")
 )
@@ -38,6 +41,28 @@ const (
 	srcCopy    = 0x00CC0020
 	captureBlt = 0x40000000 // видеть и слоистые окна
 )
+
+const (
+	cursorShowing = 0x1
+	diNormal      = 0x3
+)
+
+// cursorInfo — CURSORINFO. Выравнивание hCursor до 8 байт Go делает сам, как и Windows.
+type cursorInfo struct {
+	Size   uint32
+	Flags  uint32
+	Cursor uintptr
+	X, Y   int32
+}
+
+// iconInfo — ICONINFO; точка «горячего пятна» нужна, чтобы стрелка встала в место клика.
+type iconInfo struct {
+	Icon     int32
+	XHotspot uint32
+	YHotspot uint32
+	Mask     uintptr
+	Color    uintptr
+}
 
 type bitmapInfoHeader struct {
 	Size          uint32
@@ -98,7 +123,35 @@ func (c *gdiCapturer) Capture() ([]byte, int, error) {
 	if ok == 0 {
 		return nil, 0, reasonErr(ReasonCaptureFailed, fmt.Errorf("BitBlt failed (secure desktop?)"))
 	}
+	c.drawCursor()
 	return c.pix, 4 * c.w, nil
+}
+
+// drawCursor дорисовывает курсор в кадр: BitBlt его не захватывает, и в записи и у
+// оператора мышь была бы невидима. Любая неудача молча пропускает курсор — кадр без него
+// лучше, чем сорванный сеанс.
+func (c *gdiCapturer) drawCursor() {
+	ci := cursorInfo{}
+	ci.Size = uint32(unsafe.Sizeof(ci))
+	if ok, _, _ := pGetCursorInfo.Call(uintptr(unsafe.Pointer(&ci))); ok == 0 || ci.Flags&cursorShowing == 0 || ci.Cursor == 0 {
+		return
+	}
+	var ii iconInfo
+	if ok, _, _ := pGetIconInfo.Call(ci.Cursor, uintptr(unsafe.Pointer(&ii))); ok == 0 {
+		return
+	}
+	// GetIconInfo создаёт копии битмапов: их обязаны освободить, иначе утечка на каждый кадр.
+	defer func() {
+		if ii.Mask != 0 {
+			_, _, _ = pDeleteObject.Call(ii.Mask)
+		}
+		if ii.Color != 0 {
+			_, _, _ = pDeleteObject.Call(ii.Color)
+		}
+	}()
+	x := int(ci.X) - int(ii.XHotspot)
+	y := int(ci.Y) - int(ii.YHotspot)
+	_, _, _ = pDrawIconEx.Call(c.memDC, uintptr(x), uintptr(y), ci.Cursor, 0, 0, 0, 0, diNormal)
 }
 
 func (c *gdiCapturer) Close() error {

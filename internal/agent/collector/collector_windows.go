@@ -3,6 +3,7 @@
 package collector
 
 import (
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows/registry"
+
+	"github.com/Floodww/RoutineOps/internal/agent/silentuninstall"
 )
 
 // psOut запускает PowerShell-команду и возвращает её stdout (или "" при ошибке).
@@ -406,6 +409,14 @@ func uninstallMethodFor(e uninstallEntry) UninstallMethod {
 	if e.quietUninstallString != "" {
 		return UninstallWindowsQuiet
 	}
+	// Inno Setup и NSIS QuietUninstallString обычно не пишут, но однозначно узнаются по
+	// самому деинсталлятору и снимаются известными тихими ключами. Агент выводит ту же
+	// команду заново при запуске (uninstall.execute), поэтому метод тот же — windows_quiet.
+	if e.uninstallString != "" {
+		if _, ok := silentuninstall.Derive(e.uninstallString, readFileHead); ok {
+			return UninstallWindowsQuiet
+		}
+	}
 	// Остался только интерактивный UninstallString (или вообще ничего):
 	// снимать нечем.
 	return UninstallNone
@@ -415,6 +426,18 @@ func uninstallMethodFor(e uninstallEntry) UninstallMethod {
 // {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}, то есть пригодно как ProductCode для
 // msiexec. Проверка ручная (без внешних зависимостей и без regexp на горячем
 // пути перечисления сотен ключей).
+// readFileHead читает начало деинсталлятора для поиска подписи установщика. Недоступный
+// файл — просто «подписи нет»: решение остаётся консервативным (снять нечем).
+func readFileHead(path string, max int) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	b, _ := io.ReadAll(io.LimitReader(f, int64(max)))
+	return b
+}
+
 func isProductCode(s string) bool {
 	const productCodeLen = 38 // 36 символов GUID + две фигурные скобки
 	if len(s) != productCodeLen || s[0] != '{' || s[productCodeLen-1] != '}' {

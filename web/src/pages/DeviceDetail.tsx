@@ -1,7 +1,7 @@
 import i18n from "@/i18n/config"
 import { useEffect, useState } from "react"
 import { useTranslation, Trans } from "react-i18next"
-import { useParams, useNavigate } from "react-router-dom"
+import { useParams, useNavigate, useSearchParams } from "react-router-dom"
 import { ChevronLeft, Copy, Check, Terminal, ShieldCheck, Cpu, HardDrive, MemoryStick, ChevronDown, Trash2 } from "lucide-react"
 import api, { errMessage, Device, Software, Task, Script, DeviceDetailResponse, ReenrollResponse, deviceRunsScript, agentPlatform, DEVICE_STATUS, REBOOT_DELAYS, EscrowRecord, EscrowReveal, ESCROW_SECRET_TYPE, UNINSTALL_OUTCOME, Vulnerability } from "@/lib/api"
 import { GroupBadge } from "@/components/GroupBadge"
@@ -89,9 +89,17 @@ const PRIORITY_OPTIONS = [
   { value: "high",   label: "deviceDetail.high"   },
 ]
 
+// Вкладки страницы устройства. Вкладка живёт в ?tab=, чтобы ссылку и «назад» не сбивало.
+const DEVICE_TABS = ["overview", "tasks", "screen", "software", "security"] as const
+type DeviceTab = (typeof DEVICE_TABS)[number]
+
 export default function DeviceDetail() {
   const { t } = useTranslation()
   const { id } = useParams<{ id: string }>()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const rawTab = searchParams.get("tab")
+  const tab: DeviceTab = (DEVICE_TABS as readonly string[]).includes(rawTab ?? "") ? (rawTab as DeviceTab) : "overview"
+  const setTab = (next: DeviceTab) => setSearchParams(next === "overview" ? {} : { tab: next }, { replace: true })
   const navigate = useNavigate()
   const { isAdmin, isProvider } = useMe()
   const { tenants: allTenants } = useTenants()
@@ -727,6 +735,35 @@ export default function DeviceDetail() {
         ))}
       </div>
 
+      <div role="tablist" className="flex flex-wrap gap-1 border-b border-border">
+        {([
+          ["overview", t("deviceDetail.tabOverview"), null],
+          ["tasks", t("deviceDetail.tabTasks"), null],
+          ["screen", t("deviceDetail.tabScreen"), null],
+          ["software", t("deviceDetail.tabSoftware"), software.length],
+          ["security", t("deviceDetail.tabSecurity"), vulns.length + escrow.length],
+        ] as [DeviceTab, string, number | null][]).map(([key, label, count]) => (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={tab === key}
+            onClick={() => setTab(key)}
+            className={
+              "-mb-px border-b-2 px-4 py-2 text-sm font-medium transition-colors " +
+              (tab === key
+                ? "border-[hsl(var(--brand))] text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground")
+            }
+          >
+            {label}
+            {count ? <span className="ml-1.5 text-xs text-muted-foreground">{count}</span> : null}
+          </button>
+        ))}
+      </div>
+
+      {tab === "overview" && (
+        <>
       <OwnerCard
         device={device}
         isAdmin={isAdmin}
@@ -808,6 +845,10 @@ export default function DeviceDetail() {
         </div>
       </div>
 
+        </>
+      )}
+
+      {tab === "tasks" && (
       <div className="glass">
         <div className="px-5 pt-4 pb-3">
           <h2 className="text-[15px] font-semibold text-foreground flex items-center gap-2">
@@ -872,8 +913,9 @@ export default function DeviceDetail() {
           })}
         </div>
       </div>
+      )}
 
-      {escrow.length > 0 && (
+      {tab === "security" && escrow.length > 0 && (
         <div className="glass">
           <div className="px-5 pt-4 pb-3">
             <h2 className="text-[15px] font-semibold text-foreground">{t("deviceDetail.recoveryKeysEscrow")}</h2>
@@ -913,9 +955,13 @@ export default function DeviceDetail() {
 
       {/* Экран устройства (ADR-8, только Enterprise). Секция сама прячется, если
           ручек нет: в open-core их не существует вовсе. */}
-      <ScreenSessionPanel deviceId={id!} />
+      {/* Панель не размонтируется при смене вкладки: в ней идёт живой сеанс, и размонтирование
+          оборвало бы просмотр и ввод. Прячем стилем. */}
+      <div className={tab === "screen" ? "" : "hidden"}>
+        <ScreenSessionPanel deviceId={id!} />
+      </div>
 
-      {vulns.length > 0 && (
+      {tab === "security" && vulns.length > 0 && (
         <div className="glass">
           <div className="px-5 pt-4 pb-3">
             <h2 className="text-[15px] font-semibold text-foreground">{t("deviceDetail.vulnerabilitiesCve")}</h2>
@@ -946,7 +992,7 @@ export default function DeviceDetail() {
         </div>
       )}
 
-      {software.length > 0 && (
+      {tab === "software" && software.length > 0 && (
         <div className="glass">
           <div className="px-5 pt-4 pb-3">
             <h2 className="text-[15px] font-semibold text-foreground">{t("deviceDetail.software")}</h2>
@@ -994,6 +1040,11 @@ export default function DeviceDetail() {
                     >
                       <Trash2 className="h-4 w-4" strokeWidth={2} />
                     </Button>
+                  )}
+                  {isAdmin && !s.uninstall_method && (
+                    <span className="text-xs text-muted-foreground/60" title={t("deviceDetail.noUninstall")}>
+                      —
+                    </span>
                   )}
                 </div>
               </div>

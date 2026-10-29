@@ -54,6 +54,7 @@ func (s *Service) Routes() []api.RouterOption {
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
 			r.Delete("/screen-sessions/{id}/recording", s.httpDeleteRecording)
+			r.Delete("/screen-sessions/{id}", s.httpDeleteSession)
 			r.Put("/screen-recording-grants/{user_id}", s.httpSetGrant)
 			r.Patch("/screen-access-mode", s.httpSetMode)
 			r.Patch("/screen-profile-cap", s.httpSetProfileCap)
@@ -419,6 +420,54 @@ func (s *Service) httpStop(w http.ResponseWriter, r *http.Request) {
 	s.audit(r.Context(), tenantID, userID, email, "screen_session_stop", id, map[string]any{"device_id": sess.DeviceID})
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// httpDeleteSession удаляет завершённый сеанс целиком: файл записи, строку журнала и
+// журнал ввода. Идущий сеанс не трогаем — его сначала останавливают. Что именно и чьё
+// удалено, остаётся в аудите: сама строка исчезает, а след — нет.
+func (s *Service) httpDeleteSession(w http.ResponseWriter, r *http.Request) {
+	tenantID, userID, email, ok := actor(w, r)
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "id")
+	err := s.st.scoped(r.Context(), tenantID, func(ctx context.Context, q storage.TenantScope) error {
+		sess, err := s.st.get(ctx, q, id)
+		if err != nil {
+			return err
+		}
+		if sess.Status != "ended" {
+			return errSessionActive
+		}
+		if sess.recordingPath != "" {
+			if err := s.removeRecording(sess.recordingPath); err != nil {
+				return err
+			}
+		}
+		if err := s.st.deleteSession(ctx, q, id); err != nil {
+			return err
+		}
+		return s.cfg.DB.WriteAuditLog(ctx, userID, email, "screen_session_deleted", "screen_session", id,
+			map[string]any{
+				"device_id":      sess.DeviceID,
+				"operator_email": sess.OperatorEmail,
+				"reason":         sess.Reason,
+				"control":        sess.Control,
+				"had_recording":  sess.recordingPath != "",
+			})
+	})
+	switch {
+	case errors.Is(err, ErrNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+	case errors.Is(err, errSessionActive):
+		writeErr(w, http.StatusConflict, "session_active")
+	case err != nil:
+		s.internal(w, "delete session", err)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+var errSessionActive = errors.New("screen: session is not ended")
 
 // httpDeleteRecording удаляет файл записи завершённого сеанса; строка журнала остаётся.
 // Права на просмотр не требует: удаление не раскрывает содержимое, а админу, который

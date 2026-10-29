@@ -5,13 +5,16 @@ package uninstall
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"strings"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 
 	"github.com/Floodww/RoutineOps/internal/agent/collector"
+	"github.com/Floodww/RoutineOps/internal/agent/silentuninstall"
 )
 
 // Ветки ARP, из которых коллектор читает установленное ПО. Ищем строку снятия
@@ -51,15 +54,11 @@ func execute(ctx context.Context, target collector.Software, log *slog.Logger) (
 		return runCommand(ctx, msiexecName, args, nil)
 
 	case collector.UninstallWindowsQuiet:
-		line, err := readQuietUninstallString(target.UninstallID)
+		argv, err := quietArgv(target.UninstallID)
 		if err != nil {
 			return "", err
 		}
-		argv, err := windows.DecomposeCommandLine(line)
-		if err != nil || len(argv) == 0 {
-			return "", fmt.Errorf("строка тихого снятия из реестра неразбираема: %v", err)
-		}
-		log.Info("uninstall: QuietUninstallString", slog.String("exe", argv[0]))
+		log.Info("uninstall: quiet", slog.String("exe", argv[0]))
 		return runCommand(ctx, argv[0], argv[1:], nil)
 
 	default:
@@ -67,10 +66,46 @@ func execute(ctx context.Context, target collector.Software, log *slog.Logger) (
 	}
 }
 
+// quietArgv — команда тихого снятия: либо QuietUninstallString вендора, либо (когда его
+// нет) та, что выводится из UninstallString для Inno Setup / NSIS. Всё — из реестра этой
+// машины, сервер называет только цель.
+func quietArgv(keyName string) ([]string, error) {
+	if line, err := readQuietUninstallString(keyName); err == nil {
+		argv, derr := windows.DecomposeCommandLine(line)
+		if derr != nil || len(argv) == 0 {
+			return nil, fmt.Errorf("строка тихого снятия из реестра неразбираема: %v", derr)
+		}
+		return argv, nil
+	}
+	us, err := readRegistryString(keyName, "UninstallString")
+	if err != nil {
+		return nil, err
+	}
+	if argv, ok := silentuninstall.Derive(us, readFileHead); ok {
+		return argv, nil
+	}
+	return nil, fmt.Errorf("в реестре больше нет тихого деинсталлятора для %q (запись изменилась после снимка)", keyName)
+}
+
+// readFileHead — начало файла для поиска подписи установщика (см. silentuninstall).
+func readFileHead(path string, max int) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	b, _ := io.ReadAll(io.LimitReader(f, int64(max)))
+	return b
+}
+
 // readQuietUninstallString достаёт строку тихого снятия из той же ветки ARP, из
 // которой коллектор увидел запись. Обе ветки (нативная и WOW6432Node) —
 // 32-битный продукт на 64-битной ОС живёт во второй.
 func readQuietUninstallString(keyName string) (string, error) {
+	return readRegistryString(keyName, quietUninstallString)
+}
+
+func readRegistryString(keyName, value string) (string, error) {
 	if !validRegistryKeyName(keyName) {
 		return "", fmt.Errorf("недопустимый ключ записи %q", keyName)
 	}
@@ -79,13 +114,13 @@ func readQuietUninstallString(keyName string) (string, error) {
 		if err != nil {
 			continue
 		}
-		v, _, err := k.GetStringValue(quietUninstallString)
+		v, _, err := k.GetStringValue(value)
 		k.Close()
 		if err == nil && strings.TrimSpace(v) != "" {
 			return v, nil
 		}
 	}
-	return "", fmt.Errorf("в реестре больше нет тихого деинсталлятора для %q (запись изменилась после снимка)", keyName)
+	return "", fmt.Errorf("в реестре нет значения %s для %q", value, keyName)
 }
 
 // looksLikeProductCode и validRegistryKeyName живут в validate.go без build-тега:

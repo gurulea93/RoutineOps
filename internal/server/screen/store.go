@@ -326,6 +326,12 @@ func (st store) dropRecording(ctx context.Context, q storage.TenantScope, id str
 	return err
 }
 
+// deleteSession — строка завершённого сеанса; журнал ввода уходит каскадом.
+func (st store) deleteSession(ctx context.Context, q storage.TenantScope, id string) error {
+	_, err := q.Exec(ctx, `DELETE FROM screen_sessions WHERE id = $1::uuid AND status = 'ended'`, id)
+	return err
+}
+
 // Гранты на просмотр записей (миграция 067, users.can_view_session_recording).
 
 type grant struct {
