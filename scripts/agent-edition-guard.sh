@@ -110,9 +110,11 @@ case "$rc" in
      exit 2 ;;
 esac
 
+# Тег `screen` (форк: удалённый стол без остального enterprise) — тоже «редакция с экраном»:
+# токен пакета internal/agent/screen слинкован ровно тогда, когда собрано с enterprise или screen.
 case "$TAGS" in
-  *enterprise*) want=yes ;;
-  *)            want=no ;;
+  *enterprise*|*screen*) want=yes ;;
+  *)                     want=no ;;
 esac
 
 if [ "$have" = "$want" ]; then

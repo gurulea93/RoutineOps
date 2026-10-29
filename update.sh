@@ -254,7 +254,9 @@ docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
         # ниже это штатно вырождается в «macOS-релиз не опубликован» с предупреждением,
         # поэтому гейт (он fail-closed на ненайденном файле) зовём только на существующем.
         if [ -f "$PREBUILT" ]; then
-          sh scripts/agent-edition-guard.sh "$BUILD_TAGS" "$PREBUILT" "darwin/arm64 (prebuilt из репо)"
+          # prebuilt macOS — всегда без экрана (захвата на macOS пока нет), поэтому ждём open-core
+          # независимо от BUILD_TAGS: иначе тег screen ложно бы краснил этот гейт.
+          sh scripts/agent-edition-guard.sh "" "$PREBUILT" "darwin/arm64 (prebuilt из репо)"
         fi
         ;;
     esac
