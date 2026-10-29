@@ -44,7 +44,7 @@ async function getBinary(url: string): Promise<ArrayBuffer> {
   return r.arrayBuffer()
 }
 
-// fetchSetup скачивает stub и MSI с панели и собирает установщик.
+// fetchSetup downloads the stub and the MSI from the panel and builds the installer.
 export async function fetchSetup(base: string, params: SetupParams): Promise<Blob> {
   const [stub, msi] = await Promise.all([
     getBinary(`${base}/downloads/RoutineOps-setup.exe`),

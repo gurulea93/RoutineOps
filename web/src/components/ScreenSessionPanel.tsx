@@ -40,6 +40,10 @@ import { formatDistanceToNow } from "@/lib/time"
 
 interface Props {
   deviceId: string
+  // Окно просмотра (/screen-window/...): присоединяется к УЖЕ идущему сеансу этого же
+  // оператора и рисует только экран — без журнала и формы запуска.
+  attachId?: string
+  windowed?: boolean
 }
 
 // Пауза long-poll. Держится ниже серверного потолка (25 с), чтобы ответ не обрубался
@@ -146,7 +150,7 @@ export function framesPausedText(reason: string, t: (k: string) => string): stri
   return t("screenSession.framesPaused") + " (" + code + ")"
 }
 
-export function ScreenSessionPanel({ deviceId }: Props) {
+export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Props) {
   const { t } = useTranslation()
   const [sessions, setSessions] = useState<ScreenSession[]>([])
   // available=false — ручек нет вовсе (open-core). Секция в этом случае не рисуется:
@@ -193,6 +197,17 @@ export function ScreenSessionPanel({ deviceId }: Props) {
   // сразу при создании, поэтому одного `live.control` мало: петля отправки стартовала бы
   // в окно, когда принимать ввод ещё некому.
   const [streamOpen, setStreamOpen] = useState(false)
+
+  // Экран вынесен в отдельное окно: здешний опрос остановлен, ввод не отправляется — иначе
+  // два окна слали бы один и тот же ввод дважды.
+  const [poppedOut, setPoppedOut] = useState(false)
+  const [isFullscreen, setIsFullscreen] = useState(false)
+  const popupRef = useRef<Window | null>(null)
+  const liveRef = useRef<ScreenSession | null>(null)
+  // Поколение опроса. Новый runViewer и вынос в окно повышают его, и старый цикл, дожидаясь
+  // ответа, видит чужое поколение и выходит, не трогая состояние нового.
+  const genRef = useRef(0)
+  const stageRef = useRef<HTMLDivElement | null>(null)
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const stopRef = useRef(false)
@@ -242,10 +257,11 @@ export function ScreenSessionPanel({ deviceId }: Props) {
   const runViewer = useCallback(
     async (sessionId: string) => {
       stopRef.current = false
+      const gen = ++genRef.current
       let since = 0
       let sized = false
 
-      while (!stopRef.current) {
+      while (!stopRef.current && gen === genRef.current) {
         let res
         try {
           res = await api.get<ArrayBuffer>(`/screen-sessions/${sessionId}/live`, {
@@ -333,6 +349,9 @@ export function ScreenSessionPanel({ deviceId }: Props) {
           break
         }
       }
+      // Поколение сменилось (вынос в окно или новый опрос): сеанс не кончился, состоянием
+      // распоряжается тот, кто пришёл на смену.
+      if (gen !== genRef.current) return
       setLive(null)
       setStreamOpen(false)
       void loadJournal()
@@ -347,7 +366,7 @@ export function ScreenSessionPanel({ deviceId }: Props) {
   }, [])
 
   // Управление активно ровно тогда, когда сервер его выдал и оператор его не вернул.
-  const controlOn = Boolean(live?.control) && !controlReturned
+  const controlOn = Boolean(live?.control) && !controlReturned && !poppedOut
   useEffect(() => {
     controlOnRef.current = controlOn
   }, [controlOn])
@@ -434,6 +453,91 @@ export function ScreenSessionPanel({ deviceId }: Props) {
     } catch (e) {
       setError(errMessage(e))
     }
+  }
+
+  useEffect(() => {
+    liveRef.current = live
+  }, [live])
+
+  // Присоединиться к идущему сеансу своего оператора с правом ввода, если оно ещё не
+  // возвращено. Чужой сеанс сервер всё равно не пустит на ввод (404), так что здесь это
+  // только то, что рисует кнопки.
+  const attach = useCallback(
+    (row: ScreenSession) => {
+      setError("")
+      setLive(row)
+      setStreamOpen(false)
+      setControlReturned(!row.control || Boolean(row.control_returned_at))
+      setInputWarning("")
+      setControlState({ state: "unknown", reason: "" })
+      setFramesFlow({ paused: false, reason: "" })
+      framesPausedRef.current = false
+      setStatus(t("screenSession.waitingAgent"))
+      void runViewer(row.id)
+    },
+    [runViewer, t],
+  )
+
+  useEffect(() => {
+    if (!attachId) return
+    let dropped = false
+    api
+      .get<ScreenSession[]>(`/devices/${deviceId}/screen-sessions`)
+      .then((r) => {
+        if (dropped) return
+        const row = (r.data ?? []).find((x) => x.id === attachId)
+        if (row && (row.status === "active" || row.status === "requested")) attach(row)
+        else setStatus(t("screenSession.ended"))
+      })
+      .catch((e) => !dropped && setError(errMessage(e)))
+    return () => {
+      dropped = true
+    }
+    // attach зависит от runViewer/t; присоединяемся один раз на монтирование.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [attachId, deviceId])
+
+  // Вынести экран в отдельное окно: его можно растянуть, развернуть, унести на другой
+  // монитор. Окно присоединяется к тому же сеансу как второй зритель; здесь опрос и ввод
+  // останавливаются, а когда окно закроют, возобновляются.
+  const popOut = () => {
+    const cur = liveRef.current
+    if (!cur) return
+    const w = window.open(
+      `/screen-window/${deviceId}/${cur.id}`,
+      `routineops-screen-${cur.id}`,
+      "popup=yes,width=1280,height=800",
+    )
+    if (!w) {
+      setError(t("screenSession.popupBlocked"))
+      return
+    }
+    genRef.current++
+    popupRef.current = w
+    setPoppedOut(true)
+    setStreamOpen(false)
+    const timer = window.setInterval(() => {
+      if (!w.closed) return
+      window.clearInterval(timer)
+      popupRef.current = null
+      setPoppedOut(false)
+      const again = liveRef.current
+      if (again) {
+        setStatus(t("screenSession.waitingAgent"))
+        void runViewer(again.id)
+      }
+    }, 1000)
+  }
+
+  useEffect(() => {
+    const onFs = () => setIsFullscreen(document.fullscreenElement === stageRef.current)
+    document.addEventListener("fullscreenchange", onFs)
+    return () => document.removeEventListener("fullscreenchange", onFs)
+  }, [])
+
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) void document.exitFullscreen()
+    else void stageRef.current?.requestFullscreen?.()
   }
 
   const start = async () => {
@@ -542,14 +646,21 @@ export function ScreenSessionPanel({ deviceId }: Props) {
   if (!available) return null
 
   return (
-    <div className="glass">
-      <div className="px-5 pt-4 pb-3">
-        <h2 className="text-[15px] font-semibold text-foreground">{t("screenSession.title")}</h2>
-        <p className="text-xs text-muted-foreground mt-1">{t("screenSession.hint")}</p>
-      </div>
+    <div className={windowed ? "" : "glass"}>
+      {!windowed && (
+        <div className="px-5 pt-4 pb-3">
+          <h2 className="text-[15px] font-semibold text-foreground">{t("screenSession.title")}</h2>
+          <p className="text-xs text-muted-foreground mt-1">{t("screenSession.hint")}</p>
+        </div>
+      )}
 
-      <div className="border-t border-border px-5 py-4">
-        {live ? (
+      <div className={windowed ? "px-3 py-3" : "border-t border-border px-5 py-4"}>
+        {windowed && !live ? (
+          <div className="space-y-2 text-sm text-muted-foreground">
+            <p>{status || t("screenSession.waitingAgent")}</p>
+            {error && <p className="text-destructive">{error}</p>}
+          </div>
+        ) : live ? (
           <div className="space-y-3">
             <div className="flex items-center justify-between gap-3">
               <div className="flex items-center gap-2">
@@ -564,6 +675,22 @@ export function ScreenSessionPanel({ deviceId }: Props) {
                     {t("screenSession.returnControl")}
                   </Button>
                 )}
+                {poppedOut ? (
+                  <Button size="sm" variant="outline" onClick={() => popupRef.current?.close()}>
+                    {t("screenSession.bringBack")}
+                  </Button>
+                ) : (
+                  <>
+                    {!windowed && (
+                      <Button size="sm" variant="outline" onClick={popOut}>
+                        {t("screenSession.popOut")}
+                      </Button>
+                    )}
+                    <Button size="sm" variant="outline" onClick={toggleFullscreen}>
+                      {isFullscreen ? t("screenSession.exitFullscreen") : t("screenSession.fullscreen")}
+                    </Button>
+                  </>
+                )}
                 <Button size="sm" variant="outline" onClick={stop}>
                   {t("screenSession.stop")}
                 </Button>
@@ -571,11 +698,24 @@ export function ScreenSessionPanel({ deviceId }: Props) {
             </div>
             {/* Холст получает фокус только в режиме управления: tabIndex у картинки, по
                 которой нельзя кликнуть, — это лишняя остановка при обходе с клавиатуры. */}
+            {poppedOut ? (
+              <div className="rounded-xl border border-border bg-muted/30 px-4 py-10 text-center text-sm text-muted-foreground">
+                {t("screenSession.poppedOut")}
+              </div>
+            ) : (
+            <div ref={stageRef} className={isFullscreen ? "flex h-screen w-screen items-center justify-center bg-black" : ""}>
             <canvas
               ref={canvasRef}
               tabIndex={controlOn ? 0 : undefined}
+              style={
+                isFullscreen
+                  ? { maxWidth: "100vw", maxHeight: "100vh", width: "auto", height: "auto" }
+                  : windowed
+                    ? { maxHeight: "calc(100vh - 6.5rem)", width: "auto", maxWidth: "100%", margin: "0 auto", display: "block" }
+                    : undefined
+              }
               className={
-                "w-full rounded-xl border bg-black outline-none " +
+                (windowed || isFullscreen ? "" : "w-full ") + "rounded-xl border bg-black outline-none " +
                 (controlOn
                   ? "border-destructive cursor-crosshair focus-visible:ring-2 focus-visible:ring-destructive"
                   : "border-border")
@@ -632,6 +772,8 @@ export function ScreenSessionPanel({ deviceId }: Props) {
                 inputRef.current?.add({ kind: "text", text })
               }}
             />
+            </div>
+            )}
             {/*
               Кадры приостановлены (§9.11) — БЕЗ оговорки на controlOn, в отличие от
               соседних индикаторов ниже. Смотровой сеанс это и есть тот случай, ради
