@@ -11,6 +11,7 @@ import ResetPassword from "@/pages/ResetPassword"
 import AcceptInvite from "@/pages/AcceptInvite"
 import MFASetup from "@/pages/MFASetup"
 import Devices from "@/pages/Devices"
+import ScreenWindow from "@/pages/ScreenWindow"
 import DeviceDetail from "@/pages/DeviceDetail"
 import Alerts from "@/pages/Alerts"
 import AdminAccess from "@/pages/AdminAccess"
@@ -64,6 +65,14 @@ export default function App() {
         <Route path="/reset-password" element={<ResetPassword />} />
         <Route path="/accept-invite" element={<AcceptInvite />} />
         <Route path="/mfa-setup" element={<MFASetup />} />
+        <Route
+          path="/screen-window/:deviceId/:sessionId"
+          element={
+            <PrivateRoute>
+              <ScreenWindow />
+            </PrivateRoute>
+          }
+        />
         <Route
           path="/"
           element={

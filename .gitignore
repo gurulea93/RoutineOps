@@ -136,3 +136,6 @@ cmd/agent/rsrc_windows_arm64.syso
 # Артефакты Playwright: отчёты и трассы прогонов, не исходники.
 web/test-results/
 web/playwright-report/
+
+# Манифест stub-установщика (генерится в publish-installers.sh)
+cmd/setup/rsrc_windows_amd64.syso

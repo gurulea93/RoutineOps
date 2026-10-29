@@ -46,6 +46,28 @@ fi
 
 mkdir -p releases
 
+# RoutineOps-setup.exe — stub установщика «одним файлом» (cmd/setup). Панель при создании
+# устройства склеивает его в браузере с MSI и параметрами энроллмента (токен, CA, адрес
+# сервера), так что на машине сотрудника ставится двойным кликом. Сам stub от редакции и
+# от деплоя НЕ зависит: параметров в нём нет, они приходят хвостом файла. Поэтому его
+# можно собирать на любой инсталляции, и сбой сборки не должен ронять выкат — кнопка
+# «Скачать MSI» с ручной командой остаётся рабочей.
+if command -v go >/dev/null 2>&1; then
+  if go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.7.0 -64 -arm=false \
+       -o cmd/setup/rsrc_windows_amd64.syso -manifest cmd/setup/setup.manifest \
+       -company RoutineOps -product-name "RoutineOps Agent Setup" -description "RoutineOps Setup" \
+       -internal-name RoutineOps-setup -original-name RoutineOps-setup.exe cmd/setup/versioninfo.json \
+     && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+          -ldflags "-s -w -H windowsgui" -o releases/RoutineOps-setup.exe ./cmd/setup; then
+    echo "  Setup stub → releases/RoutineOps-setup.exe собран"
+  else
+    echo "  ⚠ Setup stub не собрался — установщик одним файлом недоступен (MSI с командой работает)"
+  fi
+  rm -f cmd/setup/rsrc_windows_amd64.syso
+else
+  echo "  ⚠ go не найден — Setup stub не собран"
+fi
+
 # copy_private <переменная> <путь> <расширение> <метка>
 copy_private() {
   var=$1; src=$2; ext=$3; label=$4

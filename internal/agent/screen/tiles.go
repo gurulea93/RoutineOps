@@ -36,6 +36,11 @@ var (
 		MaxBitsPerSec: 1_500_000, MaxPause: time.Second}
 	// Бюджет medium не задан: в Ф1 решён только low (29.10.2026).
 	ProfileMedium = Profile{Name: "medium", FPS: 2, MaxSide: 1920, Quality: 70}
+	// high — для управления мышью: 10 к/с. Бюджет 12 Мбит/с рассчитан на LAN и офисный канал
+	// (изменившиеся тайлы: ~20 КБ на кадр при перетаскивании окон, то есть ~1.6 Мбит/с);
+	// пауза до 0.5 с, чтобы картинка не отставала от курсора. Решение проекта, а не замер.
+	ProfileHigh = Profile{Name: "high", FPS: 10, MaxSide: 1920, Quality: 70,
+		MaxBitsPerSec: 12_000_000, MaxPause: 500 * time.Millisecond}
 )
 
 // ProfileByName — неизвестное имя даёт low и fallback=true: агент не роняет сеанс из-за
@@ -46,6 +51,8 @@ func ProfileByName(name string) (p Profile, fallback bool) {
 		return ProfileLow, name != "low" && name != ""
 	case "medium":
 		return ProfileMedium, false
+	case "high":
+		return ProfileHigh, false
 	default:
 		return ProfileLow, true
 	}
@@ -130,15 +137,29 @@ func (e *TileEncoder) changed(x, y, w, h int) bool {
 // текста на экране ближайший сосед честнее билинейного: буквы остаются резкими, а не
 // размытыми, а 1280 по длинной стороне выбраны так, чтобы шрифт оставался читаемым.
 func scaleBGRXToRGBA(dst []byte, w, h int, src []byte, stride, srcW, srcH int) {
+	if w == srcW && h == srcH {
+		// Без масштаба: только перестановка каналов, без делений на каждый пиксель.
+		for y := 0; y < h; y++ {
+			row := src[y*stride : y*stride+w*4]
+			d := dst[y*w*4 : (y+1)*w*4]
+			for x := 0; x < len(row); x += 4 {
+				d[x+0], d[x+1], d[x+2], d[x+3] = row[x+2], row[x+1], row[x], 0xff
+			}
+		}
+		return
+	}
+	xs := make([]int, w) // исходный столбец для каждого целевого: делим один раз на кадр, а не на пиксель
+	for x := range xs {
+		xs[x] = (x * srcW / w) * 4
+	}
 	for y := 0; y < h; y++ {
 		sy := y * srcH / h
 		row := src[sy*stride:]
 		d := dst[y*w*4:]
-		for x := 0; x < w; x++ {
-			s := row[(x*srcW/w)*4:]
-			d[x*4+0] = s[2]
-			d[x*4+1] = s[1]
-			d[x*4+2] = s[0]
+		for x, sx := range xs {
+			d[x*4+0] = row[sx+2]
+			d[x*4+1] = row[sx+1]
+			d[x*4+2] = row[sx]
 			d[x*4+3] = 0xff
 		}
 	}
