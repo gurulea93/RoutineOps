@@ -202,6 +202,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // два окна слали бы один и тот же ввод дважды.
   const [poppedOut, setPoppedOut] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
+  const [dims, setDims] = useState({ w: 0, h: 0 })
   const popupRef = useRef<Window | null>(null)
   const liveRef = useRef<ScreenSession | null>(null)
   // Поколение опроса. Новый runViewer и вынос в окно повышают его, и старый цикл, дожидаясь
@@ -298,6 +299,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           canvas.width = w
           canvas.height = h
           sized = true
+          setDims({ w, h })
         }
         since = Number(res.headers["x-screen-seq"] || since)
         // Признак применяемости ввода (Ф3): сервер шлёт его только у сеанса с управлением.
@@ -643,6 +645,163 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
     }
   }
 
+  // Размер кадра для вписывания холста в окно (окно и полный экран рисуют только картинку).
+  const fill = windowed || isFullscreen
+  const fillStyle: React.CSSProperties | undefined = fill
+    ? dims.w > 0
+      ? { width: `min(100vw, calc(100vh * ${dims.w} / ${dims.h}))`, height: "auto", display: "block" }
+      : { width: "100%", display: "block" }
+    : undefined
+
+  const canvasNode = (
+    <canvas
+      ref={canvasRef}
+      tabIndex={controlOn ? 0 : undefined}
+      style={fillStyle}
+      className={
+        (fill ? "" : "w-full rounded-xl border ") + "bg-black outline-none " +
+        (controlOn
+          ? (fill ? "cursor-crosshair" : "border-destructive cursor-crosshair focus-visible:ring-2 focus-visible:ring-destructive")
+          : fill ? "" : "border-border")
+      }
+      aria-label={controlOn ? t("screenSession.canvasControlLabel") : t("screenSession.canvasLabel")}
+      onPointerDown={(e) => {
+        if (!controlOn) return
+        // Фокус на холст обязателен: без него клавиатурные события уедут в
+        // документ, а не сюда, и Ctrl+C оператора сработает в его собственном
+        // браузере вместо машины сотрудника.
+        e.currentTarget.focus()
+        const p = toFrame(e.currentTarget, e.clientX, e.clientY)
+        if (p) inputRef.current?.add({ kind: "mouse_down", ...p, button: e.button })
+      }}
+      onPointerUp={(e) => {
+        if (!controlOn) return
+        const p = toFrame(e.currentTarget, e.clientX, e.clientY)
+        if (p) inputRef.current?.add({ kind: "mouse_up", ...p, button: e.button })
+      }}
+      onPointerMove={(e) => {
+        if (!controlOn) return
+        const p = toFrame(e.currentTarget, e.clientX, e.clientY)
+        if (p) inputRef.current?.add({ kind: "mouse_move", ...p })
+      }}
+      onPointerLeave={() => controlOn && inputRef.current?.release()}
+      onContextMenu={(e) => {
+        // Правая кнопка уезжает НА УДАЛЁННУЮ машину, а не открывает меню браузера:
+        // иначе контекстное меню в проводнике сотрудника недостижимо в принципе.
+        if (controlOn) e.preventDefault()
+      }}
+      onWheel={(e) => {
+        if (!controlOn) return
+        inputRef.current?.add({ kind: "wheel", ...wheelClicks(e.nativeEvent) })
+      }}
+      onKeyDown={(e) => {
+        if (!controlOn) return
+        const evs = keyEvents(e.nativeEvent, true)
+        if (evs.length) e.preventDefault()
+        evs.forEach((ev) => inputRef.current?.add(ev))
+      }}
+      onKeyUp={(e) => {
+        if (!controlOn) return
+        const evs = keyEvents(e.nativeEvent, false)
+        if (evs.length) e.preventDefault()
+        evs.forEach((ev) => inputRef.current?.add(ev))
+      }}
+      onPaste={(e) => {
+        // Вставка буфера обмена — текстом, а не набором клавиш: раскладка на
+        // машине сотрудника своя, и «нажать те же кнопки» дало бы другие символы.
+        if (!controlOn) return
+        const text = e.clipboardData.getData("text/plain")
+        if (!text) return
+        e.preventDefault()
+        inputRef.current?.add({ kind: "text", text })
+      }}
+    />
+  )
+
+  // Панель управления сеансом. В обычной карточке — строка над картинкой; в окне и на полном
+  // экране — плавающая «таблетка» под ручкой у верхнего края, чтобы не закрывать экран
+  // (как в RustDesk): ручка видна всегда, панель раскрывается при наведении.
+  const renderBar = (floating: boolean) => {
+    const btn = floating ? "border-white/30 bg-transparent text-white hover:bg-white/15 hover:text-white" : ""
+    return (
+      <div
+        className={
+          floating
+            ? "flex items-center gap-2 rounded-full bg-black/80 px-3 py-1.5 text-white shadow-lg backdrop-blur"
+            : "flex items-center justify-between gap-3"
+        }
+      >
+        <div className="flex items-center gap-2">
+          <Badge variant={controlOn ? "destructive" : "outline"}>
+            {controlOn ? t("screenSession.controlling") : t("screenSession.watching")}
+          </Badge>
+          {status && <span className={"text-xs " + (floating ? "text-white/70" : "text-muted-foreground")}>{status}</span>}
+        </div>
+        <div className="flex items-center gap-2">
+          {controlOn && (
+            <Button size="sm" variant="outline" className={btn} onClick={() => void returnControl()}>
+              {t("screenSession.returnControl")}
+            </Button>
+          )}
+          {poppedOut ? (
+            <Button size="sm" variant="outline" className={btn} onClick={() => popupRef.current?.close()}>
+              {t("screenSession.bringBack")}
+            </Button>
+          ) : (
+            <>
+              {!windowed && (
+                <Button size="sm" variant="outline" className={btn} onClick={popOut}>
+                  {t("screenSession.popOut")}
+                </Button>
+              )}
+              <Button size="sm" variant="outline" className={btn} onClick={toggleFullscreen}>
+                {isFullscreen ? t("screenSession.exitFullscreen") : t("screenSession.fullscreen")}
+              </Button>
+            </>
+          )}
+          <Button size="sm" variant="outline" className={btn} onClick={stop}>
+            {t("screenSession.stop")}
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  // Плавающая панель: ручка у верхнего края по центру; раскрывается наведением или фокусом.
+  // Занимает только свою ширину, поэтому остальная верхняя кромка удалённого экрана
+  // остаётся доступной для кликов.
+  const floatingBar = (
+    <div className="group absolute left-1/2 top-0 z-10 -translate-x-1/2">
+      <div className="mx-auto h-3 w-20 rounded-b-lg bg-white/30 group-hover:hidden group-focus-within:hidden" />
+      <div className="mt-1 hidden group-hover:block group-focus-within:block">{renderBar(true)}</div>
+    </div>
+  )
+
+  // Важное, что нельзя прятать: затор ввода, пауза кадров, ввод не доходит. Остальные
+  // пояснения живут в обычной карточке; в окне они закрывали бы экран.
+  const overlayNotes = [
+    inputWarning,
+    framesFlow.paused ? framesPausedText(framesFlow.reason, t) : "",
+    controlOn && controlState.state === "ineffective" ? controlIneffectiveText(controlState.reason, t) : "",
+    error,
+  ].filter(Boolean)
+
+  if (windowed && live) {
+    return (
+      <div ref={stageRef} className="fixed inset-0 flex items-center justify-center overflow-hidden bg-black">
+        {canvasNode}
+        {floatingBar}
+        {overlayNotes.length > 0 && (
+          <div className="pointer-events-none absolute bottom-2 left-2 max-w-[60vw] rounded bg-black/70 px-2 py-1 text-[11px] text-amber-300">
+            {overlayNotes.map((n, i) => (
+              <p key={i}>{n}</p>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   if (!available) return null
 
   return (
@@ -662,40 +821,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           </div>
         ) : live ? (
           <div className="space-y-3">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                <Badge variant={controlOn ? "destructive" : "outline"}>
-                  {controlOn ? t("screenSession.controlling") : t("screenSession.watching")}
-                </Badge>
-                <span className="text-xs text-muted-foreground">{status}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                {controlOn && (
-                  <Button size="sm" variant="outline" onClick={() => void returnControl()}>
-                    {t("screenSession.returnControl")}
-                  </Button>
-                )}
-                {poppedOut ? (
-                  <Button size="sm" variant="outline" onClick={() => popupRef.current?.close()}>
-                    {t("screenSession.bringBack")}
-                  </Button>
-                ) : (
-                  <>
-                    {!windowed && (
-                      <Button size="sm" variant="outline" onClick={popOut}>
-                        {t("screenSession.popOut")}
-                      </Button>
-                    )}
-                    <Button size="sm" variant="outline" onClick={toggleFullscreen}>
-                      {isFullscreen ? t("screenSession.exitFullscreen") : t("screenSession.fullscreen")}
-                    </Button>
-                  </>
-                )}
-                <Button size="sm" variant="outline" onClick={stop}>
-                  {t("screenSession.stop")}
-                </Button>
-              </div>
-            </div>
+            {renderBar(false)}
             {/* Холст получает фокус только в режиме управления: tabIndex у картинки, по
                 которой нельзя кликнуть, — это лишняя остановка при обходе с клавиатуры. */}
             {poppedOut ? (
@@ -703,75 +829,9 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                 {t("screenSession.poppedOut")}
               </div>
             ) : (
-            <div ref={stageRef} className={isFullscreen ? "flex h-screen w-screen items-center justify-center bg-black" : ""}>
-            <canvas
-              ref={canvasRef}
-              tabIndex={controlOn ? 0 : undefined}
-              style={
-                isFullscreen
-                  ? { maxWidth: "100vw", maxHeight: "100vh", width: "auto", height: "auto" }
-                  : windowed
-                    ? { maxHeight: "calc(100vh - 6.5rem)", width: "auto", maxWidth: "100%", margin: "0 auto", display: "block" }
-                    : undefined
-              }
-              className={
-                (windowed || isFullscreen ? "" : "w-full ") + "rounded-xl border bg-black outline-none " +
-                (controlOn
-                  ? "border-destructive cursor-crosshair focus-visible:ring-2 focus-visible:ring-destructive"
-                  : "border-border")
-              }
-              aria-label={controlOn ? t("screenSession.canvasControlLabel") : t("screenSession.canvasLabel")}
-              onPointerDown={(e) => {
-                if (!controlOn) return
-                // Фокус на холст обязателен: без него клавиатурные события уедут в
-                // документ, а не сюда, и Ctrl+C оператора сработает в его собственном
-                // браузере вместо машины сотрудника.
-                e.currentTarget.focus()
-                const p = toFrame(e.currentTarget, e.clientX, e.clientY)
-                if (p) inputRef.current?.add({ kind: "mouse_down", ...p, button: e.button })
-              }}
-              onPointerUp={(e) => {
-                if (!controlOn) return
-                const p = toFrame(e.currentTarget, e.clientX, e.clientY)
-                if (p) inputRef.current?.add({ kind: "mouse_up", ...p, button: e.button })
-              }}
-              onPointerMove={(e) => {
-                if (!controlOn) return
-                const p = toFrame(e.currentTarget, e.clientX, e.clientY)
-                if (p) inputRef.current?.add({ kind: "mouse_move", ...p })
-              }}
-              onPointerLeave={() => controlOn && inputRef.current?.release()}
-              onContextMenu={(e) => {
-                // Правая кнопка уезжает НА УДАЛЁННУЮ машину, а не открывает меню браузера:
-                // иначе контекстное меню в проводнике сотрудника недостижимо в принципе.
-                if (controlOn) e.preventDefault()
-              }}
-              onWheel={(e) => {
-                if (!controlOn) return
-                inputRef.current?.add({ kind: "wheel", ...wheelClicks(e.nativeEvent) })
-              }}
-              onKeyDown={(e) => {
-                if (!controlOn) return
-                const evs = keyEvents(e.nativeEvent, true)
-                if (evs.length) e.preventDefault()
-                evs.forEach((ev) => inputRef.current?.add(ev))
-              }}
-              onKeyUp={(e) => {
-                if (!controlOn) return
-                const evs = keyEvents(e.nativeEvent, false)
-                if (evs.length) e.preventDefault()
-                evs.forEach((ev) => inputRef.current?.add(ev))
-              }}
-              onPaste={(e) => {
-                // Вставка буфера обмена — текстом, а не набором клавиш: раскладка на
-                // машине сотрудника своя, и «нажать те же кнопки» дало бы другие символы.
-                if (!controlOn) return
-                const text = e.clipboardData.getData("text/plain")
-                if (!text) return
-                e.preventDefault()
-                inputRef.current?.add({ kind: "text", text })
-              }}
-            />
+            <div ref={stageRef} className={isFullscreen ? "relative flex h-screen w-screen items-center justify-center bg-black" : ""}>
+            {canvasNode}
+            {isFullscreen && floatingBar}
             </div>
             )}
             {/*
