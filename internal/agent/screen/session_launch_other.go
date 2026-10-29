@@ -1,4 +1,4 @@
-//go:build screen && !linux
+//go:build screen && !linux && !windows
 
 package screen
 
