@@ -26,6 +26,7 @@ const MODES = [
 // Потолок профиля сеанса. Порядок «выше → ниже» намеренно: medium — умолчание после
 // полевых замеров, а low остаётся для тенанта на узком канале.
 const PROFILE_CAPS = [
+  { value: "high", label: "screenAccess.profile.high", hint: "screenAccess.profile.highHint" },
   { value: "medium", label: "screenAccess.profile.medium", hint: "screenAccess.profile.mediumHint" },
   { value: "low", label: "screenAccess.profile.low", hint: "screenAccess.profile.lowHint" },
 ] as const

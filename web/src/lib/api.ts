@@ -616,7 +616,7 @@ export interface ScreenAccessPolicy {
   // profile_cap — ПОТОЛОК, а не значение: сервер выдаёт профиль в приглашении не выше
   // него. Отсутствует у сервера до 075 — трактуем как low, то есть как поведение до
   // появления настройки, а не как «потолок неизвестен».
-  profile_cap?: "low" | "medium"
+  profile_cap?: "low" | "medium" | "high"
   recording_used: number
   recording_quota: number
   recording_retention: number

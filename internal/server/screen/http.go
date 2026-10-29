@@ -213,8 +213,9 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		// Профиль — потолок тенанта (075); неизвестное значение — low.
 		profile := "low"
-		if pol.ProfileCap == "medium" {
-			profile = "medium"
+		switch pol.ProfileCap {
+		case "medium", "high":
+			profile = pol.ProfileCap
 		}
 		sid, taskID, err := s.st.create(ctx, q, newSession{
 			DeviceID: deviceID, OperatorID: userID, OperatorEmail: email,
@@ -617,7 +618,7 @@ func (s *Service) httpSetProfileCap(w http.ResponseWriter, r *http.Request) {
 		ProfileCap string `json:"profile_cap"`
 	}
 	s.setTenantValue(w, r, &req, func() (string, bool) {
-		return req.ProfileCap, req.ProfileCap == "low" || req.ProfileCap == "medium"
+		return req.ProfileCap, req.ProfileCap == "low" || req.ProfileCap == "medium" || req.ProfileCap == "high"
 	}, "screen_profile_cap_changed", s.st.setProfileCap)
 }
 

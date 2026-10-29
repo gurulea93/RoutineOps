@@ -1515,8 +1515,10 @@
     "profileHint": "A ceiling for every session of this tenant. Operators cannot request more — but on a narrow link the ceiling is worth lowering.",
     "profileSaved": "Quality ceiling changed",
     "profile": {
+      "high": "10 frames per second, up to 1920 px",
+      "highHint": "Default. For mouse control: the cursor keeps up. Needs a decent link (up to ~12 Mbit/s per session, usually ~2).",
       "medium": "2 frames per second, up to 1920 px",
-      "mediumHint": "The default. Measured on a live desktop: a session uses 1.6-1.7 % of the allotted bandwidth, with plenty of headroom.",
+      "mediumHint": "For watching without control. Measured on a live desktop: a session uses 1.6-1.7 % of the allotted bandwidth, with plenty of headroom.",
       "low": "1 frame per second, up to 1280 px",
       "lowHint": "For narrow links and sites with expensive traffic. The picture refreshes noticeably less often."
     },
