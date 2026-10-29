@@ -68,6 +68,13 @@ func (m *Manager) exec(s *session) {
 	m.run(s)
 }
 
+// current — идущий сеанс или nil.
+func (m *Manager) current() *session {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cur
+}
+
 // Busy — идёт ли сеанс сейчас.
 func (m *Manager) Busy() bool {
 	m.mu.Lock()

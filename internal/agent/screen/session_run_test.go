@@ -215,3 +215,22 @@ func TestServiceStartSessionRefusal(t *testing.T) {
 	}
 	svc.mgr.Wait()
 }
+
+func TestServiceReleaseEndsSessionWithReason(t *testing.T) {
+	bs := newBlockingStream()
+	d, sink := testDeps(launchWith(helloOnly), bs)
+	svc := NewService(context.Background(), d, quietLog())
+
+	if code, err := svc.StartSession(context.Background(), "t1", cmdID("s1")); code != "" || err != nil {
+		t.Fatalf("start: %q %v", code, err)
+	}
+	if svc.ActiveID() != "s1" || !svc.Busy() {
+		t.Fatalf("active %q busy %v", svc.ActiveID(), svc.Busy())
+	}
+	svc.Release(ReasonAgentUpdate)
+	svc.mgr.Wait()
+
+	if eventReason(t, sink) != "AGENT_UPDATE" || svc.Busy() || svc.ActiveID() != "" {
+		t.Fatalf("event %q busy %v id %q", eventReason(t, sink), svc.Busy(), svc.ActiveID())
+	}
+}

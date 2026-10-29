@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/Floodww/RoutineOps/internal/agent/transport"
 	pb "github.com/Floodww/RoutineOps/proto"
 )
 
@@ -184,4 +186,57 @@ func (v *Service) StartSession(ctx context.Context, _ string, cmd *pb.ScreenSess
 		return string(s.reason()), errors.New(cmp.Or(detail, string(s.reason())))
 	}
 	return "", nil
+}
+
+// Busy — идёт ли сеанс.
+func (v *Service) Busy() bool { return v.mgr.Busy() }
+
+// ActiveID — id идущего сеанса или пусто. Нужен гейту самообновления: он различает работы по
+// описанию, и «идёт сеанс» без id склеило бы два соседних сеанса в одну задержку.
+func (v *Service) ActiveID() string {
+	if s := v.mgr.current(); s != nil {
+		return s.id
+	}
+	return ""
+}
+
+// Release штатно закрывает идущий сеанс с указанной причиной (AGENT_UPDATE при обновлении):
+// событие, SessionEnd и гашение плашки пройдут через finishSession, а не TerminateProcess.
+func (v *Service) Release(r EndReason) {
+	if s := v.mgr.current(); s != nil {
+		s.end(r, "")
+	}
+}
+
+// ServiceConfig — то, что проводке агента известно снаружи пакета.
+type ServiceConfig struct {
+	Exe       string                     // бинарь агента: им же запускается screen-worker
+	Version   string                     // версия агента для SessionHello
+	Dialer    *transport.Dialer          // отдельные соединения под стримы сеансов
+	Enqueue   func(string, []byte) error // outbox.Queue.Enqueue
+	WorkerLog io.Writer                  // stderr захватчика; nil — отбросить
+}
+
+type enqueueFunc func(string, []byte) error
+
+func (f enqueueFunc) Enqueue(kind string, data []byte) error { return f(kind, data) }
+
+// NewAgentService — служба сеансов с настоящими запуском захватчика, стримом и очередью.
+func NewAgentService(parent context.Context, cfg ServiceConfig, log *slog.Logger) *Service {
+	stderr := cfg.WorkerLog
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	var sink eventSink
+	if cfg.Enqueue != nil {
+		sink = enqueueFunc(cfg.Enqueue)
+	}
+	d := &runDeps{
+		launch: func(c wireConfig) (*workerProc, EndReason, error) { return launchWorker(cfg.Exe, c, stderr) },
+		dial: func(s *session, h wireHello) (*sessionStream, EndReason, error) {
+			return dialSession(cfg.Dialer, s, h, cfg.Version)
+		},
+		sink: sink, log: log, now: time.Now,
+	}
+	return NewService(parent, d, log)
 }
