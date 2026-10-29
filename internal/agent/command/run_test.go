@@ -2,6 +2,7 @@ package command
 
 import (
 	"context"
+	"os/exec"
 	"runtime"
 	"strings"
 	"testing"
@@ -24,7 +25,16 @@ func TestInterpreterByPlatform(t *testing.T) {
 	}
 }
 
+// skipWithoutBash: сценарии macOS/Linux идут через bash, которого на «чистом» Windows нет.
+func skipWithoutBash(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash не найден в PATH")
+	}
+}
+
 func TestRunScriptSuccess(t *testing.T) {
+	skipWithoutBash(t)
 	stdout, stderr, err := runScript(context.Background(), "macOS", "echo hello")
 	if err != nil {
 		t.Fatalf("err=%v", err)
@@ -38,6 +48,7 @@ func TestRunScriptSuccess(t *testing.T) {
 }
 
 func TestRunScriptError(t *testing.T) {
+	skipWithoutBash(t)
 	stdout, stderr, err := runScript(context.Background(), "macOS", "echo oops 1>&2; exit 3")
 	if err == nil {
 		t.Fatal("ожидали ошибку при exit 3")

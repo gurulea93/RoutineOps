@@ -109,7 +109,10 @@ func TestVP8StaticScreenIsCheap(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if len(last)*10 > len(key) {
+	// Ключевой кадр синтетического градиента сам крошечный (сотни байт), поэтому одно
+	// отношение 1:10 ложно срабатывает. Дёшево значит «в 10 раз меньше ключевого ИЛИ
+	// в пределах килобайта»: бюджет кадра при 500 кбит/с и 15 к/с — около 4 КБ.
+	if len(last)*10 > len(key) && len(last) > 1024 {
 		t.Fatalf("static frame %d bytes vs keyframe %d", len(last), len(key))
 	}
 }
