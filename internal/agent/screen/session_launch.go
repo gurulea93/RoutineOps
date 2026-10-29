@@ -22,6 +22,7 @@ type wireConfig struct {
 	Operator       string `json:"operator"`
 	Reason         string `json:"reason"`
 	MaxDurationSec int    `json:"max_duration_sec"`
+	AllowInput     bool   `json:"allow_input,omitempty"`
 }
 
 // workerProc — запущенный захватчик и его концы канала (wire.go).

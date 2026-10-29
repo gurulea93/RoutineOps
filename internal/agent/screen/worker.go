@@ -9,7 +9,10 @@ import (
 	"io"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/Floodww/RoutineOps/internal/screenframe"
+	pb "github.com/Floodww/RoutineOps/proto"
 )
 
 // Процесс захвата (agent screen-worker). Живёт в графической сессии сотрудника, от его
@@ -32,6 +35,11 @@ type WorkerConfig struct {
 	// KeyframeEvery — периодический ключевой кадр: страхует зрителя от накопленной
 	// ошибки, даже если запрос ключевого кадра потерялся. 0 → 30 с.
 	KeyframeEvery time.Duration
+
+	// AllowInput — сеанс с управлением. Без NewInjector (или если тот отказал) сеанс
+	// закрывается INPUT_UNAVAILABLE, а не понижается молча до просмотра.
+	AllowInput  bool
+	NewInjector func(srcW, srcH int) (Injector, error)
 
 	NewCapturer func() (Capturer, error)
 	ShowNotice  func(operator, reason string) (Notice, error)
@@ -66,8 +74,19 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 	}
 	defer notice.Close()
 
-	prof, fallback := ProfileByName(cfg.Profile)
 	srcW, srcH := capt.Size()
+	var inj Injector
+	if cfg.AllowInput {
+		if cfg.NewInjector == nil {
+			return end(ReasonInputUnavailable, "worker built without input injection")
+		}
+		var ierr error
+		if inj, ierr = cfg.NewInjector(srcW, srcH); ierr != nil {
+			return end(ReasonInputUnavailable, ierr.Error())
+		}
+		defer inj.Close() // отпускает всё зажатое при любом конце сеанса
+	}
+	prof, fallback := ProfileByName(cfg.Profile)
 	enc := NewTileEncoder(srcW, srcH, prof)
 	if err := writeJSONMsg(out, msgHello, wireHello{
 		Width: enc.W, Height: enc.H, Profile: prof.Name, ProfileFallback: fallback,
@@ -75,7 +94,7 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 		return ReasonWorkerLost
 	}
 
-	ctl := readControl(in)
+	ctl := readControl(in, inj)
 	tick := time.NewTicker(time.Second / time.Duration(prof.FPS))
 	defer tick.Stop()
 	deadline := time.NewTimer(cfg.MaxDuration)
@@ -152,7 +171,9 @@ type control struct{ stop string }
 type controlReader struct{ ch chan control }
 
 // readControl читает команды службы. Канал закрывается на EOF/ошибке.
-func readControl(in io.Reader) *controlReader {
+// Ввод исполняется прямо в читающей горутине, а не через канал: цикл кадров занят захватом
+// десятки миллисекунд, и ввод, ждущий очереди за кадром, давал бы заметный лаг мыши.
+func readControl(in io.Reader, inj Injector) *controlReader {
 	cr := &controlReader{ch: make(chan control, 4)}
 	go func() {
 		defer close(cr.ch)
@@ -166,6 +187,14 @@ func readControl(in io.Reader) *controlReader {
 				select {
 				case cr.ch <- control{}:
 				default: // запрос уже в очереди
+				}
+			case msgInput:
+				if inj == nil {
+					continue // ввод не объявлялся приглашением: не исполняем
+				}
+				var si pb.SessionInput
+				if proto.Unmarshal(body, &si) == nil {
+					inj.Apply(&si)
 				}
 			case msgStop:
 				var s wireStop

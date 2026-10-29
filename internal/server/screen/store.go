@@ -185,6 +185,7 @@ type newSession struct {
 	Reason        string
 	Mode          string
 	Profile       string
+	Control       bool // сеанс с управлением: объявляется приглашением один раз
 }
 
 // create вставляет сеанс и задачу-приглашение. Задача сразу 'acked': доставляет её сам
@@ -197,9 +198,9 @@ func (st store) create(ctx context.Context, q storage.TenantScope, n newSession)
 		opID = &n.OperatorID
 	}
 	err = q.QueryRow(ctx, `
-		INSERT INTO screen_sessions (tenant_id, device_id, operator_id, operator_email, reason, mode, profile)
-		SELECT d.tenant_id, d.id, $2::uuid, $3, $4, $5, $6 FROM devices d WHERE d.id = $1::uuid
-		RETURNING id::text`, n.DeviceID, opID, n.OperatorEmail, n.Reason, n.Mode, n.Profile).Scan(&sessionID)
+		INSERT INTO screen_sessions (tenant_id, device_id, operator_id, operator_email, reason, mode, profile, control)
+		SELECT d.tenant_id, d.id, $2::uuid, $3, $4, $5, $6, $7 FROM devices d WHERE d.id = $1::uuid
+		RETURNING id::text`, n.DeviceID, opID, n.OperatorEmail, n.Reason, n.Mode, n.Profile, n.Control).Scan(&sessionID)
 	if err != nil {
 		return "", "", err
 	}
@@ -382,4 +383,30 @@ func (st store) setMode(ctx context.Context, q storage.TenantScope, tenantID, mo
 func (st store) setProfileCap(ctx context.Context, q storage.TenantScope, tenantID, cap string) error {
 	_, err := q.Exec(ctx, `UPDATE tenants SET screen_profile_cap = $2 WHERE id = $1::uuid`, tenantID, cap)
 	return err
+}
+
+// returnControl — возврат управления сотруднику. Истина, если управление ещё было у
+// оператора: повторный возврат ничего не меняет и не пишет второй строки журнала.
+func (st store) returnControl(ctx context.Context, q storage.TenantScope, id string) (bool, error) {
+	tag, err := q.Exec(ctx, `
+		UPDATE screen_sessions SET control_returned_at = now()
+		WHERE id = $1::uuid AND control AND control_returned_at IS NULL AND status <> 'ended'`, id)
+	return tag.RowsAffected() == 1, err
+}
+
+// inputEvent — строка журнала ввода (screen_input_events, миграция 073). detail пишется
+// пустым для печатного ввода: что набрано, не хранится никогда (§9.21 п.6).
+func (st store) inputEvent(ctx context.Context, q storage.TenantScope, sessionID, kind, detail string, events int, offsetMs int64) error {
+	_, err := q.Exec(ctx, `
+		INSERT INTO screen_input_events (tenant_id, device_id, session_id, operator_id, operator_email, kind, detail, events, offset_ms)
+		SELECT tenant_id, device_id, id, operator_id, operator_email, $2, $3, $4, $5
+		FROM screen_sessions WHERE id = $1::uuid`, sessionID, kind, detail, events, offsetMs)
+	return err
+}
+
+// adminCount — сколько it_admin в тенанте (RLS ограничивает выборку текущим).
+func (st store) adminCount(ctx context.Context, q storage.TenantScope) (int, error) {
+	var n int
+	err := q.QueryRow(ctx, `SELECT count(*) FROM users WHERE role = 'it_admin'`).Scan(&n)
+	return n, err
 }

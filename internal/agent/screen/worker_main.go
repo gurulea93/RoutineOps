@@ -30,6 +30,8 @@ func runWorkerProcess(ctx context.Context, in io.Reader, out io.Writer,
 		Operator:    cfg.Operator,
 		Reason:      cfg.Reason,
 		MaxDuration: time.Duration(cfg.MaxDurationSec) * time.Second,
+		AllowInput:  cfg.AllowInput,
+		NewInjector: newPlatformInjector,
 		NewCapturer: newCapturer,
 		ShowNotice:  showNotice,
 	}, in, out)

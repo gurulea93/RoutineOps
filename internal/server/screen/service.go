@@ -143,6 +143,7 @@ func (s *Service) Stream(fingerprint string, stream pb.AgentService_ScreenSessio
 	}
 
 	h := newHub(uint16(hello.Width), uint16(hello.Height))
+	h.setOwner(tenantID, sess)
 	if !s.hubs.put(sess.ID, h) {
 		return status.Error(codes.AlreadyExists, "session already has a stream")
 	}
@@ -347,6 +348,15 @@ func (r *streamRun) loop(ctx context.Context) {
 			_ = r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Control{
 				Control: &pb.SessionControl{RequestKeyframe: true},
 			}})
+		case in := <-r.hub.input:
+			if stopReason == "" {
+				_ = r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Input{Input: in}})
+			}
+		case <-r.hub.narrow:
+			// Возврат управления — сужение, а не стоп: сеанс наблюдения продолжается.
+			_ = r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Control{
+				Control: &pb.SessionControl{Narrow: &pb.ScreenScope{Displays: []int32{0}, AllowInput: false}},
+			}})
 		case reason := <-r.hub.stop:
 			stop(reason)
 		case <-maxDur.C:
@@ -358,6 +368,7 @@ func (r *streamRun) loop(ctx context.Context) {
 			if time.Since(lastFlush) >= 10*time.Second {
 				lastFlush = time.Now()
 				r.flushProgress(ctx)
+				r.flushInput(ctx)
 			}
 		case <-stopDeadline:
 			r.finish(stopReason, "agent did not confirm stop")
@@ -431,6 +442,7 @@ func (r *streamRun) finish(reason, detail string) {
 	s := r.s
 	ctx := context.WithoutCancel(r.stream.Context())
 	r.hub.close(reason)
+	r.flushInput(ctx)
 	var name, trunc string
 	var n int64
 	if r.rec != nil {

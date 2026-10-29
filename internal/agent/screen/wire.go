@@ -28,6 +28,7 @@ const (
 	msgStats    byte = 4 // worker → служба: счётчики
 	msgKeyframe byte = 10
 	msgStop     byte = 11
+	msgInput    byte = 13 // служба → worker: pb.SessionInput (protobuf) — ввод оператора
 )
 
 // maxWireMsg — потолок сообщения: часть кадра плюс заголовки. Больше — протокольная ошибка,

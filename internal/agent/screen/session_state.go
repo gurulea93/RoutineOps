@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	pb "github.com/Floodww/RoutineOps/proto"
 )
@@ -45,11 +46,17 @@ type session struct {
 	// приглашению кодом отказа синхронно.
 	ready     chan struct{}
 	readyOnce sync.Once
+
+	// inputOn — управление ещё у оператора. Выставляется приглашением и только снимается
+	// (возврат управления = сужение), обратно не включается.
+	inputOn atomic.Bool
 }
 
 func newSession(parent context.Context, cmd *pb.ScreenSessionCommand) *session {
 	ctx, cancel := context.WithCancel(parent)
-	return &session{id: cmd.GetSessionId(), cmd: cmd, ctx: ctx, cancel: cancel, ready: make(chan struct{})}
+	s := &session{id: cmd.GetSessionId(), cmd: cmd, ctx: ctx, cancel: cancel, ready: make(chan struct{})}
+	s.inputOn.Store(cmd.GetAllowInput())
+	return s
 }
 
 // activate — requested → active. Ложь, если сеанс уже не ждёт старта.

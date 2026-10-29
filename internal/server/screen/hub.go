@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Floodww/RoutineOps/internal/screenframe"
+	pb "github.com/Floodww/RoutineOps/proto"
 )
 
 // Хаб сеанса RSF1: стрим агента пишет части кадров, зрители забирают их long-poll'ом
@@ -50,6 +51,17 @@ type hub struct {
 
 	keyframe chan struct{} // → стрим: попросить агента о ключевом кадре
 	stop     chan string   // → стрим: закрыть сеанс с причиной
+
+	// Управление (Ф3). input и narrow читает только стрим сеанса: он единственный, кто
+	// пишет в stream.Send, и потому единственный, кто может отправить агенту ввод.
+	input  chan *pb.SessionInput
+	narrow chan struct{} // → стрим: вернуть управление сотруднику (сужение области)
+
+	// Кому принадлежит управление. Заполняется при открытии стрима из строки сеанса, чтобы
+	// ручка ввода (десятки запросов в секунду) не ходила за ними в БД.
+	tenantID, operatorID string
+	control, returned    bool
+	counts               inputCounts
 }
 
 func newHub(w, h uint16) *hub {
@@ -59,6 +71,8 @@ func newHub(w, h uint16) *hub {
 		lastPoll: time.Now(),
 		keyframe: make(chan struct{}, 1),
 		stop:     make(chan string, 1),
+		input:    make(chan *pb.SessionInput, inputQueue),
+		narrow:   make(chan struct{}, 1),
 	}
 }
 

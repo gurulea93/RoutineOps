@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"google.golang.org/protobuf/proto"
+
 	pb "github.com/Floodww/RoutineOps/proto"
 )
 
@@ -35,11 +37,15 @@ func loopDown(ctx context.Context, s *session, st *sessionStream, ctl *ctlWriter
 		if ctx.Err() != nil {
 			return
 		}
-		if m.GetInput() != nil {
-			if !inputWarned {
-				inputWarned = true
-				log.Warn("screen: SessionInput ignored, view-only session", "session_id", s.id)
+		if in := m.GetInput(); in != nil {
+			if !s.inputOn.Load() {
+				if !inputWarned {
+					inputWarned = true
+					log.Warn("screen: SessionInput ignored, view-only session", "session_id", s.id)
+				}
+				continue
 			}
+			forwardInput(s, ctl, in, log)
 			continue
 		}
 		c := m.GetControl()
@@ -52,7 +58,7 @@ func loopDown(ctx context.Context, s *session, st *sessionStream, ctl *ctlWriter
 		}
 		if n := c.GetNarrow(); n != nil {
 			handled = true
-			if !handleNarrow(s, n, log) {
+			if !handleNarrow(s, n, ctl, log) {
 				return
 			}
 		}
@@ -121,7 +127,7 @@ func checkNarrow(cmd *pb.ScreenSessionCommand, req *pb.ScreenScope) narrowVerdic
 // TODO: попытку расширения стоит отправлять событием безопасности (outbox.KindSecurity,
 // pb.SecurityEvent). Сюда оно пока не проведено: у loopDown нет доступа к очереди, а
 // пробрасывать её надо вместе с session_end.go, одним решением. До тех пор — только лог.
-func handleNarrow(s *session, req *pb.ScreenScope, log *slog.Logger) bool {
+func handleNarrow(s *session, req *pb.ScreenScope, ctl *ctlWriter, log *slog.Logger) bool {
 	switch checkNarrow(s.cmd, req) {
 	case narrowExpand:
 		log.Warn("screen: expansion attempt rejected", "session_id", s.id,
@@ -131,7 +137,16 @@ func handleNarrow(s *session, req *pb.ScreenScope, log *slog.Logger) bool {
 		s.end(ReasonOperatorRevoked, "narrow left no displays")
 		return false
 	}
-	// В M1 экран один, так что допустимое сужение ничего не меняет.
+	// Возврат управления — сужение: ввод перестаёт исполняться, зажатое отпускается. Назад
+	// не включается: взять управление снова — новый сеанс с новой строкой аудита.
+	if s.inputOn.Load() && !req.GetAllowInput() {
+		s.inputOn.Store(false)
+		if ctl != nil {
+			forwardInput(s, ctl, &pb.SessionInput{ReleaseAll: true}, log)
+		}
+		log.Info("screen: control returned to the employee", "session_id", s.id)
+	}
+	// В M1 экран один, так что сужение экранов ничего не меняет.
 	log.Debug("screen: narrow accepted", "session_id", s.id,
 		"displays", req.GetDisplays(), "allow_input", req.GetAllowInput())
 	return true
@@ -154,4 +169,17 @@ func stopReason(raw string) (EndReason, string) {
 		raw = string(rs[:maxStopDetail])
 	}
 	return ReasonOperatorRevoked, raw
+}
+
+// forwardInput передаёт пачку ввода захватчику. Ошибка канала не поднимается: умерший
+// захватчик заметит readPipe по EOF и закроет сеанс.
+func forwardInput(s *session, ctl *ctlWriter, in *pb.SessionInput, log *slog.Logger) {
+	b, err := proto.Marshal(in)
+	if err != nil || len(b) > maxWireMsg {
+		log.Warn("screen: SessionInput dropped", "session_id", s.id, "err", err, "bytes", len(b))
+		return
+	}
+	if err := ctl.send(msgInput, b); err != nil {
+		log.Warn("screen: input not delivered to worker", "session_id", s.id, "err", err)
+	}
 }
