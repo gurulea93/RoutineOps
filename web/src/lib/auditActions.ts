@@ -108,6 +108,7 @@ export const ACTION_LABELS: Record<string, string> = {
   // --- удалённый рабочий стол (ADR-8) ---
   screen_session_requested: "auditAction.screen_session_requested",
   screen_recording_viewed: "auditAction.screen_recording_viewed",
+  screen_recording_deleted: "auditAction.screen_recording_deleted",
   screen_recording_view_denied: "auditAction.screen_recording_view_denied",
   screen_session_foreign_claim: "auditAction.screen_session_foreign_claim",
   screen_session_operator_revoked: "auditAction.screen_session_operator_revoked",
@@ -216,6 +217,7 @@ export const ACTION_CATEGORY: Record<string, EventCategory> = {
   // подотчётности, и в ленте это должно быть видно категорией.
   screen_session_requested: "security",
   screen_recording_viewed: "security",
+  screen_recording_deleted: "security",
   screen_recording_view_denied: "security",
   screen_session_foreign_claim: "security",
   screen_session_operator_revoked: "security",

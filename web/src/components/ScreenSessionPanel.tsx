@@ -171,6 +171,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // другой администратор в этот момент разбирает инцидент, и его работа прекращается
   // без предупреждения. Свой сеанс оператор обрывает себе же и тут же начинает заново.
   const [confirmStop, setConfirmStop] = useState<ScreenSession | null>(null)
+  const [confirmDelRec, setConfirmDelRec] = useState<ScreenSession | null>(null)
 
   // Запрошено ли управление ДО начала сеанса. Отдельный флаг от `live.control`: первый —
   // намерение оператора, второй — то, что реально выдал сервер и объявил агенту.
@@ -601,6 +602,16 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // закрывший вкладку, терял единственный способ его остановить, а второй администратор
   // видел идущее наблюдение и ничего не мог с ним сделать. Сторож закрыл бы сеанс сам,
   // но через минуту без зрителя (§9.9) — целая минута чужого экрана.
+  const deleteRecording = async (id: string) => {
+    setError("")
+    try {
+      await api.delete(`/screen-sessions/${id}/recording`)
+    } catch (e) {
+      setError(errMessage(e))
+    }
+    void loadJournal()
+  }
+
   const stopFromJournal = async (id: string) => {
     setError("")
     try {
@@ -999,6 +1010,11 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                         {s.recording_bytes ? ` · ${formatBytes(s.recording_bytes)}` : ""}
                       </span>
                     )}
+                    {s.status === "ended" && (
+                      <Button size="sm" variant="outline" onClick={() => setConfirmDelRec(s)}>
+                        {t("screenSession.deleteRecording")}
+                      </Button>
+                    )}
                   </>
                 )}
               </div>
@@ -1043,6 +1059,18 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           setConfirmStop(null)
         }}
       />
+      <ConfirmDialog
+        open={confirmDelRec !== null}
+        onOpenChange={(open) => !open && setConfirmDelRec(null)}
+        title={t("screenSession.deleteRecordingTitle")}
+        description={t("screenSession.deleteRecordingBody")}
+        confirmLabel={t("screenSession.deleteRecording")}
+        destructive
+        onConfirm={() => {
+          if (confirmDelRec) void deleteRecording(confirmDelRec.id)
+          setConfirmDelRec(null)
+        }}
+      />
     </div>
   )
 }
@@ -1057,7 +1085,7 @@ async function downloadRecording(sessionId: string) {
   const url = URL.createObjectURL(res.data as Blob)
   const a = document.createElement("a")
   a.href = url
-  a.download = `screen-session-${sessionId}.bin`
+  a.download = `screen-${sessionId}.rsf`
   a.click()
   URL.revokeObjectURL(url)
 }

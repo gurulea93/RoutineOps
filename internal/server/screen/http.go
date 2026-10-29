@@ -53,6 +53,7 @@ func (s *Service) Routes() []api.RouterOption {
 			// Ввод — только от человека: в журнале должен оказаться тот, кто нажимал.
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
+			r.Delete("/screen-sessions/{id}/recording", s.httpDeleteRecording)
 			r.Put("/screen-recording-grants/{user_id}", s.httpSetGrant)
 			r.Patch("/screen-access-mode", s.httpSetMode)
 			r.Patch("/screen-profile-cap", s.httpSetProfileCap)
@@ -417,6 +418,42 @@ func (s *Service) httpStop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r.Context(), tenantID, userID, email, "screen_session_stop", id, map[string]any{"device_id": sess.DeviceID})
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// httpDeleteRecording удаляет файл записи завершённого сеанса; строка журнала остаётся.
+// Права на просмотр не требует: удаление не раскрывает содержимое, а админу, который
+// сам не вправе смотреть, всё равно нужно уметь освободить место. Факт — в аудит.
+func (s *Service) httpDeleteRecording(w http.ResponseWriter, r *http.Request) {
+	tenantID, userID, email, ok := actor(w, r)
+	if !ok {
+		return
+	}
+	id := chi.URLParam(r, "id")
+	err := s.st.scoped(r.Context(), tenantID, func(ctx context.Context, q storage.TenantScope) error {
+		sess, err := s.st.get(ctx, q, id)
+		if err != nil {
+			return err
+		}
+		if sess.recordingPath == "" || sess.Status != "ended" {
+			return ErrNotFound
+		}
+		if err := s.removeRecording(sess.recordingPath); err != nil {
+			return err
+		}
+		if err := s.st.dropRecording(ctx, q, id); err != nil {
+			return err
+		}
+		return s.cfg.DB.WriteAuditLog(ctx, userID, email, "screen_recording_deleted", "screen_session", id,
+			map[string]any{"device_id": sess.DeviceID, "recording_bytes": sess.RecordingBytes})
+	})
+	switch {
+	case errors.Is(err, ErrNotFound):
+		http.Error(w, "not found", http.StatusNotFound)
+	case err != nil:
+		s.internal(w, "delete recording", err)
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func (s *Service) httpRecording(w http.ResponseWriter, r *http.Request) {
