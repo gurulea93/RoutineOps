@@ -31,7 +31,15 @@ func wireScreen(_, exe string, dialer *transport.Dialer, enqueue func(string, []
 	return &screenRuntime{svc: svc, log: log}
 }
 
-func (r *screenRuntime) capabilities() []string { return []string{"screen_session"} }
+// capabilities: screen_control объявляется только там, где агент умеет внедрять ввод
+// (сейчас Windows). Без неё сервер отбивает приглашение с управлением 409 agent_no_control.
+func (r *screenRuntime) capabilities() []string {
+	caps := []string{"screen_session"}
+	if screen.InputAvailable() {
+		caps = append(caps, "screen_control")
+	}
+	return caps
+}
 
 func (r *screenRuntime) sessioner() command.ScreenSessioner { return r.svc }
 

@@ -37,6 +37,9 @@ type runDeps struct {
 	// Переопределения для тестов; ноль — значения по умолчанию.
 	ceiling time.Duration
 	hello   time.Duration
+
+	// inputOK — умеет ли сборка внедрять ввод (на Windows — да). Тесты задают явно.
+	inputOK bool
 }
 
 // run — весь жизненный цикл сеанса: проверки приглашения → захватчик → hello → стрим →
@@ -63,7 +66,7 @@ func (d *runDeps) run(s *session) {
 
 	// Что агент не умеет, отказываем кодом ДО запуска захвата, а не понижаем молча (§4).
 	switch cmd := s.cmd; {
-	case cmd.GetAllowInput():
+	case cmd.GetAllowInput() && !d.inputOK:
 		s.end(ReasonInputUnavailable, "input injection is not available in this build")
 		return
 	case cmd.GetConsentRequired():
@@ -81,6 +84,7 @@ func (d *runDeps) run(s *session) {
 	w, reason, err = d.launch(wireConfig{
 		SessionID: s.id, Profile: s.cmd.GetProfile(), Operator: s.cmd.GetOperatorName(),
 		Reason: s.cmd.GetReason(), MaxDurationSec: int(dur / time.Second),
+		AllowInput: s.cmd.GetAllowInput(),
 	})
 	if reason != "" || err != nil {
 		w = nil
@@ -236,7 +240,7 @@ func NewAgentService(parent context.Context, cfg ServiceConfig, log *slog.Logger
 		dial: func(s *session, h wireHello) (*sessionStream, EndReason, error) {
 			return dialSession(cfg.Dialer, s, h, cfg.Version)
 		},
-		sink: sink, log: log, now: time.Now,
+		sink: sink, log: log, now: time.Now, inputOK: inputAvailable(),
 	}
 	return NewService(parent, d, log)
 }

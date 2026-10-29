@@ -44,13 +44,14 @@ func (s *Service) Routes() []api.RouterOption {
 			r.Post("/screen-sessions/{id}/stop", s.httpStop)
 			r.Get("/screen-access-mode", s.httpPolicy)
 			r.Get("/screen-recording-grants", s.httpGrants)
-			// Управление — не в M1: агент его не объявляет, и сеанса с control не бывает.
-			r.Post("/screen-sessions/{id}/input", s.httpNoControl)
-			r.Delete("/screen-sessions/{id}/control", s.httpNoControl)
+			// Вернуть управление — защитное действие, его не запрещаем и автоматике.
+			r.Delete("/screen-sessions/{id}/control", s.httpReturnControl)
 		}),
 		api.WithHumanAdminRoutes(func(_ *api.Handler, r chi.Router) {
 			r.Post("/devices/{id}/screen-sessions", s.httpCreate)
 			r.Get("/screen-sessions/{id}/live", s.httpLive)
+			// Ввод — только от человека: в журнале должен оказаться тот, кто нажимал.
+			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
 			r.Put("/screen-recording-grants/{user_id}", s.httpSetGrant)
 			r.Patch("/screen-access-mode", s.httpSetMode)
@@ -158,6 +159,11 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Обслуживание подразумевает управление (proto: maintenance ⇒ allow_input).
+	if req.Maintenance {
+		req.Control = true
+	}
+
 	var (
 		sess    *SessionRow
 		cn      string
@@ -212,15 +218,23 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		sid, taskID, err := s.st.create(ctx, q, newSession{
 			DeviceID: deviceID, OperatorID: userID, OperatorEmail: email,
-			Reason: req.Reason, Mode: mode, Profile: profile,
+			Reason: req.Reason, Mode: mode, Profile: profile, Control: req.Control,
 		})
 		if err != nil {
 			return err
 		}
 		// Аудит в той же транзакции: сеанса без строки «запрошен» не существует.
 		if err := s.cfg.DB.WriteAuditLog(ctx, userID, email, "screen_session_requested", "screen_session", sid,
-			map[string]any{"device_id": deviceID, "reason": req.Reason, "mode": mode, "profile": profile}); err != nil {
+			map[string]any{"device_id": deviceID, "reason": req.Reason, "mode": mode, "profile": profile,
+				"control": req.Control, "maintenance": req.Maintenance}); err != nil {
 			return fmt.Errorf("audit: %w", err)
+		}
+		// Передача управления — отдельная строка журнала ввода (§9.21 п.3): окно
+		// неатрибутируемости считается от неё и до возврата.
+		if req.Control {
+			if err := s.st.inputEvent(ctx, q, sid, "control_granted", "", 1, 0); err != nil {
+				return fmt.Errorf("input log: %w", err)
+			}
 		}
 		sess, err = s.st.get(ctx, q, sid)
 		if err != nil {
@@ -234,6 +248,8 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 				SessionId:         sid,
 				Profile:           profile,
 				ConsentRequired:   mode == "consent_required",
+				AllowInput:        req.Control,
+				Maintenance:       req.Maintenance,
 				OperatorName:      email,
 				Reason:            req.Reason,
 				MaxDurationSec:    int32(s.cfg.MaxDuration / time.Second),
@@ -400,10 +416,6 @@ func (s *Service) httpStop(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit(r.Context(), tenantID, userID, email, "screen_session_stop", id, map[string]any{"device_id": sess.DeviceID})
 	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Service) httpNoControl(w http.ResponseWriter, _ *http.Request) {
-	writeErr(w, http.StatusConflict, "control_not_granted")
 }
 
 func (s *Service) httpRecording(w http.ResponseWriter, r *http.Request) {
