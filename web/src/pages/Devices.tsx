@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input"
 import { Select } from "@/components/ui/select"
 import { formatDistanceToNow } from "@/lib/time"
 import { useMe } from "@/lib/useMe"
+import { fetchSetup, saveBlob, SetupUnavailableError } from "@/lib/setupBundle"
 
 type DialogStep = "form" | "token"
 
@@ -95,6 +96,8 @@ export default function Devices() {
   const [creating, setCreating] = useState(false)
   const [result, setResult] = useState<CreateDeviceResponse | null>(null)
   const [copied, setCopied] = useState(false)
+  const [setupBusy, setSetupBusy] = useState(false)
+  const [setupError, setSetupError] = useState("")
   const [arch, setArch] = useState("amd64")
   const [query, setQuery] = useState("")
   const [offset, setOffset] = useState(0)
@@ -158,6 +161,7 @@ export default function Devices() {
     setResult(null)
     setCopied(false)
     setCreating(false)
+    setSetupError("")
   }
 
   async function createDevice() {
@@ -193,6 +197,28 @@ export default function Devices() {
         `-server ${serverAddr} -server-name routineops-server`
     }
     return `agent enroll -enroll-url ${base}/api/v1/enroll -token ${result.enrollment_token}`
+  }
+
+  // Установщик одним файлом: stub + MSI + параметры этого устройства, склеенные в браузере.
+  async function downloadSetup() {
+    if (!result) return
+    const base = apiBase()
+    setSetupBusy(true)
+    setSetupError("")
+    try {
+      const blob = await fetchSetup(base, {
+        enroll_url: `${base}/api/v1/enroll`,
+        enroll_token: result.enrollment_token,
+        ca_url: `${base}/ca.crt`,
+        ca_sha256: result.ca_sha256,
+        server_addr: `${window.location.hostname}:50051`,
+      })
+      saveBlob(blob, "RoutineOps-setup.exe")
+    } catch (e) {
+      setSetupError(e instanceof SetupUnavailableError ? t("devices.downloadSetupMissing") : t("devices.downloadSetupFail"))
+    } finally {
+      setSetupBusy(false)
+    }
   }
 
   async function copyCommand() {
@@ -280,9 +306,16 @@ export default function Devices() {
                   <p>Token: <span className="font-mono">{result.enrollment_token}</span></p>
                 </div>
                 {result.device.os === "windows" ? (
-                  <a href={`${apiBase()}/downloads/RoutineOps-agent.msi`} download className="block">
-                    <Button variant="outline" className="w-full">{t("devices.downloadMSI")}</Button>
-                  </a>
+                  <div className="space-y-2">
+                    <Button className="w-full" onClick={downloadSetup} disabled={setupBusy}>
+                      {setupBusy ? t("devices.downloadSetupBusy") : t("devices.downloadSetup")}
+                    </Button>
+                    <p className="text-xs text-muted-foreground">{t("devices.downloadSetupHint")}</p>
+                    {setupError && <p className="text-xs text-red-600 dark:text-red-500">{setupError}</p>}
+                    <a href={`${apiBase()}/downloads/RoutineOps-agent.msi`} download className="block">
+                      <Button variant="outline" className="w-full">{t("devices.downloadMSI")}</Button>
+                    </a>
+                  </div>
                 ) : result.device.os === "darwin" ? (
                   <a href={`${apiBase()}/downloads/RoutineOps-agent.pkg`} download className="block">
                     <Button variant="outline" className="w-full">{t("devices.downloadPKG")}</Button>
