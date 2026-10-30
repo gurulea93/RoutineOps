@@ -67,7 +67,7 @@ func TestUninstallMethodFor(t *testing.T) {
 			// вернёт 1605 — метод давать нельзя.
 			"GUID-ключ без признаков MSI",
 			uninstallEntry{keyName: productCode, scope: ScopeMachine, uninstallString: `C:\Program Files\App\uninst.exe`},
-			UninstallNone,
+			UninstallWindowsQuiet, // не msiexec; запускается деинсталлятор приложения
 		},
 		{
 			// Помечено как MSI, но адресовать msiexec нечем — падаем в фолбэк.
@@ -86,10 +86,11 @@ func TestUninstallMethodFor(t *testing.T) {
 			UninstallWindowsQuiet,
 		},
 		{
-			// Главный fail-safe: интерактивный визард в session 0 повиснет невидимо.
+			// Интерактивный визард в session 0 повис бы невидимо, поэтому агент открывает его
+			// в сеансе пользователя (uninstall.execute); метод остаётся windows_quiet.
 			"только интерактивный UninstallString",
 			uninstallEntry{keyName: "LegacyApp", scope: ScopeMachine, uninstallString: `C:\legacy\setup.exe -remove`},
-			UninstallNone,
+			UninstallWindowsQuiet,
 		},
 		{
 			"вообще нет команды удаления",

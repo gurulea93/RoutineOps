@@ -4,6 +4,7 @@ package uninstall
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Floodww/RoutineOps/internal/agent/collector"
 	"github.com/Floodww/RoutineOps/internal/agent/silentuninstall"
+	"github.com/Floodww/RoutineOps/internal/agent/winsession"
 )
 
 // Ветки ARP, из которых коллектор читает установленное ПО. Ищем строку снятия
@@ -55,11 +57,15 @@ func execute(ctx context.Context, target collector.Software, log *slog.Logger) (
 
 	case collector.UninstallWindowsQuiet:
 		argv, err := quietArgv(target.UninstallID)
-		if err != nil {
+		if err == nil {
+			log.Info("uninstall: quiet", slog.String("exe", argv[0]))
+			return runCommand(ctx, argv[0], argv[1:], nil)
+		}
+		if !errors.Is(err, errNoSilent) {
 			return "", err
 		}
-		log.Info("uninstall: quiet", slog.String("exe", argv[0]))
-		return runCommand(ctx, argv[0], argv[1:], nil)
+		// Тихой команды нет: открываем штатный деинсталлятор на экране пользователя.
+		return launchInteractive(target.UninstallID, log)
 
 	default:
 		return "", fmt.Errorf("способ снятия %q не поддержан на Windows", target.UninstallMethod)
@@ -84,7 +90,36 @@ func quietArgv(keyName string) ([]string, error) {
 	if argv, ok := silentuninstall.Derive(us, readFileHead); ok {
 		return argv, nil
 	}
-	return nil, fmt.Errorf("в реестре больше нет тихого деинсталлятора для %q (запись изменилась после снимка)", keyName)
+	return nil, fmt.Errorf("%w: %q", errNoSilent, keyName)
+}
+
+// errNoSilent — тихой команды вывести нельзя; не сбой, а повод открыть деинсталлятор в
+// сеансе пользователя.
+var errNoSilent = errors.New("тихая команда снятия недоступна")
+
+// launchInteractive запускает UninstallString из реестра этой машины в активной
+// консольной сессии (под SYSTEM — как захватчик экрана, чтобы права и UAC не мешали) и НЕ
+// ждёт его завершения: человек доводит визард через удалённый экран. Итог определяет
+// повторный снимок ПО, так что открытый визард честно даст «осталось на машине».
+func launchInteractive(keyName string, log *slog.Logger) (string, error) {
+	us, err := readRegistryString(keyName, "UninstallString")
+	if err != nil {
+		return "", err
+	}
+	argv, err := windows.DecomposeCommandLine(us)
+	if err != nil || len(argv) == 0 {
+		return "", fmt.Errorf("UninstallString из реестра неразбираем: %v", err)
+	}
+	h, err := winsession.LaunchInActiveSessionOpts(argv[0], argv[1:], winsession.Options{AsSystem: true})
+	if err != nil {
+		if errors.Is(err, winsession.ErrNoActiveSession) {
+			return "", fmt.Errorf("тихого снятия нет, а на машине никто не вошёл в систему: деинсталлятор негде показать")
+		}
+		return "", fmt.Errorf("не удалось открыть деинсталлятор в сеансе пользователя: %w", err)
+	}
+	_ = windows.CloseHandle(h)
+	log.Info("uninstall: деинсталлятор открыт в сеансе пользователя", slog.String("exe", argv[0]))
+	return "деинсталлятор открыт на экране пользователя — завершите удаление через удалённый экран", nil
 }
 
 // readFileHead — начало файла для поиска подписи установщика (см. silentuninstall).
