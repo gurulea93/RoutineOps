@@ -57,7 +57,7 @@ func TestProfileByName(t *testing.T) {
 	if p, fb := ProfileByName("medium"); p.FPS != 2 || p.MaxSide != 1920 || fb {
 		t.Fatal("medium")
 	}
-	if p, fb := ProfileByName("ultra"); p.Name != "low" || !fb {
+	if p, fb := ProfileByName("bogus"); p.Name != "low" || !fb {
 		t.Fatal("unknown profile must fall back to low with flag")
 	}
 	if _, fb := ProfileByName(""); fb {
