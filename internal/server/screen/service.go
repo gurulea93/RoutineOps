@@ -290,6 +290,7 @@ func (r *streamRun) start(ctx context.Context, hello *pb.SessionHello) (reason, 
 		relay, err := s.rtc.NewRelaySession(r.sess.ID, SessionOptions{
 			SendToAgent: r.hub.sendSignal,
 			Recorder:    r.webm.rec,
+			Log:         s.log,
 			OnClose: func(reason string) {
 				select {
 				case r.hub.stop <- reason:
