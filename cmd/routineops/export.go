@@ -72,9 +72,11 @@ func exportConfig(c *client, scriptsDir string) (*Config, map[string]string, err
 		if scriptsDir == "" {
 			item.Content = s.Content
 		} else {
-			rel := filepath.Join(scriptsDir, slug(s.Name)+scriptExt(s.Platform))
+			// Ключ — всегда со слэшами (как в YAML): на Windows Join даёт обратные, и карта
+			// расходилась бы со ссылкой в конфиге. filepath.Join при записи их понимает.
+			rel := filepath.ToSlash(filepath.Join(scriptsDir, slug(s.Name)+scriptExt(s.Platform)))
 			files[rel] = s.Content
-			item.File = filepath.ToSlash(rel)
+			item.File = rel
 		}
 		cfg.Scripts = append(cfg.Scripts, item)
 	}
