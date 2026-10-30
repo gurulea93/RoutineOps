@@ -32,6 +32,9 @@ export interface FramePart {
   seq: number
   keyframe: boolean
   last: boolean
+  /** Мониторов у машины (0 — агент не сообщил) и номер показанного. */
+  displays: number
+  display: number
   width: number
   height: number
   tiles: Tile[]
@@ -63,6 +66,8 @@ export function parseFramePart(buf: Uint8Array): FramePart {
     seq: view.getUint32(4),
     keyframe: (flags & FLAG_KEYFRAME) !== 0,
     last: (flags & FLAG_LAST) !== 0,
+    displays: (flags >> 2) & 0xf,
+    display: (flags >> 6) & 0xf,
     width: view.getUint16(12),
     height: view.getUint16(14),
     tiles: [],

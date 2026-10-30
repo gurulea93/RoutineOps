@@ -34,6 +34,12 @@ const (
 	FlagKeyframe uint16 = 1 << 0
 	FlagLast     uint16 = 1 << 1
 
+	// Биты 2–5 — сколько мониторов у машины (0 = агент не сообщает), биты 6–9 — номер
+	// того, что сейчас показан. Старые разборщики эти биты игнорируют.
+	flagDisplaysShift = 2
+	flagDisplayShift  = 6
+	flagDisplayMask   = 0xF
+
 	// MaxPartBytes — потолок части: MaxRecvMsgSize gRPC-сервера (4 MiB) общий на весь
 	// сервер и не трогается, поэтому кадр режется на части по 256 KiB (proto SessionFrame).
 	MaxPartBytes = 256 << 10
@@ -54,6 +60,8 @@ type Part struct {
 	Seq      uint32
 	Keyframe bool
 	Last     bool
+	Displays uint8 // мониторов у машины; 0 — агент не сообщил
+	Display  uint8 // номер показанного
 	Width    uint16
 	Height   uint16
 	Tiles    []Tile
@@ -114,6 +122,8 @@ func ParsePart(b []byte) (Part, error) {
 		Seq:      binary.BigEndian.Uint32(b[4:]),
 		Keyframe: flags&FlagKeyframe != 0,
 		Last:     flags&FlagLast != 0,
+		Displays: uint8(flags >> flagDisplaysShift & flagDisplayMask),
+		Display:  uint8(flags >> flagDisplayShift & flagDisplayMask),
 		Width:    binary.BigEndian.Uint16(b[12:]),
 		Height:   binary.BigEndian.Uint16(b[14:]),
 	}
@@ -227,4 +237,17 @@ func ParseRecords(b []byte) ([]Record, error) {
 		off += l
 	}
 	return out, nil
+}
+
+// SetDisplayInfo вписывает в заголовок готовой части число мониторов и номер текущего
+// (оба 0..15). Часть короче заголовка не трогается.
+func SetDisplayInfo(part []byte, count, cur int) {
+	if len(part) < HeaderLen {
+		return
+	}
+	f := binary.BigEndian.Uint16(part[8:])
+	f &^= flagDisplayMask<<flagDisplaysShift | flagDisplayMask<<flagDisplayShift
+	f |= uint16(min(max(count, 0), flagDisplayMask))<<flagDisplaysShift |
+		uint16(min(max(cur, 0), flagDisplayMask))<<flagDisplayShift
+	binary.BigEndian.PutUint16(part[8:], f)
 }

@@ -571,13 +571,7 @@ export default function DeviceDetail() {
                   скелетом (агент апсертит строку heartbeat'ом в gateway) и сиротеет.
                   Сначала «Вывести из эксплуатации» снимает агента, потом чистим запись.
                   Never-connected удаляют в EnrollmentQueue — там свой гард по last_seen. */}
-              {/* Агент, который сам себя больше не подтвердит (переустановили ОС, сняли вручную,
-                  ушла старая 32-битная сборка), навсегда оставляет запись в «ожидает». Поэтому
-                  чистить запись можно и у устройства, молчащего более 10 минут; живой агент
-                  воскресит её следующим heartbeat'ом — это сказано в тексте подтверждения. */}
-              {(device.status === "decommissioned" ||
-                !device.last_seen_at ||
-                Date.now() - new Date(device.last_seen_at).getTime() > 10 * 60 * 1000) && (
+              {device.status === "decommissioned" && (
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem destructive disabled={deleting} onSelect={() => setConfirmDelete(true)}>
