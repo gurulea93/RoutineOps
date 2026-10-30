@@ -50,6 +50,9 @@ type session struct {
 	// inputOn — управление ещё у оператора. Выставляется приглашением и только снимается
 	// (возврат управления = сужение), обратно не включается.
 	inputOn atomic.Bool
+
+	// display — монитор, который агент уже просил показывать (0 — основной, как при старте).
+	display atomic.Int32
 }
 
 func newSession(parent context.Context, cmd *pb.ScreenSessionCommand) *session {

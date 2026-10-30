@@ -161,7 +161,7 @@ func handleNarrow(s *session, req *pb.ScreenScope, ctl *ctlWriter, log *slog.Log
 	}
 	// Один выбранный экран из приглашённых — это переключение монитора: захватчик
 	// пересоздаётся. Список из нескольких экранов оставляет текущий как есть.
-	if ds := req.GetDisplays(); len(ds) == 1 && ctl != nil {
+	if ds := req.GetDisplays(); len(ds) == 1 && ctl != nil && s.display.Swap(ds[0]) != ds[0] {
 		b, _ := json.Marshal(wireDisplay{Index: int(ds[0])})
 		if err := ctl.send(msgDisplay, b); err != nil {
 			log.Warn("screen: display switch not delivered", "session_id", s.id, "err", err)
