@@ -341,10 +341,15 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       while (!stopRef.current && gen === genRef.current) {
         let res
         try {
+          // 🔴 В WebRTC-сеансе RSF1-кадров нет, и длинный опрос ждал бы все 20 секунд, прежде
+          // чем вернуть пустой 200 — а именно он запускает WebRTC (startRtc ниже). Оператор
+          // видел «Ждём агента…» и чёрный экран, а при остановке раньше 20-й секунды WebRTC
+          // не стартовал вовсе. Пока WebRTC не запущен, опрашиваем коротко.
+          const waitMs = transportRef.current === "webrtc" && !rtcRef.current ? 1000 : WAIT_MS
           res = await api.get<ArrayBuffer>(`/screen-sessions/${sessionId}/live`, {
-            params: { since, wait: WAIT_MS },
+            params: { since, wait: waitMs },
             responseType: "arraybuffer",
-            timeout: WAIT_MS + 15000,
+            timeout: waitMs + 15000,
           })
         } catch (e) {
           if (errStatus(e) === 410) {
@@ -367,6 +372,8 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         // Первый не-202 ответ = стрим зарегистрирован в хабе. Только с этого момента
         // ввод есть кому принять — до него петля отправки не запускается вовсе.
         setStreamOpen(true)
+        // Стрим открыт — «Ждём агента…» устарело и не должно висеть поверх видео.
+        setStatus((cur) => (cur === t("screenSession.waitingAgent") ? "" : cur))
         if (transportRef.current === "webrtc") void startRtc(sessionId)
 
         const w = Number(res.headers["x-screen-width"] || 0)
