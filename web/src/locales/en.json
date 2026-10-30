@@ -1483,6 +1483,7 @@
     "qualityAuto": "Quality: maximum",
     "qualityLow": "Low · 1 fps",
     "qualityMedium": "Medium · 2 fps",
+    "qualityUltra": "Maximum (30 fps)",
     "qualityHigh": "High · 10 fps",
     "recordingForbidden": "Viewing recordings requires a grant — an administrator issues it on the Screen access page",
     "recordingLocked": "Recorded, no access",
@@ -1543,6 +1544,8 @@
     "profileHint": "A ceiling for every session of this tenant. Operators cannot request more — but on a narrow link the ceiling is worth lowering.",
     "profileSaved": "Quality ceiling changed",
     "profile": {
+      "ultra": "30 frames per second, native resolution up to 4K",
+      "ultraHint": "Live feel: sharp text and smooth motion. Needs a good link and CPU headroom on server and agent; almost no traffic when idle.",
       "high": "10 frames per second, up to 1920 px",
       "highHint": "Default. For mouse control: the cursor keeps up. Needs a decent link (up to ~12 Mbit/s per session, usually ~2).",
       "medium": "2 frames per second, up to 1920 px",

@@ -149,8 +149,8 @@ type createReq struct {
 // pickProfile — профиль сеанса: запрошенный оператором, но не выше потолка тенанта.
 // Неизвестное значение трактуется как «не просили» (потолок), неизвестный потолок — как low.
 func pickProfile(requested, tenantCap string) string {
-	rank := map[string]int{"low": 0, "medium": 1, "high": 2}
-	names := []string{"low", "medium", "high"}
+	rank := map[string]int{"low": 0, "medium": 1, "high": 2, "ultra": 3}
+	names := []string{"low", "medium", "high", "ultra"}
 	capRank, ok := rank[tenantCap]
 	if !ok {
 		capRank = 0
@@ -722,7 +722,7 @@ func (s *Service) httpSetProfileCap(w http.ResponseWriter, r *http.Request) {
 		ProfileCap string `json:"profile_cap"`
 	}
 	s.setTenantValue(w, r, &req, func() (string, bool) {
-		return req.ProfileCap, req.ProfileCap == "low" || req.ProfileCap == "medium" || req.ProfileCap == "high"
+		return req.ProfileCap, req.ProfileCap == "low" || req.ProfileCap == "medium" || req.ProfileCap == "high" || req.ProfileCap == "ultra"
 	}, "screen_profile_cap_changed", s.st.setProfileCap)
 }
 

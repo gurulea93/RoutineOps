@@ -14,6 +14,8 @@ func TestPickProfile(t *testing.T) {
 		{"bogus", "medium", "medium"},
 		{"medium", "bogus", "low"},
 		{"", "", "low"},
+		{"ultra", "ultra", "ultra"},
+		{"ultra", "high", "high"},
 	}
 	for _, c := range cases {
 		if got := pickProfile(c.req, c.cap); got != c.want {

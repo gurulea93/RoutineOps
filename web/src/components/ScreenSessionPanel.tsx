@@ -808,6 +808,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
             <option value="low">{t("screenSession.qualityLow")}</option>
             <option value="medium">{t("screenSession.qualityMedium")}</option>
             <option value="high">{t("screenSession.qualityHigh")}</option>
+            <option value="ultra">{t("screenSession.qualityUltra")}</option>
           </select>
           {displays.count > 1 && (
             <select
@@ -980,6 +981,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                 <option value="low">{t("screenSession.qualityLow")}</option>
                 <option value="medium">{t("screenSession.qualityMedium")}</option>
                 <option value="high">{t("screenSession.qualityHigh")}</option>
+                <option value="ultra">{t("screenSession.qualityUltra")}</option>
               </select>
               <Button size="sm" disabled={starting} onClick={start}>
                 {starting ? "…" : wantControl ? t("screenSession.connectControl") : t("screenSession.connect")}

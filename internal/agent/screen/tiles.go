@@ -41,6 +41,11 @@ var (
 	// пауза до 0.5 с, чтобы картинка не отставала от курсора. Решение проекта, а не замер.
 	ProfileHigh = Profile{Name: "high", FPS: 10, MaxSide: 1920, Quality: 70,
 		MaxBitsPerSec: 12_000_000, MaxPause: 500 * time.Millisecond}
+	// ultra — «как вживую»: 30 к/с, родное разрешение (до 4K), JPEG quality 88. Рассчитан на
+	// LAN и хороший офисный канал; бюджет 80 Мбит/с — потолок, а не ожидаемая нагрузка:
+	// в покое уходят только заголовки, а изменившиеся тайлы — десятки КБ.
+	ProfileUltra = Profile{Name: "ultra", FPS: 30, MaxSide: 3840, Quality: 88,
+		MaxBitsPerSec: 80_000_000, MaxPause: 250 * time.Millisecond}
 )
 
 // ProfileByName — неизвестное имя даёт low и fallback=true: агент не роняет сеанс из-за
@@ -53,6 +58,8 @@ func ProfileByName(name string) (p Profile, fallback bool) {
 		return ProfileMedium, false
 	case "high":
 		return ProfileHigh, false
+	case "ultra":
+		return ProfileUltra, false
 	default:
 		return ProfileLow, true
 	}

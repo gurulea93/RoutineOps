@@ -62,10 +62,10 @@ func virtualPos(rect monitorRect, vx, vy, vw, vh, cx, cy, fw, fh int) (x, y int3
 	return int32(min(max(nx, 0), 65535)), int32(min(max(ny, 0), 65535)), true
 }
 
-// Коды профилей в ScreenScope.displays: profileCodeBase+1 low, +2 medium, +3 high.
+// Коды профилей в ScreenScope.displays: profileCodeBase+1 low, +2 medium, +3 high, +4 ultra.
 const profileCodeBase = 100
 
-var profileByCode = map[int32]string{profileCodeBase + 1: "low", profileCodeBase + 2: "medium", profileCodeBase + 3: "high"}
+var profileByCode = map[int32]string{profileCodeBase + 1: "low", profileCodeBase + 2: "medium", profileCodeBase + 3: "high", profileCodeBase + 4: "ultra"}
 
 // splitProfileCode отделяет коды профилей от номеров экранов. Исходное сообщение не меняется.
 func splitProfileCode(in *pb.ScreenScope) (*pb.ScreenScope, string) {

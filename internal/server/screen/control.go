@@ -373,6 +373,8 @@ func profileCode(name string) int32 {
 		return 102
 	case "high":
 		return 103
+	case "ultra":
+		return 104
 	}
 	return 0
 }
