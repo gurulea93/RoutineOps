@@ -459,6 +459,9 @@ docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
 # образов проверять нечего: установщики либо лежат в образе агентов, либо о них уже
 # предупредил publish-agents.sh.
 [ -f build/msi/RoutineOps-agent.msi ] || echo "MSI: build/msi/RoutineOps-agent.msi нет — Windows-установка через MSI недоступна (собрать: build/msi/build-msi.ps1 на Windows)"
+if [ -f build/msi/RoutineOps-agent.msi ] && [ "$(cat build/msi/RoutineOps-agent.msi.version 2>/dev/null)" != "$(cat AGENT_VERSION)" ]; then
+  echo "⚠ MSI собран для агента '$(cat build/msi/RoutineOps-agent.msi.version 2>/dev/null || echo ?)', а AGENT_VERSION=$(cat AGENT_VERSION): новые установки начнут со старого агента (потом он обновится сам). Пересобрать: scripts/build-windows-vpx.ps1 на ПК"
+fi
 [ -f build/pkg/RoutineOps-agent.pkg ] || echo "PKG: build/pkg/RoutineOps-agent.pkg нет — macOS-установка через PKG недоступна (собрать: make pkg-mac-native НА маке)"
 fi
 

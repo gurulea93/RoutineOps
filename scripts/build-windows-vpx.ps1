@@ -57,5 +57,22 @@ $hash = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
 [IO.File]::WriteAllText((Join-Path $root "$out.sha256"), "$hash  agent_windows_amd64_vpx.exe`n")
 [IO.File]::WriteAllText((Join-Path $root "$out.version"), "v$ver")
 Write-Host "Done: $out (v$ver, sha256 $hash)"
-Write-Host "Copy three files to the server into ~/RoutineOps/build/windows/: .exe, .exe.sha256, .exe.version, then:"
-Write-Host "  cd ~/RoutineOps && git pull && SKIP_DARWIN=1 ./install.sh"
+
+# The installer (MSI) must carry the same agent, otherwise fresh installs start on an old
+# version. Build it here in the same run, so there is no separate step to forget.
+$msiOk = $false
+try {
+  & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root "build\msi\build-msi.ps1") `
+    -ExePath (Join-Path $root $out) -Version "$ver.0"
+  $msiOk = ($LASTEXITCODE -eq 0)
+} catch {
+  Write-Warning "MSI build failed: $_"
+}
+if ($msiOk) { Write-Host "MSI: build\msi\RoutineOps-agent.msi (v$ver)" }
+else { Write-Warning "MSI was NOT rebuilt - new installs will start on an older agent until it is." }
+
+Write-Host ""
+Write-Host "Next:"
+Write-Host "  1. Upload $out in the panel (Screen access, Windows agent with VP8), version $ver"
+Write-Host "  2. git add build/msi; git commit -m 'MSI $ver'; git push origin HEAD:main"
+Write-Host "  3. On the server: cd ~/RoutineOps && git pull && SKIP_DARWIN=1 ./install.sh"
