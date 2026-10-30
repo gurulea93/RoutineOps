@@ -143,3 +143,5 @@ cmd/setup/rsrc_windows_amd64.syso
 # VP8-агент Windows, собранный на ПК (scripts/build-windows-vpx.ps1): коммитится осознанно,
 # install.sh публикует его вместо обычной сборки, если версия и sha256 совпали.
 !build/windows/*.exe
+
+build/msi/*.wixpdb

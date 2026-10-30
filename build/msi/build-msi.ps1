@@ -26,6 +26,16 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+# Пути из параметров разрешаем от ТЕКУЩЕГО каталога вызывающего, а сам wix запускаем из
+# каталога скрипта (см. ниже): так скрипт работает откуда угодно, а не только из build\msi.
+function Get-FullPath([string]$p) {
+  # GetFullPath(path, base) нет в Windows PowerShell 5.1 (.NET Framework) - собираем сами.
+  if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path (Get-Location).ProviderPath $p }
+  return [IO.Path]::GetFullPath($p)
+}
+$ExePath = Get-FullPath $ExePath
+$Out = Get-FullPath $Out
+
 if (-not (Test-Path $ExePath)) {
   throw "Не найден бинарь агента: $ExePath. Соберите его: make build-win (CGO_ENABLED=0)."
 }
@@ -67,11 +77,19 @@ Write-Host "Сборка MSI ($Version)..."
 # файлом — а он ещё и уедет в релиз как новый.
 $before = (Get-Item $Out -ErrorAction SilentlyContinue).LastWriteTimeUtc
 
-wix build "$PSScriptRoot/mdm-agent.wxs" `
-  -d Version=$Version `
-  -ext WixToolset.Util.wixext `
-  -arch x64 `
-  -o $Out
+# Относительные пути в mdm-agent.wxs (icon.ico, mdm-agent.exe, uninstall.bat) wix разрешает
+# от текущего каталога, а не от каталога .wxs. Поэтому всегда собираем из каталога скрипта
+# (иначе запуск из корня репо давал WIX0103).
+Push-Location $PSScriptRoot
+try {
+  wix build "$PSScriptRoot/mdm-agent.wxs" `
+    -d Version=$Version `
+    -ext WixToolset.Util.wixext `
+    -arch x64 `
+    -o $Out
+} finally {
+  Pop-Location
+}
 
 # Провал wix обязан валить скрипт. Раньше его код возврата не проверялся вовсе:
 # при ошибке WIX0103 (относительные пути в .wxs не разрешились — так бывает,
@@ -87,6 +105,8 @@ if ($before -and $built.LastWriteTimeUtc -le $before) {
 Write-Host ("MSI собран: " + $Out)
 Write-Host ("  версия:  " + $Version)
 Write-Host ("  sha256:  " + (Get-FileHash $Out -Algorithm SHA256).Hash)
+# Метка версии рядом с MSI: install.sh по ней предупреждает, что MSI отстал от AGENT_VERSION.
+[IO.File]::WriteAllText("$Out.version", ($Version -replace '\.0$', ''))
 
 # Подпись (опционально). Подход согласован с gen-win-codesign.ps1.
 if ($PfxPath) {
