@@ -1487,7 +1487,7 @@
     "display": "Display",
     "displayN": "Display {{n}}",
     "quality": "Quality",
-    "qualityAuto": "Quality: maximum",
+    "qualityAuto": "Auto (organization limit)",
     "qualityLow": "Low · 1 fps",
     "qualityMedium": "Medium · 2 fps",
     "rtcFailed": "The video stream could not be established (is UDP to the server blocked?). Close the session and retry.",
