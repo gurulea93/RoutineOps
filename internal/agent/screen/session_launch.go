@@ -23,6 +23,18 @@ type wireConfig struct {
 	Reason         string `json:"reason"`
 	MaxDurationSec int    `json:"max_duration_sec"`
 	AllowInput     bool   `json:"allow_input,omitempty"`
+
+	// WebRTC (Этап B): transport="webrtc" → worker сам держит PeerConnection и шлёт VP8;
+	// сигнализация идёт через службу (msgSignal/msgSignalIn).
+	Transport string    `json:"transport,omitempty"`
+	Codec     string    `json:"codec,omitempty"`
+	ICE       []wireICE `json:"ice,omitempty"`
+}
+
+type wireICE struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
 }
 
 // workerProc — запущенный захватчик и его концы канала (wire.go).

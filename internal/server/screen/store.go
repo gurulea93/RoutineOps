@@ -5,6 +5,7 @@ package screen
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,6 +47,8 @@ type SessionRow struct {
 	ConsentAt                *time.Time `json:"consent_at"`
 	Control                  bool       `json:"control"`
 	ControlReturnedAt        *time.Time `json:"control_returned_at"`
+	// RecordingFormat — "rsf" (тайлы, играет RecordingPlayer) или "webm" (видео, <video>).
+	RecordingFormat string `json:"recording_format,omitempty"`
 
 	recordingPath string
 }
@@ -69,6 +72,10 @@ func scanSession(row pgx.Row) (*SessionRow, error) {
 	}
 	if path != nil && *path != "" {
 		s.recordingPath = *path
+		s.RecordingFormat = "rsf"
+		if strings.HasSuffix(*path, ".webm") {
+			s.RecordingFormat = "webm"
+		}
 		s.HasRecording = s.RecordingBytes > 0
 	}
 	return &s, nil

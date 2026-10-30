@@ -35,6 +35,9 @@ type session struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	// onSignal — куда readPipe отдаёт сигнал от worker'а (msgSignal); nil — сигналов не ждём.
+	onSignal func([]byte)
+
 	mu        sync.Mutex
 	state     SessionState
 	endReason EndReason

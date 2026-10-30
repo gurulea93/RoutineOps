@@ -38,6 +38,9 @@ func (r *screenRuntime) capabilities() []string {
 	if screen.InputAvailable() {
 		caps = append(caps, "screen_control")
 	}
+	// screen_webrtc_vp8 — только в сборке с libvpx (тег vpx); без неё список пуст и сервер
+	// отдаёт сеансы по RSF1.
+	caps = append(caps, screen.VideoCapabilities()...)
 	return caps
 }
 

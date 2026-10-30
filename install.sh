@@ -187,6 +187,16 @@ if bash scripts/env-db-roles.sh .env.prod; then :; else
   exit 1
 fi
 
+# WebRTC-relay удалённого стола (VP8). Идемпотентно: .env.prod создаётся один раз, а порт
+# нужен и существующим установкам. Адрес для кандидатов ICE — только IPv4 (имя хоста в SDP
+# браузер не примет; с доменом relay не стартует, и сеансы идут по RSF1).
+if ! grep -q '^SCREEN_RTC_UDP=' .env.prod; then
+  printf 'SCREEN_RTC_UDP=:50052\n' >> .env.prod
+  if printf '%s' "${PUBLIC_IP:-}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    printf 'SCREEN_RTC_PUBLIC_IPS=%s\n' "${PUBLIC_IP}" >> .env.prod
+  fi
+fi
+
 # .env.prod создаётся только при отсутствии (выше) — значит смена адреса его не трогает,
 # и PUBLIC_WEB_URL остаётся со старым: ломаются ссылки на скачивание агентов и инвайты.
 # Критерий — не «совпадает с PUBLIC_IP», а «покрыт ли этот хост сертом»: PUBLIC_WEB_URL
@@ -324,6 +334,19 @@ docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
       # shellcheck disable=SC2086
       set -- $pair; OS=$1; ARCH=$2
       echo "  → $OS/$ARCH"
+      # VP8: Windows-агент с libvpx (CGO) в контейнере сервера не собрать — его собирают на ПК
+      # скриптом scripts/build-windows-vpx.ps1 и кладут в build/windows/. Годится, только если
+      # версия и sha256 совпали с текущими; иначе публикуется обычная сборка (RSF1).
+      VPX=build/windows/agent_windows_amd64_vpx.exe
+      if [ "$OS" = "windows" ] && [ "$ARCH" = "amd64" ] && [ -f "$VPX" ]; then
+        if [ "$(cat "$VPX.version" 2>/dev/null)" = "v${V}" ] && ( cd build/windows && sha256sum -c agent_windows_amd64_vpx.exe.sha256 >/dev/null 2>&1 ); then
+          echo "    сборка с VP8 (libvpx) из $VPX"
+          sh scripts/agent-edition-guard.sh "$BUILD_TAGS" "$VPX" "$OS/$ARCH (vpx)"
+          go run ./cmd/publish-release -binary "$VPX" -version "v${V}" -os "$OS" -arch "$ARCH" -key release_ed25519.pem
+          continue
+        fi
+        echo "    ⚠ $VPX не соответствует v${V} (версия или sha256) — публикую обычную сборку без VP8"
+      fi
       EXTRA_LDFLAGS=""
       if [ "$OS" = "windows" ]; then
         # Манифест Common-Controls v6: без него lxn/walk ПАНИКУЕТ при создании окна

@@ -38,6 +38,11 @@ type Service struct {
 	hubs  hubs
 	log   *slog.Logger
 	timer sync.WaitGroup
+
+	// WebRTC (Этап B). rtc == nil — транспорт выключен, все сеансы идут по RSF1.
+	// rtcPending — сеансы, которым при создании выбран webrtc: Stream берёт их по id.
+	rtc        *RTC
+	rtcPending sync.Map
 }
 
 // Config — параметры сервиса. Нулевые значения заменяются умолчаниями.
@@ -51,7 +56,12 @@ type Config struct {
 	ViewerTimeout   time.Duration // 0 → 60 с
 	MaxDuration     time.Duration // 0 → 1 ч (потолок сервера; агент держит свой)
 	StartTimeout    time.Duration // 0 → 2 мин: приглашение без hello
-	Logger          *slog.Logger
+
+	// RTCUDPAddr — UDP-порт WebRTC-relay (":50052"). Пусто — WebRTC выключен, только RSF1.
+	// RTCPublicIPs — адреса сервера для кандидатов ICE (сервер в docker/за NAT).
+	RTCUDPAddr   string
+	RTCPublicIPs []string
+	Logger       *slog.Logger
 }
 
 func New(cfg Config) (*Service, error) {
@@ -82,7 +92,18 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Service{cfg: cfg, st: store{db: cfg.DB}, log: cfg.Logger.With("component", "screen")}, nil
+	s := &Service{cfg: cfg, st: store{db: cfg.DB}, log: cfg.Logger.With("component", "screen")}
+	if cfg.RTCUDPAddr != "" {
+		rtc, err := NewRTC(RTCConfig{UDPAddr: cfg.RTCUDPAddr, PublicIPs: cfg.RTCPublicIPs})
+		if err != nil {
+			// Не роняем сервер: без WebRTC остаётся RSF1.
+			s.log.Error("screen: webrtc relay not started, RSF1 only", "err", err)
+		} else {
+			s.rtc = rtc
+			s.log.Info("screen: webrtc relay enabled", "udp", cfg.RTCUDPAddr, "public_ips", cfg.RTCPublicIPs)
+		}
+	}
+	return s, nil
 }
 
 var (
@@ -201,6 +222,8 @@ type streamRun struct {
 	deviceID string
 	hub      *hub
 	rec      *rsfRecorder
+	webm     *webmRecording // запись сеанса WebRTC (вместо rec)
+	relay    *RelaySession
 	started  time.Time
 	c        counters
 	maxLagMs int64
@@ -222,7 +245,13 @@ func (r *streamRun) start(ctx context.Context, hello *pb.SessionHello) (reason, 
 		r.markTruncated(truncTenantQuota)
 		return "RECORDING_QUOTA", "tenant recording quota exhausted"
 	}
-	r.rec, err = newRSFRecorder(s.cfg.RecordingDir, r.sess.ID, s.cfg.MaxSessionBytes, s.cfg.TenantQuota-used)
+	_, rtcMode := s.rtcPending.LoadAndDelete(r.sess.ID)
+	rtcMode = rtcMode && s.rtc != nil
+	if rtcMode {
+		r.webm, err = newWebmRecording(s.cfg.RecordingDir, r.sess.ID, min(s.cfg.MaxSessionBytes, s.cfg.TenantQuota-used))
+	} else {
+		r.rec, err = newRSFRecorder(s.cfg.RecordingDir, r.sess.ID, s.cfg.MaxSessionBytes, s.cfg.TenantQuota-used)
+	}
 	if err != nil {
 		r.markTruncated(truncIOError)
 		return "RECORDING_FAILED", err.Error()
@@ -251,6 +280,24 @@ func (r *streamRun) start(ctx context.Context, hello *pb.SessionHello) (reason, 
 	}
 
 	r.started = time.Now()
+	if rtcMode {
+		// Релей должен существовать ДО Accepted: оферта агента придёт сразу после него.
+		relay, err := s.rtc.NewRelaySession(r.sess.ID, SessionOptions{
+			SendToAgent: r.hub.sendSignal,
+			Recorder:    r.webm.rec,
+			OnClose: func(reason string) {
+				select {
+				case r.hub.stop <- reason:
+				default:
+				}
+			},
+		})
+		if err != nil {
+			return "TRANSPORT_LOST", err.Error()
+		}
+		r.relay = relay
+		r.hub.setRelay(relay)
+	}
 	if err := r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Accepted{
 		Accepted: &pb.SessionAccepted{ServerTimeMs: r.started.UnixMilli()},
 	}}); err != nil {
@@ -332,6 +379,13 @@ func (r *streamRun) loop(ctx context.Context) {
 				}
 				r.finish(reason, msg.End.GetDetail())
 				return
+			case *pb.SessionUp_Signal:
+				if r.relay == nil {
+					stop("PROTOCOL_ERROR")
+				} else if err := r.relay.HandleAgentSignal(msg.Signal); err != nil {
+					s.log.Warn("screen: agent signal rejected", "session_id", r.sess.ID, "err", err)
+					stop("SIGNAL_FAILED")
+				}
 			case *pb.SessionUp_Hello:
 				stop("PROTOCOL_ERROR")
 			default:
@@ -344,6 +398,10 @@ func (r *streamRun) loop(ctx context.Context) {
 			}
 			r.finish(reason, errDetail(err))
 			return
+		case sg := <-r.hub.sig:
+			if stopReason == "" {
+				_ = r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Signal{Signal: sg}})
+			}
 		case <-r.hub.keyframe:
 			_ = r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Control{
 				Control: &pb.SessionControl{RequestKeyframe: true},
@@ -363,6 +421,10 @@ func (r *streamRun) loop(ctx context.Context) {
 		case <-maxDur.C:
 			stop("MAX_DURATION")
 		case <-tick.C:
+			// Зрителя WebRTC хаб не опрашивает: подключённый зритель сам считается «живым».
+			if r.relay != nil && r.relay.Viewers() > 0 {
+				r.hub.touch()
+			}
 			if stopReason == "" && r.hub.idleFor() > s.cfg.ViewerTimeout {
 				stop("VIEWER_GONE")
 			}
@@ -394,8 +456,8 @@ func errDetail(err error) string {
 
 // frame принимает часть кадра. Непустая причина — сеанс надо закрывать.
 func (r *streamRun) frame(f *pb.SessionFrame) string {
-	if len(f.Payload) > screenframe.MaxPartBytes {
-		return "PROTOCOL_ERROR"
+	if r.rec == nil || len(f.Payload) > screenframe.MaxPartBytes {
+		return "PROTOCOL_ERROR" // кадры RSF1 в сеансе WebRTC не бывают
 	}
 	p, err := screenframe.ParsePart(f.Payload)
 	if err != nil || p.Seq != f.Seq || p.Keyframe != f.Keyframe || p.Last != f.LastPart {
@@ -446,11 +508,17 @@ func (r *streamRun) finish(reason, detail string) {
 	r.flushInput(ctx)
 	var name, trunc string
 	var n int64
-	if r.rec != nil {
+	if r.relay != nil {
+		r.relay.Close(reason) // закрывает и запись webm
+	}
+	switch {
+	case r.rec != nil:
 		name, n, trunc = r.rec.close()
+	case r.webm != nil:
+		name, n, trunc = r.webm.close()
 	}
 	err := s.st.scoped(ctx, r.tenantID, func(ctx context.Context, q storage.TenantScope) error {
-		if r.rec != nil {
+		if r.rec != nil || r.webm != nil {
 			if err := s.st.setRecording(ctx, q, r.sess.ID, name, n, trunc != "", trunc); err != nil {
 				return err
 			}

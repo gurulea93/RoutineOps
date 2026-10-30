@@ -49,6 +49,14 @@ func loopDown(ctx context.Context, s *session, st *sessionStream, ctl *ctlWriter
 			forwardInput(s, ctl, in, log)
 			continue
 		}
+		if sg := m.GetSignal(); sg != nil {
+			if b, err := proto.Marshal(sg); err == nil && len(b) <= maxWireMsg {
+				if err := ctl.send(msgSignalIn, b); err != nil {
+					log.Warn("screen: signal not delivered to worker", "session_id", s.id, "err", err)
+				}
+			}
+			continue
+		}
 		c := m.GetControl()
 		handled := false
 		if c.GetStop() {

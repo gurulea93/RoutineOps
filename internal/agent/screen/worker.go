@@ -45,6 +45,10 @@ type WorkerConfig struct {
 
 	// Выбор монитора (необязательно). Displays — сколько мониторов у машины, NewCapturerAt —
 	// захват монитора по номеру. Без них переключение молча игнорируется: экран один.
+	Transport string // "webrtc" → RunWorker уходит в runWebRTCWorker (VP8); иначе RSF1
+	Codec     string
+	ICE       []*pb.IceServer
+
 	Displays      func() int
 	NewCapturerAt func(idx int) (Capturer, error)
 
@@ -72,7 +76,12 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 	if err != nil {
 		return end(reasonOf(err, ReasonCaptureFailed), err.Error())
 	}
-	defer func() { _ = capt.Close() }() // capt меняется при переключении монитора
+	captOwned := false // WebRTC-путь отдаёт захватчик Streamer'у, тот закрывает его сам
+	defer func() {
+		if !captOwned {
+			_ = capt.Close() // capt меняется при переключении монитора
+		}
+	}()
 
 	notice, err := cfg.ShowNotice(cfg.Operator, cfg.Reason)
 	if err != nil {
@@ -91,6 +100,10 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 			return end(ReasonInputUnavailable, ierr.Error())
 		}
 		defer inj.Close() // отпускает всё зажатое при любом конце сеанса
+	}
+	if cfg.Transport == "webrtc" {
+		captOwned = true
+		return runWebRTCWorker(ctx, cfg, capt, inj, in, out)
 	}
 	prof, fallback := ProfileByName(cfg.Profile)
 	enc := NewTileEncoder(srcW, srcH, prof)

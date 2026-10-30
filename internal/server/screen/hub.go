@@ -55,6 +55,8 @@ type hub struct {
 	// Управление (Ф3). input и narrow читает только стрим сеанса: он единственный, кто
 	// пишет в stream.Send, и потому единственный, кто может отправить агенту ввод.
 	input  chan *pb.SessionInput
+	sig    chan *pb.SessionSignal // → стрим: сигнал WebRTC агенту (писать в стрим может только он)
+	relay  *RelaySession
 	narrow chan struct{} // → стрим: вернуть управление сотруднику (сужение области)
 
 	// Кому принадлежит управление. Заполняется при открытии стрима из строки сеанса, чтобы
@@ -77,6 +79,7 @@ func newHub(w, h uint16) *hub {
 		keyframe: make(chan struct{}, 1),
 		stop:     make(chan string, 1),
 		input:    make(chan *pb.SessionInput, inputQueue),
+		sig:      make(chan *pb.SessionSignal, 16),
 		narrow:   make(chan struct{}, 1),
 	}
 }

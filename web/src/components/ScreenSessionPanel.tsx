@@ -16,6 +16,7 @@ import api, {
 } from "@/lib/api"
 import { formatBytes, formatDuration } from "@/lib/format"
 import { drawPart, parseRecords } from "@/lib/screenframe"
+import RecordingVideo from "@/components/RecordingVideo"
 import {
   FLUSH_MS,
   InputCollector,
@@ -260,6 +261,73 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
     void loadJournal()
   }, [loadJournal])
 
+  // WebRTC-просмотр (VP8). Видео играет в скрытом <video>, а кадры рисуются на тот же холст,
+  // что и тайлы RSF1: ввод, полный экран, вынос в окно и размеры работают без изменений.
+  // Опрос /live при этом продолжается — он держит сеанс «живым» и несёт статусы.
+  const rtcRef = useRef<{ pc: RTCPeerConnection; video: HTMLVideoElement; timer: number } | null>(null)
+  const transportRef = useRef<string>("rsf1")
+
+  const stopRtc = useCallback(() => {
+    const r = rtcRef.current
+    if (!r) return
+    window.clearInterval(r.timer)
+    r.video.srcObject = null
+    r.pc.close()
+    rtcRef.current = null
+  }, [])
+
+  const startRtc = useCallback(
+    async (sessionId: string) => {
+      if (rtcRef.current) return
+      const pc = new RTCPeerConnection({ iceServers: [] })
+      const video = document.createElement("video")
+      video.muted = true
+      video.autoplay = true
+      video.playsInline = true
+      const draw = () => {
+        const canvas = canvasRef.current
+        if (!canvas || video.videoWidth === 0 || video.readyState < 2) return
+        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+          canvas.width = video.videoWidth
+          canvas.height = video.videoHeight
+          setDims({ w: video.videoWidth, h: video.videoHeight })
+        }
+        canvas.getContext("2d")?.drawImage(video, 0, 0)
+      }
+      // setInterval, а не rAF: в окне-вынесении rAF главной страницы не тикает.
+      const timer = window.setInterval(draw, 16)
+      rtcRef.current = { pc, video, timer }
+      pc.addTransceiver("video", { direction: "recvonly" })
+      pc.ontrack = (ev) => {
+        video.srcObject = ev.streams[0] ?? new MediaStream([ev.track])
+        void video.play().catch(() => {})
+      }
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === "failed") setError(t("screenSession.rtcFailed"))
+      }
+      try {
+        await pc.setLocalDescription(await pc.createOffer())
+        // Без trickle: сервер принимает один SDP со всеми кандидатами.
+        await new Promise<void>((resolve) => {
+          if (pc.iceGatheringState === "complete") return resolve()
+          const t0 = window.setTimeout(resolve, 3000)
+          pc.addEventListener("icegatheringstatechange", () => {
+            if (pc.iceGatheringState === "complete") {
+              window.clearTimeout(t0)
+              resolve()
+            }
+          })
+        })
+        const r = await api.post<{ sdp: string }>(`/screen-sessions/${sessionId}/offer`, { sdp: pc.localDescription?.sdp })
+        await pc.setRemoteDescription({ type: "answer", sdp: r.data.sdp })
+      } catch (e) {
+        setError(errMessage(e))
+        stopRtc()
+      }
+    },
+    [t, stopRtc],
+  )
+
   // Петля просмотра. Живёт ровно столько, сколько открыт сеанс: закрытая вкладка не
   // продлевает liveness, и сервер закроет сеанс сам (§9.9) — поэтому останавливать её
   // при размонтировании обязательно, иначе запись продолжится при отсутствующем зрителе.
@@ -299,6 +367,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         // Первый не-202 ответ = стрим зарегистрирован в хабе. Только с этого момента
         // ввод есть кому принять — до него петля отправки не запускается вовсе.
         setStreamOpen(true)
+        if (transportRef.current === "webrtc") void startRtc(sessionId)
 
         const w = Number(res.headers["x-screen-width"] || 0)
         const h = Number(res.headers["x-screen-height"] || 0)
@@ -364,18 +433,20 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       // Поколение сменилось (вынос в окно или новый опрос): сеанс не кончился, состоянием
       // распоряжается тот, кто пришёл на смену.
       if (gen !== genRef.current) return
+      stopRtc()
       setLive(null)
       setStreamOpen(false)
       void loadJournal()
     },
-    [loadJournal, t],
+    [loadJournal, t, startRtc, stopRtc],
   )
 
   useEffect(() => {
     return () => {
       stopRef.current = true
+      stopRtc()
     }
-  }, [])
+  }, [stopRtc])
 
   // Управление активно ровно тогда, когда сервер его выдал и оператор его не вернул.
   const controlOn = Boolean(live?.control) && !controlReturned && !poppedOut
@@ -592,8 +663,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         // (400), поэтому не полагаемся на оператора и включаем control сами.
         control: wantControl || wantMaintenance,
         maintenance: wantMaintenance,
+        codecs: browserCodecs(),
         ...(quality ? { profile: quality } : {}),
       })
+      transportRef.current = r.data.transport ?? "rsf1"
       setLive(r.data)
       setStreamOpen(false)
       setControlReturned(false)
@@ -1161,7 +1234,12 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           setConfirmStop(null)
         }}
       />
-      {watchRec && <RecordingPlayer sessionId={watchRec} onClose={() => setWatchRec(null)} />}
+      {watchRec &&
+        (sessions.find((x) => x.id === watchRec)?.recording_format === "webm" ? (
+          <RecordingVideo sessionId={watchRec} onClose={() => setWatchRec(null)} />
+        ) : (
+          <RecordingPlayer sessionId={watchRec} onClose={() => setWatchRec(null)} />
+        ))}
       <ConfirmDialog
         open={confirmDelSession !== null}
         onOpenChange={(open) => !open && setConfirmDelSession(null)}
@@ -1203,4 +1281,14 @@ async function downloadRecording(sessionId: string) {
   a.download = `screen-${sessionId}.rsf`
   a.click()
   URL.revokeObjectURL(url)
+}
+
+// browserCodecs — видеокодеки, которые браузер может принять по WebRTC. Пусто — сервер даст RSF1.
+function browserCodecs(): string[] {
+  try {
+    const caps = typeof RTCRtpReceiver !== "undefined" ? RTCRtpReceiver.getCapabilities?.("video") : null
+    return caps?.codecs.some((c) => c.mimeType.toLowerCase() === "video/vp8") ? ["vp8"] : []
+  } catch {
+    return []
+  }
 }

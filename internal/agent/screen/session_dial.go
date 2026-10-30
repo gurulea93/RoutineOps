@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Floodww/RoutineOps/internal/agent/transport"
@@ -21,6 +22,16 @@ const acceptTimeout = 15 * time.Second
 type sessionStream struct {
 	pb.AgentService_ScreenSessionClient
 	close func() // отменяет стрим и закрывает соединение
+
+	sendMu sync.Mutex
+}
+
+// Send сериализует запись: кадры/статистику и сигнал WebRTC пишут разные горутины, а
+// gRPC-стрим не допускает параллельных Send.
+func (s *sessionStream) Send(m *pb.SessionUp) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.AgentService_ScreenSessionClient.Send(m)
 }
 
 // dialSession открывает стрим сеанса на ОТДЕЛЬНОМ соединении (DialStream, ADR-8 п.1:

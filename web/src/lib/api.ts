@@ -520,6 +520,9 @@ export interface ScreenSession {
   // улики, уже открыв её, — поздно, а в режиме unattended запись это единственное, чем
   // восстанавливают, что видел оператор.
   recording_truncated?: boolean
+  recording_format?: "rsf" | "webm"
+  // Только в ответе на создание сеанса: rsf1 (тайлы) или webrtc (видео VP8).
+  transport?: "rsf1" | "webrtc"
   recording_truncated_reason?: string
   // Размер файла записи. Нужен оператору до скачивания: запись часового сеанса и
   // запись, оборвавшаяся на первой минуте, в списке выглядят одинаково.

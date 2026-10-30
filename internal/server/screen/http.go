@@ -53,6 +53,7 @@ func (s *Service) Routes() []api.RouterOption {
 			// Ввод — только от человека: в журнале должен оказаться тот, кто нажимал.
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Post("/screen-sessions/{id}/display", s.httpDisplay)
+			r.Post("/screen-sessions/{id}/offer", s.httpOffer)
 			r.Post("/screen-sessions/{id}/profile", s.httpProfile)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
 			r.Delete("/screen-sessions/{id}/recording", s.httpDeleteRecording)
@@ -144,6 +145,9 @@ type createReq struct {
 	// Profile — качество, которое оператор выбрал для этого сеанса. Пусто = потолок
 	// тенанта. Выше потолка не бывает: берётся меньшее из двух.
 	Profile string `json:"profile"`
+	// Codecs — видеокодеки, которые умеет браузер оператора ("vp8"). С WebRTC сервер выбирает
+	// видео, если и агент объявил способность; иначе тайлы RSF1.
+	Codecs []string `json:"codecs"`
 }
 
 // pickProfile — профиль сеанса: запрошенный оператором, но не выше потолка тенанта.
@@ -193,6 +197,7 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		pbTask  *pb.Task
 		errCode string
 	)
+	transport := "rsf1"
 	err := s.st.scoped(r.Context(), tenantID, func(ctx context.Context, q storage.TenantScope) error {
 		dev, err := s.st.device(ctx, q, deviceID)
 		if err != nil {
@@ -236,6 +241,12 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		}
 		// Профиль — потолок тенанта (075); неизвестное значение — low.
 		profile := pickProfile(req.Profile, pol.ProfileCap)
+		// Транспорт: WebRTC только если релей включён, агент умеет VP8 и браузер его заявил.
+		// Запись на сервере обязательна всегда, поэтому только relay (не P2P).
+		choice := Choice{Transport: "rsf1", Mode: ModeRSF1, Record: true}
+		if s.rtc != nil {
+			choice = ChooseTransport(dev.Capabilities, req.Codecs, PolicyRelayOnly, true)
+		}
 		sid, taskID, err := s.st.create(ctx, q, newSession{
 			DeviceID: deviceID, OperatorID: userID, OperatorEmail: email,
 			Reason: req.Reason, Mode: mode, Profile: profile, Control: req.Control,
@@ -261,6 +272,10 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		cn = dev.CN
+		if choice.Transport == "webrtc" {
+			s.rtcPending.Store(sid, struct{}{})
+		}
+		transport = choice.Transport
 		pbTask = &pb.Task{
 			TaskId:   taskID,
 			Platform: dev.OS,
@@ -274,7 +289,9 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 				Reason:            req.Reason,
 				MaxDurationSec:    int32(s.cfg.MaxDuration / time.Second),
 				ConsentTimeoutSec: 60,
-				Transport:         "rsf1",
+				Transport:         choice.Transport,
+				VideoCodec:        choice.VideoCodec,
+				IceServers:        s.iceFor(choice),
 				Displays:          []int32{0, 1, 2, 3, 4, 5, 6, 7}, // оператор может переключать мониторы
 			},
 		}
@@ -299,7 +316,10 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.watchStart(tenantID, sess.ID)
-	writeJSON(w, http.StatusCreated, sess)
+	writeJSON(w, http.StatusCreated, struct {
+		*SessionRow
+		Transport string `json:"transport"`
+	}{sess, transport})
 }
 
 // watchStart закрывает приглашение, на которое агент так и не открыл стрим.
@@ -576,9 +596,13 @@ func (s *Service) httpRecording(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hd := w.Header()
-	hd.Set("Content-Type", "application/octet-stream")
+	ext, ctype := "rsf", "application/octet-stream"
+	if strings.HasSuffix(sess.recordingPath, ".webm") {
+		ext, ctype = "webm", "video/webm"
+	}
+	hd.Set("Content-Type", ctype)
 	hd.Set("Cache-Control", "no-store")
-	hd.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="screen-%s.rsf"`, id))
+	hd.Set("Content-Disposition", fmt.Sprintf(`attachment; filename="screen-%s.%s"`, id, ext))
 	hd.Set("Content-Length", strconv.FormatInt(st.Size(), 10))
 	// WriteTimeout сервера (60 с) рассчитан на JSON; запись до 512 МБ в него не влезает.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Minute))

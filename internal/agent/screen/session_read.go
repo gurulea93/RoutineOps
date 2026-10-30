@@ -69,6 +69,10 @@ func readPipe(ctx context.Context, s *session, src io.Reader, box *latestFrame, 
 			_ = json.Unmarshal(m.body, &e)
 			r, _ := s.end(EndReason(cmp.Or(e.Reason, string(ReasonWorkerLost))), e.Detail)
 			return r
+		case msgSignal:
+			if s.onSignal != nil {
+				s.onSignal(m.body)
+			}
 		case msgHello, msgStats: // hello — старт сеанса; счётчики служба ведёт сама
 		default:
 			log.Warn("screen: unknown worker message ignored", "type", m.typ, "session_id", s.id)

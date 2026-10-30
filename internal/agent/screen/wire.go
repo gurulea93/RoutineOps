@@ -26,8 +26,10 @@ const (
 	msgFrame    byte = 2 // worker → служба: часть кадра
 	msgEnd      byte = 3 // worker → служба: конец сеанса с причиной
 	msgStats    byte = 4 // worker → служба: счётчики
+	msgSignal   byte = 5 // worker → служба: pb.SessionSignal (WebRTC, Этап B) — уйдёт в SessionUp.signal
 	msgKeyframe byte = 10
 	msgStop     byte = 11
+	msgSignalIn byte = 16 // служба → worker: pb.SessionSignal из SessionDown.signal
 	msgProfile  byte = 15 // служба → worker: JSON wireProfile — сменить профиль качества на лету
 	msgDisplay  byte = 14 // служба → worker: JSON wireDisplay — показать монитор с номером index
 	msgInput    byte = 13 // служба → worker: pb.SessionInput (protobuf) — ввод оператора

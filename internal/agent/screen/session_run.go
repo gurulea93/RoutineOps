@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/Floodww/RoutineOps/internal/agent/transport"
 	pb "github.com/Floodww/RoutineOps/proto"
 )
@@ -85,6 +87,7 @@ func (d *runDeps) run(s *session) {
 		SessionID: s.id, Profile: s.cmd.GetProfile(), Operator: s.cmd.GetOperatorName(),
 		Reason: s.cmd.GetReason(), MaxDurationSec: int(dur / time.Second),
 		AllowInput: s.cmd.GetAllowInput(),
+		Transport:  webrtcTransport(s.cmd), Codec: s.cmd.GetVideoCodec(), ICE: iceToWire(s.cmd.GetIceServers()),
 	})
 	if reason != "" || err != nil {
 		w = nil
@@ -103,6 +106,16 @@ func (d *runDeps) run(s *session) {
 	}
 
 	ctl = &ctlWriter{w: w.stdin}
+	// Сигнал от worker'а (оферта) уходит в тот же стрим; запись в стрим сериализована в Send.
+	s.onSignal = func(b []byte) {
+		var sig pb.SessionSignal
+		if err := proto.Unmarshal(b, &sig); err != nil {
+			return
+		}
+		if err := st.Send(&pb.SessionUp{Msg: &pb.SessionUp_Signal{Signal: &sig}}); err != nil {
+			s.end(ReasonTransportLost, err.Error())
+		}
+	}
 	box := newLatestFrame(ctl.askKeyframe)
 	prof, _ := ProfileByName(hello.Profile)
 	budget := newBandwidthBudget(prof, nil)
