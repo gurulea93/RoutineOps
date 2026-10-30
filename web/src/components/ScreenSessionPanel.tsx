@@ -303,8 +303,17 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         void video.play().catch(() => {})
       }
       pc.onconnectionstatechange = () => {
+        console.info("screen: webrtc connection", pc.connectionState)
         if (pc.connectionState === "failed") setError(t("screenSession.rtcFailed"))
       }
+      // Соединение может встать, а кадров так и не быть (агент не шлёт, ключевой кадр
+      // потерян). Чёрный экран без объяснения хуже ошибки — через 10 с без кадра говорим.
+      window.setTimeout(() => {
+        if (rtcRef.current?.pc === pc && video.videoWidth === 0) {
+          console.warn("screen: no webrtc video", { connection: pc.connectionState, ice: pc.iceConnectionState })
+          setError(t("screenSession.rtcNoVideo", { state: pc.connectionState }))
+        }
+      }, 10000)
       try {
         await pc.setLocalDescription(await pc.createOffer())
         // Без trickle: сервер принимает один SDP со всеми кандидатами.

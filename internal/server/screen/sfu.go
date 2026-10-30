@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/rtcp"
@@ -45,6 +47,8 @@ type SessionOptions struct {
 	KeyframeMinInterval time.Duration
 	// OnClose — сеанс закрылся (причина — строкой, как причины завершения в proto).
 	OnClose func(reason string)
+	// Log — журнал состояний соединений (агент/зрители). nil — slog.Default.
+	Log *slog.Logger
 }
 
 // gatherTimeout — сервер отдаёт SDP с уже собранными кандидатами (не trickle): кандидаты
@@ -68,6 +72,9 @@ type RelaySession struct {
 	viewers   map[string]*webrtc.PeerConnection
 	lastKF    time.Time
 	closed    bool
+	// fwd — сколько RTP-пакетов агента разослано зрителям: по нему в логе видно, дошло ли
+	// видео до сервера, когда у оператора чёрный экран.
+	fwd       atomic.Int64
 	closeOnce sync.Once
 	done      chan struct{}
 	endReason string
@@ -84,6 +91,10 @@ func (r *RTC) NewRelaySession(id string, opts SessionOptions) (*RelaySession, er
 	if opts.KeyframeMinInterval <= 0 {
 		opts.KeyframeMinInterval = 500 * time.Millisecond
 	}
+	if opts.Log == nil {
+		opts.Log = slog.Default()
+	}
+	opts.Log = opts.Log.With("session_id", id)
 	local, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}, "video", "screen-"+id)
 	if err != nil {
@@ -134,6 +145,7 @@ func (s *RelaySession) agentOffer(sdp string) error {
 
 	pc.OnTrack(s.onAgentTrack)
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
+		s.opts.Log.Info("screen rtc: agent connection", "state", st.String())
 		if st == webrtc.PeerConnectionStateFailed || st == webrtc.PeerConnectionStateClosed {
 			s.Close("AGENT_GONE")
 		}
@@ -156,6 +168,7 @@ func (s *RelaySession) onAgentTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRece
 		s.Close("CODEC_UNSUPPORTED")
 		return
 	}
+	s.opts.Log.Info("screen rtc: agent track", "codec", track.Codec().MimeType, "ssrc", uint32(track.SSRC()))
 	s.mu.Lock()
 	s.agentSSRC, s.haveTrack = track.SSRC(), true
 	viewers := len(s.viewers)
@@ -173,7 +186,9 @@ func (s *RelaySession) onAgentTrack(track *webrtc.TrackRemote, _ *webrtc.RTPRece
 			// Копия: samplebuilder держит пакет, а WriteRTP ниже переписывает заголовок.
 			_ = s.opts.Recorder.WriteRTP(pkt.Clone())
 		}
-		_ = s.local.WriteRTP(pkt)
+		if err := s.local.WriteRTP(pkt); err == nil && s.fwd.Add(1) == 1 {
+			s.opts.Log.Info("screen rtc: first video packet from agent")
+		}
 	}
 }
 
@@ -205,6 +220,7 @@ func (s *RelaySession) AddViewer(ctx context.Context, viewerID, offerSDP string)
 	}
 	go s.readViewerRTCP(sender)
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
+		s.opts.Log.Info("screen rtc: viewer connection", "viewer", viewerID, "state", st.String())
 		switch st {
 		case webrtc.PeerConnectionStateConnected:
 			s.requestKeyframe() // новый зритель не может начать с межкадра
@@ -297,6 +313,7 @@ func (s *RelaySession) requestKeyframe() {
 // Close закрывает сеанс: зрителей, агента, запись. Повторный вызов безопасен.
 func (s *RelaySession) Close(reason string) {
 	s.closeOnce.Do(func() {
+		s.opts.Log.Info("screen rtc: session closed", "reason", reason, "packets_forwarded", s.fwd.Load())
 		s.mu.Lock()
 		s.closed, s.endReason = true, reason
 		viewers := s.viewers
