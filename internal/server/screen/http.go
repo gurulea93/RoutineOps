@@ -457,7 +457,7 @@ func (s *Service) httpStop(w http.ResponseWriter, r *http.Request) {
 	if h := s.hubs.get(id); h != nil {
 		h.Stop("OPERATOR_STOPPED")
 	}
-	s.audit(r.Context(), tenantID, userID, email, "screen_session_stop", id, map[string]any{"device_id": sess.DeviceID})
+	s.auditScreen(r.Context(), tenantID, userID, email, "screen_session_stop", id, map[string]any{"device_id": sess.DeviceID})
 	w.WriteHeader(http.StatusNoContent)
 }
 
