@@ -146,6 +146,8 @@ export default function DeviceDetail() {
   const [revealing, setRevealing] = useState(false)
   const [revealed, setRevealed] = useState<EscrowReveal | null>(null)
   const [vulns, setVulns] = useState<Vulnerability[]>([])
+  // Есть ли живая запись с тем же именем: тогда эта — осиротевший дубль после переустановки агента.
+  const [hasLiveTwin, setHasLiveTwin] = useState(false)
 
   useEffect(() => {
     async function load() {
@@ -167,6 +169,31 @@ export default function DeviceDetail() {
     }
     load()
   }, [id])
+
+  useEffect(() => {
+    if (!device?.hostname) return
+    let alive = true
+    api
+      .get<Device[]>(`/devices?q=${encodeURIComponent(device.hostname)}&limit=20`)
+      .then((r) => {
+        if (!alive) return
+        const fresh = Date.now() - 10 * 60 * 1000
+        setHasLiveTwin(
+          (r.data ?? []).some(
+            (d) =>
+              d.id !== device.id &&
+              d.hostname === device.hostname &&
+              d.status !== "decommissioned" &&
+              !!d.last_seen_at &&
+              new Date(d.last_seen_at).getTime() > fresh,
+          ),
+        )
+      })
+      .catch(() => alive && setHasLiveTwin(false))
+    return () => {
+      alive = false
+    }
+  }, [device?.id, device?.hostname])
 
   useEffect(() => {
     const interval = setInterval(async () => {
@@ -571,7 +598,11 @@ export default function DeviceDetail() {
                   скелетом (агент апсертит строку heartbeat'ом в gateway) и сиротеет.
                   Сначала «Вывести из эксплуатации» снимает агента, потом чистим запись.
                   Never-connected удаляют в EnrollmentQueue — там свой гард по last_seen. */}
-              {device.status === "decommissioned" && (
+              {/* Дубль: тот же хост уже на связи под другой записью (переустановили агента).
+                  Просто отключённую машину так не удалить — только когда есть живая замена. */}
+              {(device.status === "decommissioned" ||
+                (hasLiveTwin &&
+                  (!device.last_seen_at || Date.now() - new Date(device.last_seen_at).getTime() > 10 * 60 * 1000))) && (
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem destructive disabled={deleting} onSelect={() => setConfirmDelete(true)}>
