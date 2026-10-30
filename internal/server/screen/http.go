@@ -139,6 +139,25 @@ type createReq struct {
 	Reason      string `json:"reason"`
 	Control     bool   `json:"control"`
 	Maintenance bool   `json:"maintenance"`
+	// Profile — качество, которое оператор выбрал для этого сеанса. Пусто = потолок
+	// тенанта. Выше потолка не бывает: берётся меньшее из двух.
+	Profile string `json:"profile"`
+}
+
+// pickProfile — профиль сеанса: запрошенный оператором, но не выше потолка тенанта.
+// Неизвестное значение трактуется как «не просили» (потолок), неизвестный потолок — как low.
+func pickProfile(requested, tenantCap string) string {
+	rank := map[string]int{"low": 0, "medium": 1, "high": 2}
+	names := []string{"low", "medium", "high"}
+	capRank, ok := rank[tenantCap]
+	if !ok {
+		capRank = 0
+	}
+	want, ok := rank[requested]
+	if !ok || want > capRank {
+		want = capRank
+	}
+	return names[want]
 }
 
 const maxReasonLen = 500
@@ -214,11 +233,7 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 			mode = "unattended"
 		}
 		// Профиль — потолок тенанта (075); неизвестное значение — low.
-		profile := "low"
-		switch pol.ProfileCap {
-		case "medium", "high":
-			profile = pol.ProfileCap
-		}
+		profile := pickProfile(req.Profile, pol.ProfileCap)
 		sid, taskID, err := s.st.create(ctx, q, newSession{
 			DeviceID: deviceID, OperatorID: userID, OperatorEmail: email,
 			Reason: req.Reason, Mode: mode, Profile: profile, Control: req.Control,

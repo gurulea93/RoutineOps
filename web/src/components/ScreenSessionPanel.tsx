@@ -179,6 +179,8 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // Запрошено ли управление ДО начала сеанса. Отдельный флаг от `live.control`: первый —
   // намерение оператора, второй — то, что реально выдал сервер и объявил агенту.
   const [wantControl, setWantControl] = useState(false)
+  // Качество сеанса; "" — как разрешено в настройках тенанта.
+  const [quality, setQuality] = useState("")
   // Запрошен ли режим обслуживания ДО начала сеанса (§9.11 / §4): управлять UAC и экраном
   // блокировки, а не паузить/рвать на них сеанс. Подразумевает управление — сервер отбивает
   // maintenance без control (400), поэтому включение обслуживания включает и управление.
@@ -561,6 +563,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         // (400), поэтому не полагаемся на оператора и включаем control сами.
         control: wantControl || wantMaintenance,
         maintenance: wantMaintenance,
+        ...(quality ? { profile: quality } : {}),
       })
       setLive(r.data)
       setStreamOpen(false)
@@ -904,6 +907,18 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                 maxLength={500}
                 onChange={(e) => setReason(e.target.value)}
               />
+              <select
+                className="rounded-lg border border-border bg-transparent px-2 py-2 text-sm"
+                value={quality}
+                onChange={(e) => setQuality(e.target.value)}
+                aria-label={t("screenSession.quality")}
+                title={t("screenSession.quality")}
+              >
+                <option value="">{t("screenSession.qualityAuto")}</option>
+                <option value="low">{t("screenSession.qualityLow")}</option>
+                <option value="medium">{t("screenSession.qualityMedium")}</option>
+                <option value="high">{t("screenSession.qualityHigh")}</option>
+              </select>
               <Button size="sm" disabled={starting} onClick={start}>
                 {starting ? "…" : wantControl ? t("screenSession.connectControl") : t("screenSession.connect")}
               </Button>

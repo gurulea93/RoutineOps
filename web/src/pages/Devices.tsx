@@ -315,6 +315,7 @@ export default function Devices() {
                     <a href={`${apiBase()}/downloads/RoutineOps-agent.msi`} download className="block">
                       <Button variant="outline" className="w-full">{t("devices.downloadMSI")}</Button>
                     </a>
+                    <p className="text-xs text-muted-foreground">{t("devices.downloadMSIHint")}</p>
                   </div>
                 ) : result.device.os === "darwin" ? (
                   <a href={`${apiBase()}/downloads/RoutineOps-agent.pkg`} download className="block">
