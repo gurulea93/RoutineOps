@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react"
 import { useTranslation } from "react-i18next"
 
+import AgentBuildUpload from "@/components/AgentBuildUpload"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from "@/components/ui/table"
@@ -258,6 +259,7 @@ export default function ScreenAccess() {
           </TableBody>
         </Table>
       </section>
+      <AgentBuildUpload />
     </div>
   )
 }

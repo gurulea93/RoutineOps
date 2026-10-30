@@ -59,6 +59,11 @@ type Config struct {
 
 	// RTCUDPAddr — UDP-порт WebRTC-relay (":50052"). Пусто — WebRTC выключен, только RSF1.
 	// RTCPublicIPs — адреса сервера для кандидатов ICE (сервер в docker/за NAT).
+	// BuildAdminEmail — суперадмин (SEED_ADMIN_EMAIL), которому разрешена загрузка агента с VP8
+	// из панели; пусто — загрузка выключена. BuildsDir — куда её кладём (по умолчанию build/windows).
+	BuildAdminEmail string
+	BuildsDir       string
+
 	RTCUDPAddr   string
 	RTCPublicIPs []string
 	Logger       *slog.Logger

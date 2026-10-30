@@ -50,6 +50,9 @@ services:
       # 20-минутный сеанс — десятки-сотни мегабайт, ретеншен 30 дней.
       # В open-core остаётся пустым: ручек сеансов там нет.
       - ./screen-recordings:/app/screen-recordings
+      # rw-том под Windows-агента с VP8, который суперадмин загружает из панели. install.sh берёт
+      # оттуда файлы и подписывает их своим ключом (ключ подписи в контейнер НЕ монтируется).
+      - ./build/windows:/app/build/windows
     env_file: .env.prod
     depends_on:
       migrate:

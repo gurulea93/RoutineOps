@@ -32,6 +32,7 @@ func screenSetup(g *gateway.Gateway, db *storage.DB, reg *registry.Registry, dir
 		// WebRTC (VP8) включается только когда задан порт; агенты без libvpx его всё равно не
 		// объявляют, и такие сеансы идут по RSF1.
 		RTCUDPAddr: os.Getenv("SCREEN_RTC_UDP"), RTCPublicIPs: ips,
+		BuildAdminEmail: os.Getenv("SEED_ADMIN_EMAIL"), BuildsDir: os.Getenv("BUILDS_DIR"),
 	})
 	if err != nil {
 		logger.Error("remote desktop: service not started", "err", err)

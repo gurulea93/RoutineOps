@@ -559,6 +559,7 @@
     "deactivate_license": "deactivated a license",
     "screen_session_requested": "requested a screen session",
     "screen_recording_viewed": "opened a session recording",
+    "agent_build_uploaded": "uploaded an agent build",
     "screen_recording_deleted": "deleted a session recording",
     "screen_session_deleted": "deleted a remote screen session",
     "screen_recording_view_denied": "was denied access to a session recording",
@@ -1535,6 +1536,15 @@
     "durationHour": "{{n}}h {{m}}m"
   },
   "screenAccess": {
+    "build": {
+      "title": "Windows agent with VP8",
+      "hint": "Upload the agent .exe built by build-windows-vpx.ps1. It is only staged on the server; the next ./install.sh signs and publishes it.",
+      "none": "No build uploaded yet.",
+      "current": "On the server: v{{version}}, {{size}}, sha256 {{hash}}…",
+      "version": "Agent version",
+      "upload": "Upload",
+      "done": "Uploaded. Now run ./install.sh on the server."
+    },
     "title": "Screen access",
     "subtitle": "How operators reach employee screens, and who may view session recordings.",
     "enterpriseOnly": "This capability is part of the Enterprise edition.",
