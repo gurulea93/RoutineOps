@@ -290,7 +290,7 @@ fi
 # отдаём ТОЛЬКО нужное (DATABASE_DSN для publish-release + RELEASE_PUBKEY), не весь
 # .env.prod (JWT/пароли билд-контейнеру не нужны). publish-release подписывает
 # манифест и делает UPSERT в agent_releases (идемпотентно при повторе).
-mkdir -p releases
+mkdir -p releases build/windows
 PG=$($DC -f "$COMPOSE" ps -q postgres)
 NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$PG" | awk '{print $1}')
 

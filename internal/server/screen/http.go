@@ -54,6 +54,8 @@ func (s *Service) Routes() []api.RouterOption {
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Post("/screen-sessions/{id}/display", s.httpDisplay)
 			r.Post("/screen-sessions/{id}/offer", s.httpOffer)
+			r.Get("/agent-builds/windows-vpx", s.httpVPXBuildInfo)
+			r.Post("/agent-builds/windows-vpx", s.httpVPXBuildUpload)
 			r.Post("/screen-sessions/{id}/profile", s.httpProfile)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
 			r.Delete("/screen-sessions/{id}/recording", s.httpDeleteRecording)

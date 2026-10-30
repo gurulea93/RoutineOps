@@ -559,6 +559,7 @@
     "deactivate_license": "деактивировал лицензию",
     "screen_session_requested": "запросил сеанс с экраном",
     "screen_recording_viewed": "открыл запись сеанса",
+    "agent_build_uploaded": "загрузил сборку агента",
     "screen_recording_deleted": "удалил запись сеанса",
     "screen_session_deleted": "удалил сеанс удалённого экрана",
     "screen_recording_view_denied": "получил отказ в доступе к записи сеанса",
@@ -1535,6 +1536,15 @@
     "durationHour": "{{n}} ч {{m}} мин"
   },
   "screenAccess": {
+    "build": {
+      "title": "Windows-агент с VP8",
+      "hint": "Загрузите .exe агента, собранный build-windows-vpx.ps1. Он только кладётся на сервер; подпишет и опубликует его следующий ./install.sh.",
+      "none": "Сборка ещё не загружена.",
+      "current": "На сервере: v{{version}}, {{size}}, sha256 {{hash}}…",
+      "version": "Версия агента",
+      "upload": "Загрузить",
+      "done": "Загружено. Теперь запустите ./install.sh на сервере."
+    },
     "title": "Наблюдение за экраном",
     "subtitle": "Режим доступа к экранам сотрудников и право просматривать записи сеансов.",
     "enterpriseOnly": "Возможность доступна в редакции Enterprise.",
