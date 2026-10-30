@@ -65,6 +65,7 @@ type hub struct {
 	// Мониторы: сколько их у машины и какой показан (по заголовкам кадров), а также какой
 	// хочет видеть оператор. Выбор уходит агенту сужением области — см. narrowScope.
 	displays, display, wantDisp int
+	wantProfile                 int32 // код профиля в narrow (profileCode*), 0 — без изменений
 	counts                      inputCounts
 }
 

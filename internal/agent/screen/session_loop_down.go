@@ -129,6 +129,18 @@ func checkNarrow(cmd *pb.ScreenSessionCommand, req *pb.ScreenScope) narrowVerdic
 // pb.SecurityEvent). Сюда оно пока не проведено: у loopDown нет доступа к очереди, а
 // пробрасывать её надо вместе с session_end.go, одним решением. До тех пор — только лог.
 func handleNarrow(s *session, req *pb.ScreenScope, ctl *ctlWriter, log *slog.Logger) bool {
+	// Смена качества едет в том же сообщении (proto не менялся): коды ≥ profileCodeBase в
+	// displays — это профиль, а не экран. Снимаем их до проверки приглашения.
+	req, profile := splitProfileCode(req)
+	if profile != "" && ctl != nil {
+		b, _ := json.Marshal(wireProfile{Name: profile})
+		if err := ctl.send(msgProfile, b); err != nil {
+			log.Warn("screen: profile change not delivered", "session_id", s.id, "err", err)
+		}
+	}
+	if len(req.GetDisplays()) == 0 && profile != "" {
+		return true
+	}
 	switch checkNarrow(s.cmd, req) {
 	case narrowExpand:
 		log.Warn("screen: expansion attempt rejected", "session_id", s.id,

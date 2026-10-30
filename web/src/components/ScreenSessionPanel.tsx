@@ -466,6 +466,16 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
     }
   }
 
+  const changeQuality = async (value: string) => {
+    setQuality(value)
+    if (!live) return
+    try {
+      await api.post(`/screen-sessions/${live.id}/profile`, { profile: value })
+    } catch (e) {
+      setError(errMessage(e))
+    }
+  }
+
   const returnControl = async () => {
     if (!live) return
     inputRef.current?.release()
@@ -784,6 +794,21 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           {status && <span className={"text-xs " + (floating ? "text-white/70" : "text-muted-foreground")}>{status}</span>}
         </div>
         <div className="flex items-center gap-2">
+          <select
+            className={
+              "rounded-md border px-2 py-1 text-xs " +
+              (floating ? "border-white/30 bg-black/60 text-white" : "border-border bg-transparent")
+            }
+            value={quality}
+            onChange={(e) => void changeQuality(e.target.value)}
+            aria-label={t("screenSession.quality")}
+            title={t("screenSession.quality")}
+          >
+            <option value="">{t("screenSession.qualityAuto")}</option>
+            <option value="low">{t("screenSession.qualityLow")}</option>
+            <option value="medium">{t("screenSession.qualityMedium")}</option>
+            <option value="high">{t("screenSession.qualityHigh")}</option>
+          </select>
           {displays.count > 1 && (
             <select
               className={

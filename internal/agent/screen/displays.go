@@ -5,6 +5,8 @@ package screen
 import (
 	"errors"
 	"sort"
+
+	pb "github.com/Floodww/RoutineOps/proto"
 )
 
 var (
@@ -58,4 +60,30 @@ func virtualPos(rect monitorRect, vx, vy, vw, vh, cx, cy, fw, fh int) (x, y int3
 	nx := (px - vx) * 65535 / (vw - 1)
 	ny := (py - vy) * 65535 / (vh - 1)
 	return int32(min(max(nx, 0), 65535)), int32(min(max(ny, 0), 65535)), true
+}
+
+// Коды профилей в ScreenScope.displays: profileCodeBase+1 low, +2 medium, +3 high.
+const profileCodeBase = 100
+
+var profileByCode = map[int32]string{profileCodeBase + 1: "low", profileCodeBase + 2: "medium", profileCodeBase + 3: "high"}
+
+// splitProfileCode отделяет коды профилей от номеров экранов. Исходное сообщение не меняется.
+func splitProfileCode(in *pb.ScreenScope) (*pb.ScreenScope, string) {
+	var (
+		keep    []int32
+		profile string
+	)
+	for _, d := range in.GetDisplays() {
+		if d >= profileCodeBase {
+			if n, ok := profileByCode[d]; ok {
+				profile = n
+			}
+			continue
+		}
+		keep = append(keep, d)
+	}
+	if profile == "" && len(keep) == len(in.GetDisplays()) {
+		return in, ""
+	}
+	return &pb.ScreenScope{Displays: keep, AllowInput: in.GetAllowInput()}, profile
 }

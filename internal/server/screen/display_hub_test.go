@@ -22,8 +22,17 @@ func TestHubSetDisplay(t *testing.T) {
 	}
 	h.control = true
 	d, allow := h.narrowScope()
-	if d != 1 || !allow {
-		t.Fatalf("scope %d %v: switching must keep control", d, allow)
+	if len(d) != 1 || d[0] != 1 || !allow {
+		t.Fatalf("scope %v %v: switching must keep control", d, allow)
+	}
+	if got := h.setProfile("t1", "u1", "medium"); got != displayOK {
+		t.Fatalf("profile: %v", got)
+	}
+	if d, _ = h.narrowScope(); len(d) != 2 || d[1] != 102 {
+		t.Fatalf("profile code missing: %v", d)
+	}
+	if got := h.setProfile("t1", "u1", "bogus"); got != displayBadIndex {
+		t.Fatalf("bogus profile: %v", got)
 	}
 	h.returned = true
 	if _, allow = h.narrowScope(); allow {

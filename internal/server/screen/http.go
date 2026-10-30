@@ -53,6 +53,7 @@ func (s *Service) Routes() []api.RouterOption {
 			// Ввод — только от человека: в журнале должен оказаться тот, кто нажимал.
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Post("/screen-sessions/{id}/display", s.httpDisplay)
+			r.Post("/screen-sessions/{id}/profile", s.httpProfile)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
 			r.Delete("/screen-sessions/{id}/recording", s.httpDeleteRecording)
 			r.Delete("/screen-sessions/{id}", s.httpDeleteSession)

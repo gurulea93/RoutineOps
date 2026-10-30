@@ -2,7 +2,11 @@
 
 package screen
 
-import "testing"
+import (
+	"testing"
+
+	pb "github.com/Floodww/RoutineOps/proto"
+)
 
 func TestOrderMonitors(t *testing.T) {
 	in := []monitorRect{{X: -1920, W: 1920, H: 1080}, {X: 0, W: 2560, H: 1440, Primary: true}, {X: 2560, W: 1920, H: 1080}}
@@ -34,5 +38,20 @@ func TestVirtualPos(t *testing.T) {
 	}
 	if _, _, ok := virtualPos(l, 0, 0, 1, 1, 0, 0, 10, 10); ok {
 		t.Fatal("degenerate desktop accepted")
+	}
+}
+
+func TestSplitProfileCode(t *testing.T) {
+	in := &pb.ScreenScope{Displays: []int32{1, profileCodeBase + 1}, AllowInput: true}
+	out, p := splitProfileCode(in)
+	if p != "low" || len(out.GetDisplays()) != 1 || out.GetDisplays()[0] != 1 || !out.GetAllowInput() {
+		t.Fatalf("got %v %q", out, p)
+	}
+	if len(in.GetDisplays()) != 2 {
+		t.Fatal("input mutated")
+	}
+	same, p := splitProfileCode(&pb.ScreenScope{Displays: []int32{0}})
+	if p != "" || len(same.GetDisplays()) != 1 {
+		t.Fatal("plain scope changed")
 	}
 }

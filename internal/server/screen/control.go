@@ -354,10 +354,90 @@ const (
 // narrowScope — что стрим пошлёт агенту по сигналу narrow: выбранный монитор и «управление
 // ещё у оператора». Возврат управления и смена монитора — одно сообщение, поэтому оно всегда
 // несёт оба значения: иначе смена экрана сняла бы управление, а возврат — вернула бы монитор 0.
-func (b *hub) narrowScope() (display int32, allowInput bool) {
+func (b *hub) narrowScope() (displays []int32, allowInput bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return int32(b.wantDisp), b.control && !b.returned
+	displays = []int32{int32(b.wantDisp)}
+	if b.wantProfile != 0 {
+		displays = append(displays, b.wantProfile) // коды ≥100 агент читает как смену качества
+	}
+	return displays, b.control && !b.returned
+}
+
+// profileCode — код профиля в ScreenScope.displays (см. profileCodeBase на стороне агента).
+func profileCode(name string) int32 {
+	switch name {
+	case "low":
+		return 101
+	case "medium":
+		return 102
+	case "high":
+		return 103
+	}
+	return 0
+}
+
+// setProfile запоминает профиль и будит стрим.
+func (b *hub) setProfile(tenantID, userID, name string) displayResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.tenantID != tenantID || b.operatorID != userID:
+		return displayNotYours
+	case b.closed:
+		return displayClosed
+	}
+	code := profileCode(name)
+	if code == 0 {
+		return displayBadIndex
+	}
+	b.wantProfile = code
+	select {
+	case b.narrow <- struct{}{}:
+	default:
+	}
+	return displayOK
+}
+
+// httpProfile — POST /screen-sessions/{id}/profile {"profile": "low|medium|high|\"\""}.
+// Пустое значение — «авто», то есть потолок тенанта; выше потолка выбрать нельзя.
+func (s *Service) httpProfile(w http.ResponseWriter, r *http.Request) {
+	tenantID, userID, _, ok := actor(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Profile string `json:"profile"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	h := s.hubs.get(chi.URLParam(r, "id"))
+	if h == nil {
+		writeErr(w, http.StatusServiceUnavailable, "stream_not_open")
+		return
+	}
+	var capName string
+	err := s.st.scoped(r.Context(), tenantID, func(ctx context.Context, q storage.TenantScope) error {
+		pol, err := s.st.policy(ctx, q, tenantID)
+		capName = pol.ProfileCap
+		return err
+	})
+	if err != nil {
+		s.internal(w, "profile cap", err)
+		return
+	}
+	switch h.setProfile(tenantID, userID, pickProfile(req.Profile, capName)) {
+	case displayOK:
+		w.WriteHeader(http.StatusNoContent)
+	case displayNotYours:
+		http.Error(w, "not found", http.StatusNotFound)
+	case displayClosed:
+		writeErr(w, http.StatusGone, "session_ended")
+	default:
+		writeErr(w, http.StatusBadRequest, "bad_profile")
+	}
 }
 
 // setDisplay запоминает выбранный монитор и будит стрим. Допустим только номер из тех, что

@@ -133,6 +133,24 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 			if c.stop != "" {
 				return end(EndReason(c.stop), "")
 			}
+			if c.profile != "" {
+				if np, _ := ProfileByName(c.profile); np.Name != prof.Name {
+					prof = np
+					enc = NewTileEncoder(srcW, srcH, prof)
+					tick.Reset(time.Second / time.Duration(prof.FPS))
+				}
+			}
+			if c.display >= 0 && c.display != curDisp && c.display < nDisp && cfg.NewCapturerAt != nil {
+				if nc, err := cfg.NewCapturerAt(c.display); err == nil {
+					_ = capt.Close()
+					capt, curDisp = nc, c.display
+					srcW, srcH = capt.Size()
+					enc = NewTileEncoder(srcW, srcH, prof)
+					if da, ok := inj.(DisplayAware); ok {
+						da.SetDisplay(curDisp)
+					}
+				}
+			}
 			wantKey = true
 		case <-statsTick.C:
 			if err := writeJSONMsg(out, msgStats, stats); err != nil {
@@ -148,6 +166,9 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 			if err != nil {
 				return end(ReasonCaptureFailed, "jpeg: "+err.Error())
 			}
+			if key && cfg.Displays != nil {
+				nDisp = max(1, cfg.Displays())
+			}
 			seq++
 			parts, err := screenframe.Split(seq, key, uint16(enc.W), uint16(enc.H), tiles, screenframe.MaxPartBytes)
 			if err != nil {
@@ -155,6 +176,7 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 			}
 			now := time.Now().UnixMilli()
 			for i, p := range parts {
+				screenframe.SetDisplayInfo(p, nDisp, curDisp)
 				if err := writeFrameMsg(out, wireFrame{Seq: seq, Keyframe: key, Last: i == len(parts)-1,
 					CapturedMs: now, Payload: p}); err != nil {
 					return ReasonWorkerLost
@@ -179,7 +201,8 @@ func reasonOf(err error, def EndReason) EndReason {
 
 type control struct {
 	stop    string
-	display int // ≥0 — перейти на монитор с этим номером; −1 — не меняется
+	profile string // непусто — сменить профиль качества
+	display int    // ≥0 — перейти на монитор с этим номером; −1 — не меняется
 }
 
 type controlReader struct{ ch chan control }
@@ -209,6 +232,22 @@ func readControl(in io.Reader, inj Injector) *controlReader {
 				var si pb.SessionInput
 				if proto.Unmarshal(body, &si) == nil {
 					inj.Apply(&si)
+				}
+			case msgDisplay:
+				var d wireDisplay
+				if json.Unmarshal(body, &d) == nil && d.Index >= 0 {
+					select {
+					case cr.ch <- control{display: d.Index}:
+					default: // очередь полна — оператор нажмёт ещё раз
+					}
+				}
+			case msgProfile:
+				var pf wireProfile
+				if json.Unmarshal(body, &pf) == nil && pf.Name != "" {
+					select {
+					case cr.ch <- control{profile: pf.Name, display: -1}:
+					default:
+					}
 				}
 			case msgStop:
 				var s wireStop
