@@ -61,7 +61,11 @@ type hub struct {
 	// ручка ввода (десятки запросов в секунду) не ходила за ними в БД.
 	tenantID, operatorID string
 	control, returned    bool
-	counts               inputCounts
+
+	// Мониторы: сколько их у машины и какой показан (по заголовкам кадров), а также какой
+	// хочет видеть оператор. Выбор уходит агенту сужением области — см. narrowScope.
+	displays, display, wantDisp int
+	counts                      inputCounts
 }
 
 func newHub(w, h uint16) *hub {
@@ -111,6 +115,9 @@ func (b *hub) append(p *screenframe.Part, rec []byte) {
 	}
 	if p.Width != 0 && p.Height != 0 {
 		b.w, b.h = p.Width, p.Height
+	}
+	if p.Displays != 0 {
+		b.displays, b.display = int(p.Displays), int(p.Display)
 	}
 	if !b.valid {
 		// Дельты без ключевого кадра рисовать не на чем; ждём его.

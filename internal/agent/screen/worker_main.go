@@ -26,14 +26,16 @@ func runWorkerProcess(ctx context.Context, in io.Reader, out io.Writer,
 		return 1
 	}
 	RunWorker(ctx, WorkerConfig{
-		Profile:     cfg.Profile,
-		Operator:    cfg.Operator,
-		Reason:      cfg.Reason,
-		MaxDuration: time.Duration(cfg.MaxDurationSec) * time.Second,
-		AllowInput:  cfg.AllowInput,
-		NewInjector: newPlatformInjector,
-		NewCapturer: newCapturer,
-		ShowNotice:  showNotice,
+		Profile:       cfg.Profile,
+		Operator:      cfg.Operator,
+		Reason:        cfg.Reason,
+		MaxDuration:   time.Duration(cfg.MaxDurationSec) * time.Second,
+		AllowInput:    cfg.AllowInput,
+		NewInjector:   newPlatformInjector,
+		NewCapturer:   newCapturer,
+		Displays:      platformDisplayCount,
+		NewCapturerAt: newPlatformCapturerAt,
+		ShowNotice:    showNotice,
 	}, in, out)
 	return 0
 }

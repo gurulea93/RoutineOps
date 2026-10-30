@@ -26,16 +26,17 @@ const (
 	inputMouse    = 0
 	inputKeyboard = 1
 
-	mouseMove       = 0x0001
-	mouseLeftDown   = 0x0002
-	mouseLeftUp     = 0x0004
-	mouseRightDown  = 0x0008
-	mouseRightUp    = 0x0010
-	mouseMiddleDown = 0x0020
-	mouseMiddleUp   = 0x0040
-	mouseWheel      = 0x0800
-	mouseHWheel     = 0x1000
-	mouseAbsolute   = 0x8000
+	mouseMove        = 0x0001
+	mouseLeftDown    = 0x0002
+	mouseLeftUp      = 0x0004
+	mouseRightDown   = 0x0008
+	mouseRightUp     = 0x0010
+	mouseMiddleDown  = 0x0020
+	mouseMiddleUp    = 0x0040
+	mouseWheel       = 0x0800
+	mouseHWheel      = 0x1000
+	mouseAbsolute    = 0x8000
+	mouseVirtualDesk = 0x4000
 
 	keyExtended = 0x0001
 	keyKeyUp    = 0x0002
@@ -73,6 +74,33 @@ type winInjector struct {
 	mu      sync.Mutex
 	buttons map[int32]bool
 	keys    map[string]bool
+
+	// Монитор, не являющийся основным: тогда координаты считаются по виртуальному столу.
+	rect    monitorRect
+	virtual bool
+}
+
+// SetDisplay нацеливает мышь на монитор idx (0 — основной, как раньше).
+func (w *winInjector) SetDisplay(idx int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	ms := listMonitors()
+	if idx <= 0 || idx >= len(ms) {
+		w.virtual = false
+		return
+	}
+	w.rect, w.virtual = ms[idx], true
+}
+
+// pos — позиция события и доп. флаги SendInput.
+func (w *winInjector) pos(ev *pb.InputEvent, fw, fh int) (x, y int32, extra uint32, ok bool) {
+	if !w.virtual {
+		x, y, ok = absPos(ev, fw, fh)
+		return x, y, 0, ok
+	}
+	vx, vy, vw, vh := virtualDesk()
+	x, y, ok = virtualPos(w.rect, vx, vy, vw, vh, int(ev.GetX()), int(ev.GetY()), fw, fh)
+	return x, y, mouseVirtualDesk, ok
 }
 
 func newPlatformInjector(srcW, srcH int) (Injector, error) {
@@ -122,8 +150,8 @@ func (w *winInjector) releaseLocked() {
 func (w *winInjector) eventLocked(ev *pb.InputEvent, fw, fh int) {
 	switch ev.GetKind() {
 	case "mouse_move":
-		if x, y, ok := absPos(ev, fw, fh); ok {
-			sendInputs(mouseRec(mouseMove|mouseAbsolute, x, y, 0))
+		if x, y, ex, ok := w.pos(ev, fw, fh); ok {
+			sendInputs(mouseRec(mouseMove|mouseAbsolute|ex, x, y, 0))
 		}
 	case "mouse_down", "mouse_up":
 		down := ev.GetKind() == "mouse_down"
@@ -132,8 +160,8 @@ func (w *winInjector) eventLocked(ev *pb.InputEvent, fw, fh int) {
 			return
 		}
 		var recs []inputRec
-		if x, y, ok := absPos(ev, fw, fh); ok {
-			recs = append(recs, mouseRec(mouseMove|mouseAbsolute, x, y, 0))
+		if x, y, ex, ok := w.pos(ev, fw, fh); ok {
+			recs = append(recs, mouseRec(mouseMove|mouseAbsolute|ex, x, y, 0))
 		}
 		sendInputs(append(recs, mouseRec(flag, 0, 0, 0))...)
 		if down {

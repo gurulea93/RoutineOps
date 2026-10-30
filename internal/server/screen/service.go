@@ -354,8 +354,9 @@ func (r *streamRun) loop(ctx context.Context) {
 			}
 		case <-r.hub.narrow:
 			// Возврат управления — сужение, а не стоп: сеанс наблюдения продолжается.
+			d, allow := r.hub.narrowScope()
 			_ = r.stream.Send(&pb.SessionDown{Msg: &pb.SessionDown_Control{
-				Control: &pb.SessionControl{Narrow: &pb.ScreenScope{Displays: []int32{0}, AllowInput: false}},
+				Control: &pb.SessionControl{Narrow: &pb.ScreenScope{Displays: []int32{d}, AllowInput: allow}},
 			}})
 		case reason := <-r.hub.stop:
 			stop(reason)

@@ -80,6 +80,7 @@ type gdiCapturer struct {
 	screenDC, memDC, bmp, old uintptr
 	pix                       []byte
 	w, h                      int
+	ox, oy                    int // левый верхний угол монитора на виртуальном столе
 }
 
 func newPlatformCapturer() (Capturer, error) {
@@ -90,7 +91,16 @@ func newPlatformCapturer() (Capturer, error) {
 	if w == 0 || h == 0 {
 		return nil, reasonErr(ReasonNoConsoleUser, fmt.Errorf("screen metrics %dx%d", w, h))
 	}
-	c := &gdiCapturer{w: int(w), h: int(h)}
+	return newGDICapturer(monitorRect{W: int(w), H: int(h), Primary: true})
+}
+
+// newGDICapturer снимает прямоугольник r виртуального стола (монитор целиком).
+func newGDICapturer(r monitorRect) (Capturer, error) {
+	_, _, _ = pSetProcessDPIAware.Call()
+	if r.W <= 0 || r.H <= 0 {
+		return nil, reasonErr(ReasonCaptureFailed, fmt.Errorf("monitor size %dx%d", r.W, r.H))
+	}
+	c := &gdiCapturer{w: r.W, h: r.H, ox: r.X, oy: r.Y}
 
 	c.screenDC, _, _ = pGetDC.Call(0)
 	if c.screenDC == 0 {
@@ -119,7 +129,7 @@ func newPlatformCapturer() (Capturer, error) {
 func (c *gdiCapturer) Size() (int, int) { return c.w, c.h }
 
 func (c *gdiCapturer) Capture() ([]byte, int, error) {
-	ok, _, _ := pBitBlt.Call(c.memDC, 0, 0, uintptr(c.w), uintptr(c.h), c.screenDC, 0, 0, srcCopy|captureBlt)
+	ok, _, _ := pBitBlt.Call(c.memDC, 0, 0, uintptr(c.w), uintptr(c.h), c.screenDC, uintptr(c.ox), uintptr(c.oy), srcCopy|captureBlt)
 	if ok == 0 {
 		return nil, 0, reasonErr(ReasonCaptureFailed, fmt.Errorf("BitBlt failed (secure desktop?)"))
 	}
@@ -149,8 +159,8 @@ func (c *gdiCapturer) drawCursor() {
 			_, _, _ = pDeleteObject.Call(ii.Color)
 		}
 	}()
-	x := int(ci.X) - int(ii.XHotspot)
-	y := int(ci.Y) - int(ii.YHotspot)
+	x := int(ci.X) - int(ii.XHotspot) - c.ox
+	y := int(ci.Y) - int(ii.YHotspot) - c.oy
 	_, _, _ = pDrawIconEx.Call(c.memDC, uintptr(x), uintptr(y), ci.Cursor, 0, 0, 0, 0, diNormal)
 }
 

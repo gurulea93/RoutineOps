@@ -1477,6 +1477,8 @@
     "recordingPlay": "▶ Играть",
     "recordingPause": "❚❚ Пауза",
     "recordingClose": "Закрыть",
+    "display": "Монитор",
+    "displayN": "Монитор {{n}}",
     "quality": "Качество",
     "qualityAuto": "Качество: максимум",
     "qualityLow": "Низкое · 1 к/с",

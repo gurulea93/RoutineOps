@@ -28,6 +28,7 @@ const (
 	msgStats    byte = 4 // worker → служба: счётчики
 	msgKeyframe byte = 10
 	msgStop     byte = 11
+	msgDisplay  byte = 14 // служба → worker: JSON wireDisplay — показать монитор с номером index
 	msgInput    byte = 13 // служба → worker: pb.SessionInput (protobuf) — ввод оператора
 )
 
@@ -54,6 +55,10 @@ type wireStats struct {
 	Bytes   uint64 `json:"bytes"`
 	Stalls  uint32 `json:"stalls"`
 	Dropped uint32 `json:"dropped"`
+}
+
+type wireDisplay struct {
+	Index int `json:"index"`
 }
 
 type wireStop struct {

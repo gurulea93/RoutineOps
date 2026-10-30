@@ -4,6 +4,7 @@ package screen
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 
@@ -146,7 +147,14 @@ func handleNarrow(s *session, req *pb.ScreenScope, ctl *ctlWriter, log *slog.Log
 		}
 		log.Info("screen: control returned to the employee", "session_id", s.id)
 	}
-	// В M1 экран один, так что сужение экранов ничего не меняет.
+	// Один выбранный экран из приглашённых — это переключение монитора: захватчик
+	// пересоздаётся. Список из нескольких экранов оставляет текущий как есть.
+	if ds := req.GetDisplays(); len(ds) == 1 && ctl != nil {
+		b, _ := json.Marshal(wireDisplay{Index: int(ds[0])})
+		if err := ctl.send(msgDisplay, b); err != nil {
+			log.Warn("screen: display switch not delivered", "session_id", s.id, "err", err)
+		}
+	}
 	log.Debug("screen: narrow accepted", "session_id", s.id,
 		"displays", req.GetDisplays(), "allow_input", req.GetAllowInput())
 	return true

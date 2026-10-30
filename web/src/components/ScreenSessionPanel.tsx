@@ -181,6 +181,8 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   const [wantControl, setWantControl] = useState(false)
   // Качество сеанса; "" — как разрешено в настройках тенанта.
   const [quality, setQuality] = useState("")
+  // Мониторы удалённой машины: сколько и какой показан (приходит в заголовках кадров).
+  const [displays, setDisplays] = useState({ count: 0, current: 0 })
   // Запрошен ли режим обслуживания ДО начала сеанса (§9.11 / §4): управлять UAC и экраном
   // блокировки, а не паузить/рвать на них сеанс. Подразумевает управление — сервер отбивает
   // maintenance без control (400), поэтому включение обслуживания включает и управление.
@@ -340,6 +342,8 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
             try {
               for (const rec of parseRecords(body)) {
                 await drawPart(ctx, rec.part)
+                const { displays: n, display: d } = rec.part
+                setDisplays((cur) => (cur.count === n && cur.current === d ? cur : { count: n, current: d }))
               }
             } catch (e) {
               // Битый поток — конец сеанса, а не «пропустим кадр»: тайлы дельтовые, и
@@ -451,6 +455,17 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   }, [controlOn])
 
   // Возврат управления. Наблюдение при этом продолжается.
+  const switchDisplay = async (index: number) => {
+    if (!live) return
+    // Оптимистично: рамка и выбор не должны отставать; реальный номер поправят кадры.
+    setDisplays((cur) => ({ ...cur, current: index }))
+    try {
+      await api.post(`/screen-sessions/${live.id}/display`, { index })
+    } catch (e) {
+      setError(errMessage(e))
+    }
+  }
+
   const returnControl = async () => {
     if (!live) return
     inputRef.current?.release()
@@ -466,6 +481,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   useEffect(() => {
     liveRef.current = live
   }, [live])
+
+  useEffect(() => {
+    setDisplays({ count: 0, current: 0 })
+  }, [live?.id])
 
   // Присоединиться к идущему сеансу своего оператора с правом ввода, если оно ещё не
   // возвращено. Чужой сеанс сервер всё равно не пустит на ввод (404), так что здесь это
@@ -765,6 +784,24 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           {status && <span className={"text-xs " + (floating ? "text-white/70" : "text-muted-foreground")}>{status}</span>}
         </div>
         <div className="flex items-center gap-2">
+          {displays.count > 1 && (
+            <select
+              className={
+                "rounded-md border px-2 py-1 text-xs " +
+                (floating ? "border-white/30 bg-black/60 text-white" : "border-border bg-transparent")
+              }
+              value={displays.current}
+              onChange={(e) => void switchDisplay(Number(e.target.value))}
+              aria-label={t("screenSession.display")}
+              title={t("screenSession.display")}
+            >
+              {Array.from({ length: displays.count }, (_, i) => (
+                <option key={i} value={i}>
+                  {t("screenSession.displayN", { n: i + 1 })}
+                </option>
+              ))}
+            </select>
+          )}
           {controlOn && (
             <Button size="sm" variant="outline" className={btn} onClick={() => void returnControl()}>
               {t("screenSession.returnControl")}

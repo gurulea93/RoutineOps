@@ -1477,6 +1477,8 @@
     "recordingPlay": "▶ Play",
     "recordingPause": "❚❚ Pause",
     "recordingClose": "Close",
+    "display": "Display",
+    "displayN": "Display {{n}}",
     "quality": "Quality",
     "qualityAuto": "Quality: maximum",
     "qualityLow": "Low · 1 fps",

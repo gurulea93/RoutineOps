@@ -42,7 +42,13 @@ type WorkerConfig struct {
 	NewInjector func(srcW, srcH int) (Injector, error)
 
 	NewCapturer func() (Capturer, error)
-	ShowNotice  func(operator, reason string) (Notice, error)
+
+	// Выбор монитора (необязательно). Displays — сколько мониторов у машины, NewCapturerAt —
+	// захват монитора по номеру. Без них переключение молча игнорируется: экран один.
+	Displays      func() int
+	NewCapturerAt func(idx int) (Capturer, error)
+
+	ShowNotice func(operator, reason string) (Notice, error)
 }
 
 // RunWorker ведёт сеанс до конца и возвращает его причину. Последнее сообщение в out —
@@ -66,7 +72,7 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 	if err != nil {
 		return end(reasonOf(err, ReasonCaptureFailed), err.Error())
 	}
-	defer capt.Close()
+	defer func() { _ = capt.Close() }() // capt меняется при переключении монитора
 
 	notice, err := cfg.ShowNotice(cfg.Operator, cfg.Reason)
 	if err != nil {
@@ -107,7 +113,12 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 		lastKey time.Time
 		wantKey = true
 		stats   wireStats
+		curDisp int
+		nDisp   = 1
 	)
+	if cfg.Displays != nil {
+		nDisp = max(1, cfg.Displays())
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -166,7 +177,10 @@ func reasonOf(err error, def EndReason) EndReason {
 	return def
 }
 
-type control struct{ stop string }
+type control struct {
+	stop    string
+	display int // ≥0 — перейти на монитор с этим номером; −1 — не меняется
+}
 
 type controlReader struct{ ch chan control }
 
@@ -185,7 +199,7 @@ func readControl(in io.Reader, inj Injector) *controlReader {
 			switch typ {
 			case msgKeyframe:
 				select {
-				case cr.ch <- control{}:
+				case cr.ch <- control{display: -1}:
 				default: // запрос уже в очереди
 				}
 			case msgInput:
@@ -202,7 +216,7 @@ func readControl(in io.Reader, inj Injector) *controlReader {
 				if s.Reason == "" {
 					s.Reason = string(ReasonStopped)
 				}
-				cr.ch <- control{stop: s.Reason}
+				cr.ch <- control{stop: s.Reason, display: -1}
 				return
 			}
 		}

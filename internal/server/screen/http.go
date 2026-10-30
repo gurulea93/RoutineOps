@@ -52,6 +52,7 @@ func (s *Service) Routes() []api.RouterOption {
 			r.Get("/screen-sessions/{id}/live", s.httpLive)
 			// Ввод — только от человека: в журнале должен оказаться тот, кто нажимал.
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
+			r.Post("/screen-sessions/{id}/display", s.httpDisplay)
 			r.Get("/screen-sessions/{id}/recording", s.httpRecording)
 			r.Delete("/screen-sessions/{id}/recording", s.httpDeleteRecording)
 			r.Delete("/screen-sessions/{id}", s.httpDeleteSession)
@@ -273,6 +274,7 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 				MaxDurationSec:    int32(s.cfg.MaxDuration / time.Second),
 				ConsentTimeoutSec: 60,
 				Transport:         "rsf1",
+				Displays:          []int32{0, 1, 2, 3, 4, 5, 6, 7}, // оператор может переключать мониторы
 			},
 		}
 		return nil

@@ -341,3 +341,73 @@ func (r *streamRun) flushInput(ctx context.Context) {
 		r.s.log.Warn("screen: input log flush failed", "session_id", r.sess.ID, "err", err)
 	}
 }
+
+type displayResult int
+
+const (
+	displayOK displayResult = iota
+	displayNotYours
+	displayClosed
+	displayBadIndex
+)
+
+// narrowScope — что стрим пошлёт агенту по сигналу narrow: выбранный монитор и «управление
+// ещё у оператора». Возврат управления и смена монитора — одно сообщение, поэтому оно всегда
+// несёт оба значения: иначе смена экрана сняла бы управление, а возврат — вернула бы монитор 0.
+func (b *hub) narrowScope() (display int32, allowInput bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return int32(b.wantDisp), b.control && !b.returned
+}
+
+// setDisplay запоминает выбранный монитор и будит стрим. Допустим только номер из тех, что
+// агент сообщил в кадрах (до первого кадра выбирать нечего).
+func (b *hub) setDisplay(tenantID, userID string, idx int) displayResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case b.tenantID != tenantID || b.operatorID != userID:
+		return displayNotYours
+	case b.closed:
+		return displayClosed
+	case idx < 0 || idx >= b.displays:
+		return displayBadIndex
+	}
+	b.wantDisp = idx
+	select {
+	case b.narrow <- struct{}{}:
+	default:
+	}
+	b.requestKeyframe()
+	return displayOK
+}
+
+// httpDisplay — POST /screen-sessions/{id}/display {"index": n}.
+func (s *Service) httpDisplay(w http.ResponseWriter, r *http.Request) {
+	tenantID, userID, _, ok := actor(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Index int `json:"index"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	h := s.hubs.get(chi.URLParam(r, "id"))
+	if h == nil {
+		writeErr(w, http.StatusServiceUnavailable, "stream_not_open")
+		return
+	}
+	switch h.setDisplay(tenantID, userID, req.Index) {
+	case displayOK:
+		w.WriteHeader(http.StatusNoContent)
+	case displayNotYours:
+		http.Error(w, "not found", http.StatusNotFound)
+	case displayClosed:
+		writeErr(w, http.StatusGone, "session_ended")
+	default:
+		writeErr(w, http.StatusBadRequest, "bad_display")
+	}
+}

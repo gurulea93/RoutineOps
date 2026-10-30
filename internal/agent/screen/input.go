@@ -26,3 +26,6 @@ func inputAvailable() bool { return platformInputAvailable }
 
 // InputAvailable — экспорт для объявления способности screen_control в cmd/agent.
 func InputAvailable() bool { return inputAvailable() }
+
+// DisplayAware — инжектор, умеющий переключать целевой монитор вместе с захватом.
+type DisplayAware interface{ SetDisplay(idx int) }
