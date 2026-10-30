@@ -417,8 +417,15 @@ func uninstallMethodFor(e uninstallEntry) UninstallMethod {
 			return UninstallWindowsQuiet
 		}
 	}
-	// Остался только интерактивный UninstallString (или вообще ничего):
-	// снимать нечем.
+	// Остался интерактивный UninstallString: тихо снять нечем, но запустить его можно.
+	// Метод тот же — windows_quiet, а решение «тихо или на экране» агент принимает при
+	// запуске (uninstall.execute): если тихой команды вывести нельзя, деинсталлятор
+	// открывается в сеансе пользователя, и оператор доводит его через удалённый экран.
+	// Исход честный: пока ПО осталось в снимке, задача получает STILL_PRESENT, а не «снято».
+	if e.uninstallString != "" {
+		return UninstallWindowsQuiet
+	}
+	// Команды удаления нет вообще: снимать нечем.
 	return UninstallNone
 }
 
