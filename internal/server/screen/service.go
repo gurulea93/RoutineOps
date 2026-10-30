@@ -537,7 +537,7 @@ func (r *streamRun) finish(reason, detail string) {
 	if err != nil {
 		s.log.Error("screen: session close not persisted", "session_id", r.sess.ID, "err", err)
 	}
-	s.audit(ctx, r.tenantID, "", agentActor(r.deviceID), "screen_session_ended", r.sess.ID, map[string]any{
+	s.auditScreen(ctx, r.tenantID, "", agentActor(r.deviceID), "screen_session_ended", r.sess.ID, map[string]any{
 		"device_id": r.deviceID, "end_reason": reason, "frames": r.c.Frames, "bytes": r.c.Bytes,
 		"recording_bytes": n, "recording_truncated": trunc, "max_lag_ms": r.maxLagMs,
 	})
@@ -547,9 +547,9 @@ func (r *streamRun) finish(reason, detail string) {
 	s.sweepRetention(ctx, r.tenantID)
 }
 
-// audit — best-effort запись для событий ПОСЛЕ факта (конец сеанса): само событие уже
+// auditScreen — best-effort запись для событий ПОСЛЕ факта (конец сеанса): само событие уже
 // случилось, и отказ журнала его не отменит. Fail-closed точки пишут аудит сами.
-func (s *Service) audit(ctx context.Context, tenantID, userID, email, action, sessionID string, details any) {
+func (s *Service) auditScreen(ctx context.Context, tenantID, userID, email, action, sessionID string, details any) {
 	err := s.st.scoped(ctx, tenantID, func(ctx context.Context, _ storage.TenantScope) error {
 		return s.cfg.DB.WriteAuditLog(ctx, userID, email, action, "screen_session", sessionID, details)
 	})
