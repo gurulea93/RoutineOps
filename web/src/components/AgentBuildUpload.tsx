@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 
 import { Button } from "@/components/ui/button"
+import axios from "axios"
+
 import api, { errMessage, errStatus } from "@/lib/api"
 import { formatBytes } from "@/lib/format"
 import { toast } from "@/lib/toast"
@@ -17,6 +19,15 @@ interface BuildInfo {
   sha256?: string
   bytes?: number
   uploaded_at?: string
+}
+
+// Сервер отвечает {"error":"код"}; общий errMessage его не показывает, а здесь код — это и есть диагноз.
+function uploadError(e: unknown): string {
+  if (axios.isAxiosError(e)) {
+    const code = (e.response?.data as { error?: string } | undefined)?.error
+    if (code) return `${e.response?.status}: ${code}`
+  }
+  return errMessage(e)
 }
 
 export default function AgentBuildUpload() {
@@ -64,7 +75,7 @@ export default function AgentBuildUpload() {
       if (input.current) input.current.value = ""
       toast({ title: t("screenAccess.build.done"), variant: "success" })
     } catch (e) {
-      toast({ title: errMessage(e), variant: "destructive" })
+      toast({ title: uploadError(e), variant: "destructive" })
     } finally {
       setProgress(null)
     }
@@ -79,7 +90,7 @@ export default function AgentBuildUpload() {
       <div className="text-sm">
         {info?.present
           ? t("screenAccess.build.current", {
-              version: info.version ?? "?",
+              version: (info.version ?? "?").replace(/^v/, ""),
               size: formatBytes(info.bytes ?? 0),
               hash: (info.sha256 ?? "").slice(0, 12),
             })
