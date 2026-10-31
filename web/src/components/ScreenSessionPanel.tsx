@@ -302,6 +302,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         video.srcObject = ev.streams[0] ?? new MediaStream([ev.track])
         void video.play().catch(() => {})
       }
+      // Диагностика: что объявили обе стороны. По ней видно, в чём чёрный экран — нет
+      // кандидатов (сеть/политика браузера) или они есть, но UDP не доходит.
+      const diag = { local: 0, remote: "" }
+      pc.oniceconnectionstatechange = () => console.info("screen: webrtc ice", pc.iceConnectionState)
       pc.onconnectionstatechange = () => {
         console.info("screen: webrtc connection", pc.connectionState)
         if (pc.connectionState === "failed") setError(t("screenSession.rtcFailed"))
@@ -310,8 +314,11 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       // потерян). Чёрный экран без объяснения хуже ошибки — через 10 с без кадра говорим.
       window.setTimeout(() => {
         if (rtcRef.current?.pc === pc && video.videoWidth === 0) {
-          console.warn("screen: no webrtc video", { connection: pc.connectionState, ice: pc.iceConnectionState })
-          setError(t("screenSession.rtcNoVideo", { state: pc.connectionState }))
+          console.warn("screen: no webrtc video", { connection: pc.connectionState, ice: pc.iceConnectionState, ...diag })
+          setError(
+            t("screenSession.rtcNoVideo", { state: pc.connectionState }) +
+              ` [ice=${pc.iceConnectionState}, local=${diag.local}, server=${diag.remote || "-"}]`,
+          )
         }
       }, 10000)
       try {
@@ -327,7 +334,14 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
             }
           })
         })
+        diag.local = (pc.localDescription?.sdp.match(/^a=candidate:/gm) ?? []).length
         const r = await api.post<{ sdp: string }>(`/screen-sessions/${sessionId}/offer`, { sdp: pc.localDescription?.sdp })
+        const cands = (r.data.sdp.match(/^a=candidate:.*$/gm) ?? []).map((l) => {
+          const f = l.split(" ")
+          return `${f[2]}:${f[4]}:${f[5]}`
+        })
+        diag.remote = cands.join(",")
+        console.info("screen: webrtc answer candidates", cands)
         await pc.setRemoteDescription({ type: "answer", sdp: r.data.sdp })
       } catch (e) {
         setError(errMessage(e))
