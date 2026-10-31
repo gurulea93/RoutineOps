@@ -38,6 +38,11 @@ func frameTiles(f *upFrame) (w, h uint16, tiles map[tilePos]screenframe.Tile, er
 		if err != nil {
 			return 0, 0, nil, err
 		}
+		if part.VP8 {
+			// Кадры VP8 зависят от предыдущих: сложить их нельзя. Ожидающий выбрасывается,
+			// дельты до ключевого кадра — тоже (ветка errGridMismatch в latestFrame).
+			return 0, 0, nil, fmt.Errorf("%w: vp8 frames do not compose", errGridMismatch)
+		}
 		if i == 0 {
 			w, h = part.Width, part.Height
 		} else if part.Width != w || part.Height != h {

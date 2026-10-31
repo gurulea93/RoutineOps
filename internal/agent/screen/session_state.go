@@ -56,6 +56,10 @@ type session struct {
 
 	// display — монитор, который агент уже просил показывать (0 — основной, как при старте).
 	display atomic.Int32
+
+	// nextProfile — профиль, на который оператор переключил сеанс: петля отправки берёт из
+	// него новый бюджет полосы (иначе high/ultra душились бы бюджетом стартового профиля).
+	nextProfile atomic.Pointer[string]
 }
 
 func newSession(parent context.Context, cmd *pb.ScreenSessionCommand) *session {

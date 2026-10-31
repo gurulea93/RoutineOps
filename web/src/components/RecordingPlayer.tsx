@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslation } from "react-i18next"
 import api from "@/lib/api"
 import { Button } from "@/components/ui/button"
-import { drawPart, parseRecords, type FrameRecord } from "@/lib/screenframe"
+import { parseRecords, type FrameRecord } from "@/lib/screenframe"
+import { FrameRenderer } from "@/lib/frameRenderer"
 
 // Проигрыватель записи сеанса прямо в панели. Запись — тот же поток RSF1, что отдаёт
 // /live ([u32 len][u32 rel_ms][часть кадра]), поэтому разбор и отрисовка общие с
@@ -30,6 +31,8 @@ interface Props {
 export default function RecordingPlayer({ sessionId, onClose }: Props) {
   const { t } = useTranslation()
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  // Отрисовщик: JPEG-тайлы и видео VP8 (запись того же потока). Создаётся на первом кадре.
+  const rendererRef = useRef<FrameRenderer | null>(null)
   const recsRef = useRef<FrameRecord[]>([])
   const cursorRef = useRef(0)
   const tokenRef = useRef(0)
@@ -43,14 +46,14 @@ export default function RecordingPlayer({ sessionId, onClose }: Props) {
 
   const draw = useCallback(async (rec: FrameRecord) => {
     const canvas = canvasRef.current
-    const ctx = canvas?.getContext("2d")
-    if (!canvas || !ctx) return
+    if (!canvas) return
     const { width, height } = rec.part
     if (width > 0 && height > 0 && (canvas.width !== width || canvas.height !== height)) {
       canvas.width = width
       canvas.height = height
     }
-    await drawPart(ctx, rec.part)
+    if (!rendererRef.current) rendererRef.current = new FrameRenderer(canvas)
+    await rendererRef.current.draw(rec.part)
   }, [])
 
   const play = useCallback(async () => {
@@ -66,6 +69,7 @@ export default function RecordingPlayer({ sessionId, onClose }: Props) {
       // Начало записи: чистый холст, дальше только дельты от ключевого кадра.
       const c = canvasRef.current
       c?.getContext("2d")?.clearRect(0, 0, c.width, c.height)
+      rendererRef.current?.reset()
     }
     while (cursorRef.current < recs.length && my === tokenRef.current) {
       const rec = recs[cursorRef.current]
@@ -105,6 +109,8 @@ export default function RecordingPlayer({ sessionId, onClose }: Props) {
       let j = target
       while (j > 0 && !recs[j].part.keyframe) j--
       while (j > 0 && recs[j - 1].part.keyframe) j--
+      // Видео декодируется заново с ключевого кадра: прежнее состояние декодера не годится.
+      rendererRef.current?.reset()
       try {
         for (let k = j; k <= target; k++) {
           if (my !== tokenRef.current) return
@@ -151,6 +157,8 @@ export default function RecordingPlayer({ sessionId, onClose }: Props) {
     return () => {
       dropped = true
       tokenRef.current++
+      rendererRef.current?.close()
+      rendererRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])

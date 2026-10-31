@@ -15,7 +15,8 @@ import api, {
   type ScreenSession,
 } from "@/lib/api"
 import { formatBytes, formatDuration } from "@/lib/format"
-import { drawPart, parseRecords } from "@/lib/screenframe"
+import { parseRecords } from "@/lib/screenframe"
+import { FrameRenderer, vp8DecodeSupported } from "@/lib/frameRenderer"
 import RecordingVideo from "@/components/RecordingVideo"
 import {
   FLUSH_MS,
@@ -266,6 +267,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // Опрос /live при этом продолжается — он держит сеанс «живым» и несёт статусы.
   const rtcRef = useRef<{ pc: RTCPeerConnection; video: HTMLVideoElement; timer: number } | null>(null)
   const transportRef = useRef<string>("rsf1")
+  // Параметры последнего запуска и обработчик отката WebRTC → RSF1 (присваивается ниже на
+  // каждом рендере: startRtc — useCallback и не должен тащить в зависимости весь start).
+  const lastStartRef = useRef<StartParams | null>(null)
+  const rtcFallbackRef = useRef<(sessionId: string, why: string) => void>(() => {})
 
   const stopRtc = useCallback(() => {
     const r = rtcRef.current
@@ -302,16 +307,25 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         video.srcObject = ev.streams[0] ?? new MediaStream([ev.track])
         void video.play().catch(() => {})
       }
+      // Диагностика: что объявили обе стороны. По ней видно, в чём чёрный экран — нет
+      // кандидатов (сеть/политика браузера) или они есть, но UDP не доходит.
+      const diag = { local: 0, remote: "" }
+      pc.oniceconnectionstatechange = () => console.info("screen: webrtc ice", pc.iceConnectionState)
       pc.onconnectionstatechange = () => {
         console.info("screen: webrtc connection", pc.connectionState)
-        if (pc.connectionState === "failed") setError(t("screenSession.rtcFailed"))
+        if (pc.connectionState === "failed" && rtcRef.current?.pc === pc) {
+          rtcFallbackRef.current(sessionId, `failed, ice=${pc.iceConnectionState}`)
+        }
       }
       // Соединение может встать, а кадров так и не быть (агент не шлёт, ключевой кадр
       // потерян). Чёрный экран без объяснения хуже ошибки — через 10 с без кадра говорим.
       window.setTimeout(() => {
         if (rtcRef.current?.pc === pc && video.videoWidth === 0) {
-          console.warn("screen: no webrtc video", { connection: pc.connectionState, ice: pc.iceConnectionState })
-          setError(t("screenSession.rtcNoVideo", { state: pc.connectionState }))
+          console.warn("screen: no webrtc video", { connection: pc.connectionState, ice: pc.iceConnectionState, ...diag })
+          rtcFallbackRef.current(
+            sessionId,
+            `${pc.connectionState}, ice=${pc.iceConnectionState}, local=${diag.local}, server=${diag.remote || "-"}`,
+          )
         }
       }, 10000)
       try {
@@ -327,14 +341,21 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
             }
           })
         })
+        diag.local = (pc.localDescription?.sdp.match(/^a=candidate:/gm) ?? []).length
         const r = await api.post<{ sdp: string }>(`/screen-sessions/${sessionId}/offer`, { sdp: pc.localDescription?.sdp })
+        const cands = (r.data.sdp.match(/^a=candidate:.*$/gm) ?? []).map((l) => {
+          const f = l.split(" ")
+          return `${f[2]}:${f[4]}:${f[5]}`
+        })
+        diag.remote = cands.join(",")
+        console.info("screen: webrtc answer candidates", cands)
         await pc.setRemoteDescription({ type: "answer", sdp: r.data.sdp })
       } catch (e) {
         setError(errMessage(e))
         stopRtc()
       }
     },
-    [t, stopRtc],
+    [stopRtc],
   )
 
   // Петля просмотра. Живёт ровно столько, сколько открыт сеанс: закрытая вкладка не
@@ -346,6 +367,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       const gen = ++genRef.current
       let since = 0
       let sized = false
+      // Отрисовщик кадров: JPEG-тайлы и видео VP8. Декодеру нужен ключевой кадр (ошибка,
+      // отставание) — переоткрываем поток с начала буфера сервера: там всегда ключевой.
+      let renderer: FrameRenderer | null = null
+      let rewind = false
 
       while (!stopRef.current && gen === genRef.current) {
         let res
@@ -355,6 +380,11 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           // видел «Ждём агента…» и чёрный экран, а при остановке раньше 20-й секунды WebRTC
           // не стартовал вовсе. Пока WebRTC не запущен, опрашиваем коротко.
           const waitMs = transportRef.current === "webrtc" && !rtcRef.current ? 1000 : WAIT_MS
+          if (rewind) {
+            since = 0
+            rewind = false
+            renderer?.reset()
+          }
           res = await api.get<ArrayBuffer>(`/screen-sessions/${sessionId}/live`, {
             params: { since, wait: waitMs },
             responseType: "arraybuffer",
@@ -422,21 +452,27 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
 
         const body = new Uint8Array(res.data as ArrayBuffer)
         if (body.byteLength > 0 && canvas) {
-          const ctx = canvas.getContext("2d")
-          if (ctx) {
-            try {
-              for (const rec of parseRecords(body)) {
-                await drawPart(ctx, rec.part)
-                const { displays: n, display: d } = rec.part
-                setDisplays((cur) => (cur.count === n && cur.current === d ? cur : { count: n, current: d }))
-              }
-            } catch (e) {
-              // Битый поток — конец сеанса, а не «пропустим кадр»: тайлы дельтовые, и
-              // дальше на холст ляжет каша из двух разных моментов.
-              console.error("screen: frame stream is not parseable", e)
-              setError(t("screenSession.brokenStream"))
-              break
+          if (!renderer) {
+            renderer = new FrameRenderer(
+              canvas,
+              (w, h) => setDims({ w, h }),
+              () => {
+                rewind = true
+              },
+            )
+          }
+          try {
+            for (const rec of parseRecords(body)) {
+              await renderer.draw(rec.part)
+              const { displays: n, display: d } = rec.part
+              setDisplays((cur) => (cur.count === n && cur.current === d ? cur : { count: n, current: d }))
             }
+          } catch (e) {
+            // Битый поток — конец сеанса, а не «пропустим кадр»: тайлы дельтовые, и
+            // дальше на холст ляжет каша из двух разных моментов.
+            console.error("screen: frame stream is not parseable", e)
+            setError(t("screenSession.brokenStream"))
+            break
           }
         }
 
@@ -448,6 +484,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       }
       // Поколение сменилось (вынос в окно или новый опрос): сеанс не кончился, состоянием
       // распоряжается тот, кто пришёл на смену.
+      renderer?.close()
       if (gen !== genRef.current) return
       stopRtc()
       setLive(null)
@@ -671,16 +708,27 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       setError(t("screenSession.reasonRequired"))
       return
     }
+    // Обслуживание подразумевает управление: сервер отбивает maintenance без control
+    // (400), поэтому не полагаемся на оператора и включаем control сами.
+    const params: StartParams = {
+      reason: text,
+      control: wantControl || wantMaintenance,
+      maintenance: wantMaintenance,
+      profile: quality,
+    }
+    lastStartRef.current = params
+    await openSession(params, await browserCodecs())
+  }
+
+  const openSession = async (params: StartParams, codecs: string[]) => {
     setStarting(true)
     try {
       const r = await api.post<ScreenSession>(`/devices/${deviceId}/screen-sessions`, {
-        reason: text,
-        // Обслуживание подразумевает управление: сервер отбивает maintenance без control
-        // (400), поэтому не полагаемся на оператора и включаем control сами.
-        control: wantControl || wantMaintenance,
-        maintenance: wantMaintenance,
-        codecs: browserCodecs(),
-        ...(quality ? { profile: quality } : {}),
+        reason: params.reason,
+        control: params.control,
+        maintenance: params.maintenance,
+        codecs,
+        ...(params.profile ? { profile: params.profile } : {}),
       })
       transportRef.current = r.data.transport ?? "rsf1"
       setLive(r.data)
@@ -706,6 +754,24 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
     } finally {
       setStarting(false)
     }
+  }
+
+  // Откат WebRTC → RSF1. Браузер не дотянулся до UDP-порта сервера (Opera с «не пускать
+  // UDP мимо прокси», корпоративная политика, VPN) или видео не пришло: закрываем сеанс и
+  // сразу открываем такой же, но с картинками RSF1 по HTTPS — они идут везде, где открыта
+  // сама панель. Браузер помечаем на сутки, чтобы следующие сеансы не теряли эти 10 секунд.
+  rtcFallbackRef.current = (sessionId: string, why: string) => {
+    console.warn("screen: webrtc unusable, falling back to images", why)
+    stopRtc()
+    markWebRTCBroken()
+    void api.post(`/screen-sessions/${sessionId}/stop`).catch(() => {})
+    const params = lastStartRef.current
+    if (!params) {
+      setError(t("screenSession.rtcFailed"))
+      return
+    }
+    setError(t("screenSession.rtcFallback", { why }))
+    void openSession(params, [])
   }
 
   const stop = async () => {
@@ -1299,8 +1365,40 @@ async function downloadRecording(sessionId: string) {
   URL.revokeObjectURL(url)
 }
 
-// browserCodecs — видеокодеки, которые браузер может принять по WebRTC. Пусто — сервер даст RSF1.
-function browserCodecs(): string[] {
+interface StartParams {
+  reason: string
+  control: boolean
+  maintenance: boolean
+  profile: string
+}
+
+// Пометка «WebRTC в этом браузере не работает» — на сутки: исправят настройку браузера или
+// сеть, и через день он попробует снова сам. localStorage может быть недоступен — тогда просто
+// каждый сеанс начнётся с попытки WebRTC.
+const RTC_BROKEN_KEY = "screen.webrtc.brokenUntil"
+
+function markWebRTCBroken() {
+  try {
+    localStorage.setItem(RTC_BROKEN_KEY, String(Date.now() + 24 * 3600 * 1000))
+  } catch {
+    // нет хранилища — не страшно
+  }
+}
+
+function webRTCMarkedBroken(): boolean {
+  try {
+    return Number(localStorage.getItem(RTC_BROKEN_KEY) || 0) > Date.now()
+  } catch {
+    return false
+  }
+}
+
+// browserCodecs — какое видео браузер может принять. "vp8-rsf" — VP8 в потоке RSF1 по HTTPS,
+// декодирует сам браузер (WebCodecs): так делает RustDesk, и это основной путь — UDP не
+// нужен. "vp8" — WebRTC, только если WebCodecs нет. Пусто — JPEG-тайлы.
+async function browserCodecs(): Promise<string[]> {
+  if (await vp8DecodeSupported) return ["vp8-rsf"]
+  if (webRTCMarkedBroken()) return []
   try {
     const caps = typeof RTCRtpReceiver !== "undefined" ? RTCRtpReceiver.getCapabilities?.("video") : null
     return caps?.codecs.some((c) => c.mimeType.toLowerCase() === "video/vp8") ? ["vp8"] : []

@@ -83,6 +83,17 @@ func newBandwidthBudget(p Profile, now func() time.Time) *bandwidthBudget {
 	return &bandwidthBudget{rate: rate, burst: rate, maxPause: p.MaxPause, tokens: rate, last: now(), now: now}
 }
 
+// setProfile меняет бюджет на бюджет профиля (смена качества посреди сеанса). Накопленные
+// токены срезаются до нового потолка.
+func (b *bandwidthBudget) setProfile(p Profile) {
+	if p.MaxBitsPerSec <= 0 || p.MaxPause <= 0 {
+		p.MaxBitsPerSec, p.MaxPause = ProfileLow.MaxBitsPerSec, ProfileLow.MaxPause
+	}
+	b.rate = float64(p.MaxBitsPerSec) / 8
+	b.burst, b.maxPause = b.rate, p.MaxPause
+	b.tokens = min(b.tokens, b.burst)
+}
+
 // wait списывает n байт и возвращает паузу перед их отправкой. capped — нужная пауза
 // длиннее MaxPause: пауза срезается до потолка, долг сверх потолка прощается (иначе он
 // копился бы и держал петлю всё дольше), и считается stall. n ≤ 0 состояние не трогает.

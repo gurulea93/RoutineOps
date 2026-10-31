@@ -41,6 +41,10 @@ func sendLoop(ctx context.Context, s *session, box *latestFrame, budget *bandwid
 		stats.Stalls = budget.Stalls()
 		stats.Dropped, _ = box.counters()
 		s.setStats(stats)
+		if p := s.nextProfile.Swap(nil); p != nil {
+			prof, _ := ProfileByName(*p)
+			budget.setProfile(prof)
+		}
 		pause, _ := budget.wait(n)
 		if !sleepCtx(ctx, pause, after) {
 			return
