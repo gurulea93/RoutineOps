@@ -140,6 +140,9 @@ func handleNarrow(s *session, req *pb.ScreenScope, ctl *ctlWriter, log *slog.Log
 	// Смена качества едет в том же сообщении (proto не менялся): коды ≥ profileCodeBase в
 	// displays — это профиль, а не экран. Снимаем их до проверки приглашения.
 	req, profile := splitProfileCode(req)
+	if profile != "" {
+		s.nextProfile.Store(&profile)
+	}
 	if profile != "" && ctl != nil {
 		b, _ := json.Marshal(wireProfile{Name: profile})
 		if err := ctl.send(msgProfile, b); err != nil {

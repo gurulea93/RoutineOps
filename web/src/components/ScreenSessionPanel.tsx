@@ -15,7 +15,8 @@ import api, {
   type ScreenSession,
 } from "@/lib/api"
 import { formatBytes, formatDuration } from "@/lib/format"
-import { drawPart, parseRecords } from "@/lib/screenframe"
+import { parseRecords } from "@/lib/screenframe"
+import { FrameRenderer, vp8DecodeSupported } from "@/lib/frameRenderer"
 import RecordingVideo from "@/components/RecordingVideo"
 import {
   FLUSH_MS,
@@ -354,7 +355,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         stopRtc()
       }
     },
-    [t, stopRtc],
+    [stopRtc],
   )
 
   // Петля просмотра. Живёт ровно столько, сколько открыт сеанс: закрытая вкладка не
@@ -366,6 +367,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       const gen = ++genRef.current
       let since = 0
       let sized = false
+      // Отрисовщик кадров: JPEG-тайлы и видео VP8. Декодеру нужен ключевой кадр (ошибка,
+      // отставание) — переоткрываем поток с начала буфера сервера: там всегда ключевой.
+      let renderer: FrameRenderer | null = null
+      let rewind = false
 
       while (!stopRef.current && gen === genRef.current) {
         let res
@@ -375,6 +380,11 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           // видел «Ждём агента…» и чёрный экран, а при остановке раньше 20-й секунды WebRTC
           // не стартовал вовсе. Пока WebRTC не запущен, опрашиваем коротко.
           const waitMs = transportRef.current === "webrtc" && !rtcRef.current ? 1000 : WAIT_MS
+          if (rewind) {
+            since = 0
+            rewind = false
+            renderer?.reset()
+          }
           res = await api.get<ArrayBuffer>(`/screen-sessions/${sessionId}/live`, {
             params: { since, wait: waitMs },
             responseType: "arraybuffer",
@@ -442,21 +452,27 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
 
         const body = new Uint8Array(res.data as ArrayBuffer)
         if (body.byteLength > 0 && canvas) {
-          const ctx = canvas.getContext("2d")
-          if (ctx) {
-            try {
-              for (const rec of parseRecords(body)) {
-                await drawPart(ctx, rec.part)
-                const { displays: n, display: d } = rec.part
-                setDisplays((cur) => (cur.count === n && cur.current === d ? cur : { count: n, current: d }))
-              }
-            } catch (e) {
-              // Битый поток — конец сеанса, а не «пропустим кадр»: тайлы дельтовые, и
-              // дальше на холст ляжет каша из двух разных моментов.
-              console.error("screen: frame stream is not parseable", e)
-              setError(t("screenSession.brokenStream"))
-              break
+          if (!renderer) {
+            renderer = new FrameRenderer(
+              canvas,
+              (w, h) => setDims({ w, h }),
+              () => {
+                rewind = true
+              },
+            )
+          }
+          try {
+            for (const rec of parseRecords(body)) {
+              await renderer.draw(rec.part)
+              const { displays: n, display: d } = rec.part
+              setDisplays((cur) => (cur.count === n && cur.current === d ? cur : { count: n, current: d }))
             }
+          } catch (e) {
+            // Битый поток — конец сеанса, а не «пропустим кадр»: тайлы дельтовые, и
+            // дальше на холст ляжет каша из двух разных моментов.
+            console.error("screen: frame stream is not parseable", e)
+            setError(t("screenSession.brokenStream"))
+            break
           }
         }
 
@@ -468,6 +484,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       }
       // Поколение сменилось (вынос в окно или новый опрос): сеанс не кончился, состоянием
       // распоряжается тот, кто пришёл на смену.
+      renderer?.close()
       if (gen !== genRef.current) return
       stopRtc()
       setLive(null)
@@ -700,7 +717,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       profile: quality,
     }
     lastStartRef.current = params
-    await openSession(params, browserCodecs())
+    await openSession(params, await browserCodecs())
   }
 
   const openSession = async (params: StartParams, codecs: string[]) => {
@@ -1376,8 +1393,11 @@ function webRTCMarkedBroken(): boolean {
   }
 }
 
-// browserCodecs — видеокодеки, которые браузер может принять по WebRTC. Пусто — сервер даст RSF1.
-function browserCodecs(): string[] {
+// browserCodecs — какое видео браузер может принять. "vp8-rsf" — VP8 в потоке RSF1 по HTTPS,
+// декодирует сам браузер (WebCodecs): так делает RustDesk, и это основной путь — UDP не
+// нужен. "vp8" — WebRTC, только если WebCodecs нет. Пусто — JPEG-тайлы.
+async function browserCodecs(): Promise<string[]> {
+  if (await vp8DecodeSupported) return ["vp8-rsf"]
   if (webRTCMarkedBroken()) return []
   try {
     const caps = typeof RTCRtpReceiver !== "undefined" ? RTCRtpReceiver.getCapabilities?.("video") : null

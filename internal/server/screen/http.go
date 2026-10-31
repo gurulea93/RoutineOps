@@ -246,7 +246,13 @@ func (s *Service) httpCreate(w http.ResponseWriter, r *http.Request) {
 		// Транспорт: WebRTC только если релей включён, агент умеет VP8 и браузер его заявил.
 		// Запись на сервере обязательна всегда, поэтому только relay (не P2P).
 		choice := Choice{Transport: "rsf1", Mode: ModeRSF1, Record: true}
-		if s.rtc != nil {
+		switch {
+		case has(dev.Capabilities, "screen_webrtc_vp8") && has(req.Codecs, "vp8-rsf"):
+			// Видео VP8 в потоке RSF1 (схема RustDesk): тот же путь, что у JPEG-тайлов —
+			// gRPC и HTTPS, без UDP. Работает везде, где открыта панель; браузер декодирует
+			// сам (WebCodecs). Предпочтительнее WebRTC: тому нужен UDP до сервера.
+			choice.VideoCodec = "vp8"
+		case s.rtc != nil:
 			choice = ChooseTransport(dev.Capabilities, req.Codecs, PolicyRelayOnly, true)
 		}
 		sid, taskID, err := s.st.create(ctx, q, newSession{

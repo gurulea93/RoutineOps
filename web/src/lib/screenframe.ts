@@ -19,6 +19,8 @@ export const RECORD_HEADER_LEN = 8
 
 const FLAG_KEYFRAME = 1 << 0
 const FLAG_LAST = 1 << 1
+// Часть несёт куски кадра VP8, а не JPEG-тайлы (см. FlagVP8 в frame.go).
+const FLAG_VP8 = 1 << 10
 
 export interface Tile {
   x: number
@@ -37,6 +39,8 @@ export interface FramePart {
   display: number
   width: number
   height: number
+  /** Тайлы — куски кадра VP8 (склеить по порядку во всех частях кадра). */
+  vp8: boolean
   tiles: Tile[]
 }
 
@@ -70,6 +74,7 @@ export function parseFramePart(buf: Uint8Array): FramePart {
     display: (flags >> 6) & 0xf,
     width: view.getUint16(12),
     height: view.getUint16(14),
+    vp8: (flags & FLAG_VP8) !== 0,
     tiles: [],
   }
 

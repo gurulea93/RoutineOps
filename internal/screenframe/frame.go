@@ -33,6 +33,12 @@ const (
 
 	FlagKeyframe uint16 = 1 << 0
 	FlagLast     uint16 = 1 << 1
+	// FlagVP8 — часть несёт кадр VP8, а не JPEG-тайлы (видео поверх того же потока, как у
+	// RustDesk: HTTPS вместо UDP). Кадр VP8 режется на «тайлы»-куски с нулевой геометрией;
+	// их полезная нагрузка, склеенная по порядку во всех частях кадра, — один кадр VP8.
+	// Старые разборщики флаг игнорируют (и не смогут показать картинку — поэтому сервер
+	// выбирает этот режим, только если браузер его заявил).
+	FlagVP8 uint16 = 1 << 10
 
 	// Биты 2–5 — сколько мониторов у машины (0 = агент не сообщает), биты 6–9 — номер
 	// того, что сейчас показан. Старые разборщики эти биты игнорируют.
@@ -64,6 +70,7 @@ type Part struct {
 	Display  uint8 // номер показанного
 	Width    uint16
 	Height   uint16
+	VP8      bool // Tiles — куски кадра VP8 (FlagVP8)
 	Tiles    []Tile
 }
 
@@ -87,6 +94,9 @@ func AppendPart(dst []byte, p *Part) ([]byte, error) {
 	}
 	if p.Last {
 		flags |= FlagLast
+	}
+	if p.VP8 {
+		flags |= FlagVP8
 	}
 	dst = binary.BigEndian.AppendUint32(dst, Magic)
 	dst = binary.BigEndian.AppendUint32(dst, p.Seq)
@@ -122,6 +132,7 @@ func ParsePart(b []byte) (Part, error) {
 		Seq:      binary.BigEndian.Uint32(b[4:]),
 		Keyframe: flags&FlagKeyframe != 0,
 		Last:     flags&FlagLast != 0,
+		VP8:      flags&FlagVP8 != 0,
 		Displays: uint8(flags >> flagDisplaysShift & flagDisplayMask),
 		Display:  uint8(flags >> flagDisplayShift & flagDisplayMask),
 		Width:    binary.BigEndian.Uint16(b[12:]),
@@ -163,12 +174,30 @@ func ParsePart(b []byte) (Part, error) {
 // keyframe стоит на КАЖДОЙ части ключевого кадра, last — только на последней. Пустой
 // список тайлов даёт одну пустую часть: «кадр без изменений» тоже кадр с номером.
 func Split(seq uint32, keyframe bool, width, height uint16, tiles []Tile, maxPart int) ([][]byte, error) {
+	return split(seq, keyframe, false, width, height, tiles, maxPart)
+}
+
+// vp8Chunk — размер куска кадра VP8 в части: с запасом под заголовки, чтобы кусок всегда
+// помещался в часть MaxPartBytes.
+const vp8Chunk = MaxPartBytes - HeaderLen - TileHeaderLen - 64
+
+// SplitVP8 режет кадр VP8 на части с FlagVP8. Куски идут по порядку; склеенные — исходный
+// кадр. width/height — геометрия видео (для холста получателя).
+func SplitVP8(seq uint32, keyframe bool, width, height uint16, frame []byte) ([][]byte, error) {
+	var tiles []Tile
+	for off := 0; off < len(frame); off += vp8Chunk {
+		tiles = append(tiles, Tile{JPEG: frame[off:min(off+vp8Chunk, len(frame))]})
+	}
+	return split(seq, keyframe, true, width, height, tiles, MaxPartBytes)
+}
+
+func split(seq uint32, keyframe, vp8 bool, width, height uint16, tiles []Tile, maxPart int) ([][]byte, error) {
 	if maxPart <= 0 {
 		maxPart = MaxPartBytes
 	}
 	var (
 		parts [][]byte
-		cur   = Part{Seq: seq, Keyframe: keyframe, Width: width, Height: height}
+		cur   = Part{Seq: seq, Keyframe: keyframe, VP8: vp8, Width: width, Height: height}
 		size  = HeaderLen
 	)
 	flush := func(last bool) error {

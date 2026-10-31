@@ -107,14 +107,33 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 	}
 	prof, fallback := ProfileByName(cfg.Profile)
 	enc := NewTileEncoder(srcW, srcH, prof)
+
+	// Видео VP8 в потоке RSF1 (как у RustDesk), если сервер его выбрал и кодек собран.
+	// Без кодека — молча JPEG-тайлы: браузер понимает оба вида частей.
+	var vp *vp8Frames
+	if cfg.Codec == "vp8" {
+		vp, _ = newVP8Frames(srcW, srcH, prof.Name)
+	}
+	defer func() {
+		if vp != nil {
+			vp.close()
+		}
+	}()
+	keyEvery := cfg.KeyframeEvery
+	fps := prof.FPS
+	helloW, helloH := enc.W, enc.H
+	if vp != nil {
+		keyEvery = min(keyEvery, vp8KeyframeEvery)
+		fps, helloW, helloH = vp.fps, vp.w, vp.h
+	}
 	if err := writeJSONMsg(out, msgHello, wireHello{
-		Width: enc.W, Height: enc.H, Profile: prof.Name, ProfileFallback: fallback,
+		Width: helloW, Height: helloH, Profile: prof.Name, ProfileFallback: fallback,
 	}); err != nil {
 		return ReasonWorkerLost
 	}
 
 	ctl := readControl(in, inj)
-	tick := time.NewTicker(time.Second / time.Duration(prof.FPS))
+	tick := time.NewTicker(time.Second / time.Duration(fps))
 	defer tick.Stop()
 	deadline := time.NewTimer(cfg.MaxDuration)
 	defer deadline.Stop()
@@ -150,7 +169,14 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 				if np, _ := ProfileByName(c.profile); np.Name != prof.Name {
 					prof = np
 					enc = NewTileEncoder(srcW, srcH, prof)
-					tick.Reset(time.Second / time.Duration(prof.FPS))
+					fps = prof.FPS
+					if vp != nil {
+						if nv, err := newVP8Frames(srcW, srcH, prof.Name); err == nil {
+							vp.close()
+							vp, fps = nv, nv.fps
+						}
+					}
+					tick.Reset(time.Second / time.Duration(fps))
 				}
 			}
 			if c.display >= 0 && c.display != curDisp && c.display < nDisp && cfg.NewCapturerAt != nil {
@@ -159,6 +185,12 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 					capt, curDisp = nc, c.display
 					srcW, srcH = capt.Size()
 					enc = NewTileEncoder(srcW, srcH, prof)
+					if vp != nil {
+						if nv, err := newVP8Frames(srcW, srcH, prof.Name); err == nil {
+							vp.close()
+							vp = nv
+						}
+					}
 					if da, ok := inj.(DisplayAware); ok {
 						da.SetDisplay(curDisp)
 					}
@@ -174,7 +206,38 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 			if err != nil {
 				return end(reasonOf(err, ReasonCaptureFailed), err.Error())
 			}
-			key := wantKey || time.Since(lastKey) >= cfg.KeyframeEvery
+			key := wantKey || time.Since(lastKey) >= keyEvery
+			if vp != nil {
+				frame, isKey, err := vp.encode(pix, stride, srcW, srcH, key)
+				if err != nil {
+					return end(ReasonEncoderFailed, "vp8: "+err.Error())
+				}
+				if frame == nil {
+					continue // кодер пропустил кадр; нужный ключевой попросим снова
+				}
+				if isKey && cfg.Displays != nil {
+					nDisp = max(1, cfg.Displays())
+				}
+				seq++
+				parts, err := screenframe.SplitVP8(seq, isKey, uint16(vp.w), uint16(vp.h), frame)
+				if err != nil {
+					return end(ReasonProtocolError, err.Error())
+				}
+				now := time.Now().UnixMilli()
+				for i, p := range parts {
+					screenframe.SetDisplayInfo(p, nDisp, curDisp)
+					if err := writeFrameMsg(out, wireFrame{Seq: seq, Keyframe: isKey, Last: i == len(parts)-1,
+						CapturedMs: now, Payload: p}); err != nil {
+						return ReasonWorkerLost
+					}
+					stats.Bytes += uint64(len(p))
+				}
+				stats.Frames++
+				if isKey {
+					wantKey, lastKey = false, time.Now()
+				}
+				continue
+			}
 			tiles, err := enc.Encode(pix, stride, key)
 			if err != nil {
 				return end(ReasonCaptureFailed, "jpeg: "+err.Error())
