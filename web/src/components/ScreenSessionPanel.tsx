@@ -266,6 +266,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // Опрос /live при этом продолжается — он держит сеанс «живым» и несёт статусы.
   const rtcRef = useRef<{ pc: RTCPeerConnection; video: HTMLVideoElement; timer: number } | null>(null)
   const transportRef = useRef<string>("rsf1")
+  // Параметры последнего запуска и обработчик отката WebRTC → RSF1 (присваивается ниже на
+  // каждом рендере: startRtc — useCallback и не должен тащить в зависимости весь start).
+  const lastStartRef = useRef<StartParams | null>(null)
+  const rtcFallbackRef = useRef<(sessionId: string, why: string) => void>(() => {})
 
   const stopRtc = useCallback(() => {
     const r = rtcRef.current
@@ -308,16 +312,18 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       pc.oniceconnectionstatechange = () => console.info("screen: webrtc ice", pc.iceConnectionState)
       pc.onconnectionstatechange = () => {
         console.info("screen: webrtc connection", pc.connectionState)
-        if (pc.connectionState === "failed") setError(t("screenSession.rtcFailed"))
+        if (pc.connectionState === "failed" && rtcRef.current?.pc === pc) {
+          rtcFallbackRef.current(sessionId, `failed, ice=${pc.iceConnectionState}`)
+        }
       }
       // Соединение может встать, а кадров так и не быть (агент не шлёт, ключевой кадр
       // потерян). Чёрный экран без объяснения хуже ошибки — через 10 с без кадра говорим.
       window.setTimeout(() => {
         if (rtcRef.current?.pc === pc && video.videoWidth === 0) {
           console.warn("screen: no webrtc video", { connection: pc.connectionState, ice: pc.iceConnectionState, ...diag })
-          setError(
-            t("screenSession.rtcNoVideo", { state: pc.connectionState }) +
-              ` [ice=${pc.iceConnectionState}, local=${diag.local}, server=${diag.remote || "-"}]`,
+          rtcFallbackRef.current(
+            sessionId,
+            `${pc.connectionState}, ice=${pc.iceConnectionState}, local=${diag.local}, server=${diag.remote || "-"}`,
           )
         }
       }, 10000)
@@ -685,16 +691,27 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       setError(t("screenSession.reasonRequired"))
       return
     }
+    // Обслуживание подразумевает управление: сервер отбивает maintenance без control
+    // (400), поэтому не полагаемся на оператора и включаем control сами.
+    const params: StartParams = {
+      reason: text,
+      control: wantControl || wantMaintenance,
+      maintenance: wantMaintenance,
+      profile: quality,
+    }
+    lastStartRef.current = params
+    await openSession(params, browserCodecs())
+  }
+
+  const openSession = async (params: StartParams, codecs: string[]) => {
     setStarting(true)
     try {
       const r = await api.post<ScreenSession>(`/devices/${deviceId}/screen-sessions`, {
-        reason: text,
-        // Обслуживание подразумевает управление: сервер отбивает maintenance без control
-        // (400), поэтому не полагаемся на оператора и включаем control сами.
-        control: wantControl || wantMaintenance,
-        maintenance: wantMaintenance,
-        codecs: browserCodecs(),
-        ...(quality ? { profile: quality } : {}),
+        reason: params.reason,
+        control: params.control,
+        maintenance: params.maintenance,
+        codecs,
+        ...(params.profile ? { profile: params.profile } : {}),
       })
       transportRef.current = r.data.transport ?? "rsf1"
       setLive(r.data)
@@ -720,6 +737,24 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
     } finally {
       setStarting(false)
     }
+  }
+
+  // Откат WebRTC → RSF1. Браузер не дотянулся до UDP-порта сервера (Opera с «не пускать
+  // UDP мимо прокси», корпоративная политика, VPN) или видео не пришло: закрываем сеанс и
+  // сразу открываем такой же, но с картинками RSF1 по HTTPS — они идут везде, где открыта
+  // сама панель. Браузер помечаем на сутки, чтобы следующие сеансы не теряли эти 10 секунд.
+  rtcFallbackRef.current = (sessionId: string, why: string) => {
+    console.warn("screen: webrtc unusable, falling back to images", why)
+    stopRtc()
+    markWebRTCBroken()
+    void api.post(`/screen-sessions/${sessionId}/stop`).catch(() => {})
+    const params = lastStartRef.current
+    if (!params) {
+      setError(t("screenSession.rtcFailed"))
+      return
+    }
+    setError(t("screenSession.rtcFallback", { why }))
+    void openSession(params, [])
   }
 
   const stop = async () => {
@@ -1313,8 +1348,37 @@ async function downloadRecording(sessionId: string) {
   URL.revokeObjectURL(url)
 }
 
+interface StartParams {
+  reason: string
+  control: boolean
+  maintenance: boolean
+  profile: string
+}
+
+// Пометка «WebRTC в этом браузере не работает» — на сутки: исправят настройку браузера или
+// сеть, и через день он попробует снова сам. localStorage может быть недоступен — тогда просто
+// каждый сеанс начнётся с попытки WebRTC.
+const RTC_BROKEN_KEY = "screen.webrtc.brokenUntil"
+
+function markWebRTCBroken() {
+  try {
+    localStorage.setItem(RTC_BROKEN_KEY, String(Date.now() + 24 * 3600 * 1000))
+  } catch {
+    // нет хранилища — не страшно
+  }
+}
+
+function webRTCMarkedBroken(): boolean {
+  try {
+    return Number(localStorage.getItem(RTC_BROKEN_KEY) || 0) > Date.now()
+  } catch {
+    return false
+  }
+}
+
 // browserCodecs — видеокодеки, которые браузер может принять по WebRTC. Пусто — сервер даст RSF1.
 function browserCodecs(): string[] {
+  if (webRTCMarkedBroken()) return []
   try {
     const caps = typeof RTCRtpReceiver !== "undefined" ? RTCRtpReceiver.getCapabilities?.("video") : null
     return caps?.codecs.some((c) => c.mimeType.toLowerCase() === "video/vp8") ? ["vp8"] : []

@@ -1491,6 +1491,7 @@
     "qualityLow": "Low · 1 fps",
     "qualityMedium": "Medium · 2 fps",
     "rtcNoVideo": "No video within 10 s (connection: {{state}}). \"connected\" means the agent sends no frames; \"connecting\"/\"failed\" means the browser cannot reach the server on UDP 50052.",
+    "rtcFallback": "WebRTC did not connect in this browser ({{why}}) — the session was reopened in image mode. Common cause in Opera: Settings → Privacy → WebRTC set to \"Disable non-proxied UDP\".",
     "rtcFailed": "The video stream could not be established (is UDP to the server blocked?). Close the session and retry.",
     "qualityUltra": "Maximum (30 fps)",
     "qualityHigh": "High · 10 fps",
