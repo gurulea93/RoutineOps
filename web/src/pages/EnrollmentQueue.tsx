@@ -16,6 +16,7 @@ import ConfirmDialog from "@/components/ConfirmDialog"
 import { formatDistanceToNow, formatDateTime } from "@/lib/time"
 import { toast } from "@/lib/toast"
 import { getIntuneMigrationScript, getJamfMigrationScript } from "@/lib/migrationScripts"
+import { fetchSetup, saveBlob, SetupUnavailableError } from "@/lib/setupBundle"
 
 type DialogStep = "form" | "token"
 
@@ -113,6 +114,8 @@ export default function EnrollmentQueue() {
   const [cmdOS, setCmdOS] = useState("windows")
   const [scriptType, setScriptType] = useState<"cmd" | "intune" | "jamf">("cmd")
   const [copied, setCopied] = useState(false)
+  const [setupBusy, setSetupBusy] = useState(false)
+  const [setupError, setSetupError] = useState("")
 
   const [confirmReject, setConfirmReject] = useState<Device | null>(null)
   const [confirmRejectAll, setConfirmRejectAll] = useState(false)
@@ -263,6 +266,30 @@ export default function EnrollmentQueue() {
       // авто-тост интерсептора. 409 = токен уже мёртв, перечитываем список.
     } finally {
       loadTokens()
+    }
+  }
+
+  // Один установщик на весь парк: stub + MSI + этот МНОГОРАЗОВЫЙ токен, склеенные в браузере.
+  // Тот же файл ставится на любое число Windows-машин (в пределах лимита и срока токена);
+  // каждая регистрируется сама и, если включено одобрение, ждёт его в очереди ниже.
+  async function downloadFleetSetup() {
+    if (!result) return
+    const base = apiBase()
+    setSetupBusy(true)
+    setSetupError("")
+    try {
+      const blob = await fetchSetup(base, {
+        enroll_url: `${base}/api/v1/enroll`,
+        enroll_token: result.enrollment_token,
+        ca_url: `${base}/ca.crt`,
+        ca_sha256: result.ca_sha256,
+        server_addr: `${window.location.hostname}:50051`,
+      })
+      saveBlob(blob, "RoutineOps-setup.exe")
+    } catch (e) {
+      setSetupError(e instanceof SetupUnavailableError ? t("devices.downloadSetupMissing") : t("devices.downloadSetupFail"))
+    } finally {
+      setSetupBusy(false)
     }
   }
 
@@ -429,6 +456,15 @@ export default function EnrollmentQueue() {
                     ? <p>CA SHA-256: <span className="font-mono break-all">{result.ca_sha256}</span></p>
                     : <p className="text-amber-600 dark:text-amber-500">{t("enrollment.theServerRunsWithout")}</p>}
                 </div>
+                {result.ca_sha256 && (
+                  <div className="space-y-1.5 rounded-md border border-border p-3">
+                    <Button className="w-full" disabled={setupBusy} onClick={() => void downloadFleetSetup()}>
+                      {setupBusy ? t("devices.downloadSetupBusy") : t("enrollment.downloadFleetSetup")}
+                    </Button>
+                    <p className="text-xs text-muted-foreground">{t("enrollment.downloadFleetSetupHint")}</p>
+                    {setupError && <p className="text-xs text-amber-600 dark:text-amber-500">{setupError}</p>}
+                  </div>
+                )}
                 {/* Токен показывается ОДИН раз: на сервере он лежит хэшем, переоткрыть нечем. */}
                 <p className="text-xs text-muted-foreground">
                   {t("enrollment.saveNow")}
