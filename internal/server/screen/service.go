@@ -386,7 +386,9 @@ func (r *streamRun) loop(ctx context.Context) {
 				r.finish(reason, msg.End.GetDetail())
 				return
 			case *pb.SessionUp_Signal:
-				if ice := msg.Signal.GetIce(); ice != nil && ice.GetSdpMid() == clipboardMid {
+				if ice := msg.Signal.GetIce(); ice != nil && ice.GetSdpMid() == filesMid {
+					r.hub.deliverFS(ice.GetCandidate())
+				} else if ice != nil && ice.GetSdpMid() == clipboardMid {
 					// Текст из буфера сотрудника (см. agent/screen/clipboard.go). Только в сеансе с
 					// управлением: агент сам не шлёт его без управления, сервер тоже не примет.
 					if r.sess.Control {

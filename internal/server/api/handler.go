@@ -2451,6 +2451,11 @@ func requestSizeCap(n int64) func(http.Handler) http.Handler {
 					return
 				}
 			}
+			// Файловый менеджер сеанса (screen/files_http.go): свой потолок, поток.
+			if strings.HasPrefix(r.URL.Path, "/api/v1/screen-sessions/") && strings.HasSuffix(r.URL.Path, "/files/upload") {
+				next.ServeHTTP(w, r)
+				return
+			}
 			r.Body = http.MaxBytesReader(w, r.Body, n)
 			next.ServeHTTP(w, r)
 		})

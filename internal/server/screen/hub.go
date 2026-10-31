@@ -50,6 +50,7 @@ type hub struct {
 	paused    bool // агент приостановил выдачу кадров (FrameFlow)
 	clipSeq   uint64
 	clipText  string
+	fs        *fsRouter // файловый менеджер: ответы агента по id запроса
 	pauseWhy  string
 
 	keyframe chan struct{} // → стрим: попросить агента о ключевом кадре

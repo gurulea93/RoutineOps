@@ -64,6 +64,8 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 	if cfg.KeyframeEvery <= 0 {
 		cfg.KeyframeEvery = 30 * time.Second
 	}
+	// В out пишут петля кадров и файловый менеджер: сообщения не должны перемешиваться.
+	out = &lockedWriter{w: out}
 	end := func(r EndReason, detail string) EndReason {
 		_ = writeJSONMsg(out, msgEnd, wireEnd{Reason: string(r), Detail: detail})
 		return r
@@ -132,7 +134,13 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 		return ReasonWorkerLost
 	}
 
-	ctl := readControl(in, inj)
+	// Файловый менеджер — только в сеансе с управлением (см. files.go).
+	var fsrv *fileServer
+	if inj != nil {
+		fsrv = newFileServer(func(b []byte) error { return writeMsg(out, msgSignal, b) })
+		defer fsrv.close()
+	}
+	ctl := readControl(in, inj, fsrv)
 	tick := time.NewTicker(time.Second / time.Duration(fps))
 	defer tick.Stop()
 	deadline := time.NewTimer(cfg.MaxDuration)
@@ -300,7 +308,7 @@ type controlReader struct{ ch chan control }
 // readControl читает команды службы. Канал закрывается на EOF/ошибке.
 // Ввод исполняется прямо в читающей горутине, а не через канал: цикл кадров занят захватом
 // десятки миллисекунд, и ввод, ждущий очереди за кадром, давал бы заметный лаг мыши.
-func readControl(in io.Reader, inj Injector) *controlReader {
+func readControl(in io.Reader, inj Injector, fsrv *fileServer) *controlReader {
 	cr := &controlReader{ch: make(chan control, 4)}
 	go func() {
 		defer close(cr.ch)
@@ -330,6 +338,11 @@ func readControl(in io.Reader, inj Injector) *controlReader {
 					case cr.ch <- control{display: d.Index}:
 					default: // очередь полна — оператор нажмёт ещё раз
 					}
+				}
+			case msgSignalIn:
+				var sig pb.SessionSignal
+				if fsrv != nil && proto.Unmarshal(body, &sig) == nil {
+					fsrv.handleSignal(&sig)
 				}
 			case msgProfile:
 				var pf wireProfile

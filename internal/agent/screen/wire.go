@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/Floodww/RoutineOps/internal/screenframe"
 )
@@ -84,13 +85,26 @@ func writeMsg(w io.Writer, typ byte, body []byte) error {
 	if len(body) > maxWireMsg {
 		return fmt.Errorf("%w: message %d B", errWire, len(body))
 	}
-	hdr := [5]byte{typ}
-	binary.BigEndian.PutUint32(hdr[1:], uint32(len(body)))
-	if _, err := w.Write(hdr[:]); err != nil {
-		return err
-	}
-	_, err := w.Write(body)
+	// Одним Write: заголовок и тело не должны разрываться чужим сообщением, когда в out
+	// пишут несколько горутин (петля кадров и файловый менеджер, см. lockedWriter).
+	buf := make([]byte, 5, 5+len(body))
+	buf[0] = typ
+	binary.BigEndian.PutUint32(buf[1:], uint32(len(body)))
+	_, err := w.Write(append(buf, body...))
 	return err
+}
+
+// lockedWriter сериализует Write: каждое сообщение — один Write (writeMsg), поэтому
+// сообщения разных горутин не перемешиваются.
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 func writeJSONMsg(w io.Writer, typ byte, v any) error {

@@ -18,6 +18,7 @@ import { formatBytes, formatDuration } from "@/lib/format"
 import { parseRecords } from "@/lib/screenframe"
 import { FrameRenderer, vp8DecodeSupported } from "@/lib/frameRenderer"
 import RecordingVideo from "@/components/RecordingVideo"
+import RemoteFileManager from "@/components/RemoteFileManager"
 import {
   FLUSH_MS,
   InputCollector,
@@ -198,6 +199,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // Текст, скопированный сотрудником, который браузер не дал записать в буфер оператора
   // молча (нет фокуса/разрешения): ждёт клика по кнопке — клик и есть разрешение.
   const [clipPending, setClipPending] = useState("")
+  // Файловый менеджер сеанса (как в RustDesk) и файлы, брошенные прямо на экран сеанса.
+  const [filesOpen, setFilesOpen] = useState(false)
+  const [droppedFiles, setDroppedFiles] = useState<File[]>([])
+  const takeDropped = useCallback(() => setDroppedFiles([]), [])
   const lastPasteShiftInsertRef = useRef(false)
   // Применяемость ввода (Ф3), как её на каждом опросе сообщает сервер заголовком
   // X-Screen-Control. Три состояния, и «неизвестно» — не «работает»: агент старше поля
@@ -931,6 +936,16 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         if (p) inputRef.current?.add({ kind: "mouse_move", ...p })
       }}
       onPointerLeave={() => controlOn && inputRef.current?.release()}
+      onDragOver={(e) => {
+        if (controlOn && e.dataTransfer.types.includes("Files")) e.preventDefault()
+      }}
+      onDrop={(e) => {
+        // Файлы, перетащенные на экран сеанса, уезжают на Рабочий стол сотрудника.
+        if (!controlOn || !e.dataTransfer.files.length) return
+        e.preventDefault()
+        setDroppedFiles(Array.from(e.dataTransfer.files))
+        setFilesOpen(true)
+      }}
       onContextMenu={(e) => {
         // Правая кнопка уезжает НА УДАЛЁННУЮ машину, а не открывает меню браузера:
         // иначе контекстное меню в проводнике сотрудника недостижимо в принципе.
@@ -1020,6 +1035,11 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
               ))}
             </select>
           )}
+          {controlOn && live && (
+            <Button size="sm" variant="outline" className={btn} onClick={() => setFilesOpen(true)}>
+              {t("screenSession.filesButton")}
+            </Button>
+          )}
           {clipPending && (
             <Button
               size="sm"
@@ -1084,11 +1104,22 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
     error,
   ].filter(Boolean)
 
+  const filesNode =
+    filesOpen && live ? (
+      <RemoteFileManager
+        sessionId={live.id}
+        onClose={() => setFilesOpen(false)}
+        dropped={droppedFiles}
+        onDroppedTaken={takeDropped}
+      />
+    ) : null
+
   if (windowed && live) {
     return (
       <div ref={stageRef} className="fixed inset-0 flex items-center justify-center overflow-hidden bg-black">
         {canvasNode}
         {floatingBar}
+        {filesNode}
         {overlayNotes.length > 0 && (
           <div className="pointer-events-none absolute bottom-2 left-2 max-w-[60vw] rounded bg-black/70 px-2 py-1 text-[11px] text-amber-300">
             {overlayNotes.map((n, i) => (
@@ -1104,6 +1135,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
 
   return (
     <div className={windowed ? "" : "glass"}>
+      {filesNode}
       {!windowed && (
         <div className="px-5 pt-4 pb-3">
           <h2 className="text-[15px] font-semibold text-foreground">{t("screenSession.title")}</h2>
