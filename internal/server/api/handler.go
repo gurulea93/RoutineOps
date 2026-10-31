@@ -160,7 +160,7 @@ func NewRouter(db *storage.DB, asynqClient *asynq.Client, jwtSecret []byte, ca *
 	r.Use(h.realIPFromProxy)
 	r.Use(accessLogRedacted) // не логируем query: одноразовые токены приходят в query-string
 	r.Use(middleware.Recoverer)
-	r.Use(middleware.RequestSize(1 << 20)) // 1 MB cap — защита от OOM через гигантские тела
+	r.Use(requestSizeCap(1 << 20)) // 1 MB cap — защита от OOM через гигантские тела
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
@@ -2434,4 +2434,25 @@ func (h *Handler) resetPassword(w http.ResponseWriter, r *http.Request) {
 	}
 	h.audit(r.Context(), t.UserID, resetEmail, "password_reset", "user", t.UserID, nil)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// uploadPrefixes — маршруты загрузки файлов, которые ставят СВОЙ потолок тела (больше 1 МБ)
+// и читают тело потоком, после проверки прав. Общий потолок их бы обрезал: http.MaxBytesReader
+// снаружи уже не снять, и загрузка Windows-агента (десятки МБ) падала с upload_interrupted.
+var uploadPrefixes = []string{"/api/v1/agent-builds/"}
+
+// requestSizeCap — middleware.RequestSize(n) для всех маршрутов, кроме uploadPrefixes.
+func requestSizeCap(n int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			for _, p := range uploadPrefixes {
+				if strings.HasPrefix(r.URL.Path, p) {
+					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, n)
+			next.ServeHTTP(w, r)
+		})
+	}
 }
