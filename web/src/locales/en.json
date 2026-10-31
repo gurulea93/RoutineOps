@@ -1181,6 +1181,8 @@
     "showBackground": "Show background changes (software updates and the like)"
   },
   "enrollment": {
+    "downloadFleetSetup": "Download one installer (.exe) for all computers",
+    "downloadFleetSetupHint": "One file for the whole fleet: run it as administrator on any number of Windows computers — each connects to the server on its own (within the token limit and lifetime; with approval on, after you approve it in the queue). The file carries the fleet token: keep it like a password and revoke the token when rollout is done.",
     "machinesUsingThisToken": "Machines using this token connect immediately, without approval.",
     "machinesUsingThisToken2": "Machines using this token go into the approval queue.",
     "theServerRunsWithout": "The server runs without a CA — certificate pinning is unavailable.",
