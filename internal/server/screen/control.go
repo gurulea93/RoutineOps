@@ -27,7 +27,7 @@ const (
 	// которая выполнит старые клики через минуту.
 	inputQueue = 64
 
-	maxInputBody    = 64 << 10
+	maxInputBody    = 256 << 10 // с буфером обмена (до maxClipboardBytes) в одной пачке
 	maxInputEvents  = 256
 	maxEventText    = 256  // рун в одном событии text
 	maxBatchText    = 2048 // рун во всей пачке
@@ -180,6 +180,14 @@ func buildInput(req *inputBatchReq) (*pb.SessionInput, inputCounts, bool) {
 			if e.Kind == "key_down" {
 				c.keys++
 			}
+		case "clipboard":
+			// Текст в буфер сотрудника (Ctrl+V оператора); следом в той же пачке — клавиши.
+			// В журнал ввода идёт только длина, как и у text.
+			if e.Text == "" || len(e.Text) > maxClipboardBytes || !utf8.ValidString(e.Text) {
+				continue
+			}
+			ev.Text = e.Text
+			c.texts += utf8.RuneCountInString(e.Text)
 		case "text":
 			n := utf8.RuneCountInString(e.Text)
 			if n == 0 || n > maxEventText || !utf8.ValidString(e.Text) {

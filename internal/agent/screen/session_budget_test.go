@@ -93,8 +93,8 @@ func TestBudgetZeroNegativeAndClockSkew(t *testing.T) {
 }
 
 func TestBudgetUnconfiguredProfileUsesLow(t *testing.T) {
-	b := newBandwidthBudget(ProfileMedium, (&fakeClock{}).now)
+	b := newBandwidthBudget(Profile{Name: "nobudget"}, (&fakeClock{}).now)
 	if b.rate != lowRate || b.maxPause != time.Second {
-		t.Fatalf("medium without budget: rate %v max pause %v", b.rate, b.maxPause)
+		t.Fatalf("profile without budget: rate %v max pause %v", b.rate, b.maxPause)
 	}
 }

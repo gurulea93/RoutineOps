@@ -25,11 +25,11 @@ type rtcParams struct{ fps, kbps, w, h int }
 func webrtcParams(profile string) rtcParams {
 	switch profile {
 	case "ultra":
-		return rtcParams{30, 16000, 3840, 2160}
+		return rtcParams{60, 25000, 3840, 2160}
 	case "high":
-		return rtcParams{30, 6000, 1920, 1080}
+		return rtcParams{30, 8000, 1920, 1080}
 	case "medium":
-		return rtcParams{20, 2500, 1920, 1080}
+		return rtcParams{25, 4000, 1920, 1080}
 	default:
 		return rtcParams{ProfileLowFPS, ProfileLowKbps, ProfileLowMaxWidth, ProfileLowMaxHeight}
 	}

@@ -190,6 +190,8 @@ func (w *winInjector) eventLocked(ev *pb.InputEvent, fw, fh int) {
 		} else {
 			w.keys[ev.GetCode()] = true
 		}
+	case "clipboard":
+		applyClipboard(ev.GetText())
 	case "text":
 		var recs []inputRec
 		for _, u := range utf16.Encode([]rune(ev.GetText())) {

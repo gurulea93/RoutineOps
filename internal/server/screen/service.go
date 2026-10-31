@@ -386,7 +386,13 @@ func (r *streamRun) loop(ctx context.Context) {
 				r.finish(reason, msg.End.GetDetail())
 				return
 			case *pb.SessionUp_Signal:
-				if r.relay == nil {
+				if ice := msg.Signal.GetIce(); ice != nil && ice.GetSdpMid() == clipboardMid {
+					// Текст из буфера сотрудника (см. agent/screen/clipboard.go). Только в сеансе с
+					// управлением: агент сам не шлёт его без управления, сервер тоже не примет.
+					if r.sess.Control {
+						r.hub.setClipboard(ice.GetCandidate())
+					}
+				} else if r.relay == nil {
 					stop("PROTOCOL_ERROR")
 				} else if err := r.relay.HandleAgentSignal(msg.Signal); err != nil {
 					s.log.Warn("screen: agent signal rejected", "session_id", r.sess.ID, "err", err)

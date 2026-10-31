@@ -35,7 +35,9 @@ var (
 	ProfileLow = Profile{Name: "low", FPS: 1, MaxSide: 1280, Quality: 60,
 		MaxBitsPerSec: 1_500_000, MaxPause: time.Second}
 	// Бюджет medium не задан: в Ф1 решён только low (29.10.2026).
-	ProfileMedium = Profile{Name: "medium", FPS: 2, MaxSide: 1920, Quality: 70}
+	// Бюджет medium — 6 Мбит/с (31.10.2026): нужен видео VP8 (25 к/с), JPEG-тайлам с запасом.
+	ProfileMedium = Profile{Name: "medium", FPS: 2, MaxSide: 1920, Quality: 70,
+		MaxBitsPerSec: 6_000_000, MaxPause: 500 * time.Millisecond}
 	// high — для управления мышью: 10 к/с. Бюджет 12 Мбит/с рассчитан на LAN и офисный канал
 	// (изменившиеся тайлы: ~20 КБ на кадр при перетаскивании окон, то есть ~1.6 Мбит/с);
 	// пауза до 0.5 с, чтобы картинка не отставала от курсора. Решение проекта, а не замер.
