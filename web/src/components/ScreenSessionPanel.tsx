@@ -22,7 +22,9 @@ import {
   FLUSH_MS,
   InputCollector,
   inputOutcome,
+  isPasteKey,
   keyEvents,
+  pasteEvents,
   toFrame,
   wheelClicks,
 } from "@/lib/screeninput"
@@ -193,6 +195,10 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // кнопка после нажатия исчезает, а не превращается в «взять снова».
   const [controlReturned, setControlReturned] = useState(false)
   const [inputWarning, setInputWarning] = useState("")
+  // Текст, скопированный сотрудником, который браузер не дал записать в буфер оператора
+  // молча (нет фокуса/разрешения): ждёт клика по кнопке — клик и есть разрешение.
+  const [clipPending, setClipPending] = useState("")
+  const lastPasteShiftInsertRef = useRef(false)
   // Применяемость ввода (Ф3), как её на каждом опросе сообщает сервер заголовком
   // X-Screen-Control. Три состояния, и «неизвестно» — не «работает»: агент старше поля
   // молчит, и молчание не должно читаться как зелёное. Живёт только у сеанса с управлением.
@@ -361,6 +367,26 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
   // Петля просмотра. Живёт ровно столько, сколько открыт сеанс: закрытая вкладка не
   // продлевает liveness, и сервер закроет сеанс сам (§9.9) — поэтому останавливать её
   // при размонтировании обязательно, иначе запись продолжится при отсутствующем зрителе.
+  // Сотрудник скопировал текст — кладём его в буфер оператора, как RustDesk.
+  const pullRemoteClipboard = async (sessionId: string) => {
+    let text = ""
+    try {
+      const r = await api.get<{ seq: number; text: string }>(`/screen-sessions/${sessionId}/clipboard`)
+      text = r.data.text
+    } catch {
+      return
+    }
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      setClipPending("")
+    } catch {
+      setClipPending(text)
+    }
+  }
+  const pullClipRef = useRef(pullRemoteClipboard)
+  pullClipRef.current = pullRemoteClipboard
+
   const runViewer = useCallback(
     async (sessionId: string) => {
       stopRef.current = false
@@ -371,6 +397,9 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       // отставание) — переоткрываем поток с начала буфера сервера: там всегда ключевой.
       let renderer: FrameRenderer | null = null
       let rewind = false
+      // Буфер обмена сотрудника: номер из X-Screen-Clipboard. -1 — первый ответ задаёт точку
+      // отсчёта (скопированное ДО подключения оператору не отдаём).
+      let clipSeen = -1
 
       while (!stopRef.current && gen === genRef.current) {
         let res
@@ -425,6 +454,12 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
           setDims({ w, h })
         }
         since = Number(res.headers["x-screen-seq"] || since)
+        const clipSeq = Number(res.headers["x-screen-clipboard"] || 0)
+        if (clipSeen < 0) clipSeen = clipSeq
+        else if (clipSeq > clipSeen) {
+          clipSeen = clipSeq
+          void pullClipRef.current(sessionId)
+        }
         // Признак применяемости ввода (Ф3): сервер шлёт его только у сеанса с управлением.
         // Заголовка нет — состояние не трогаем (у смотрового сеанса его и не будет).
         const ctrlHeader = res.headers["x-screen-control"]
@@ -907,6 +942,7 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
       }}
       onKeyDown={(e) => {
         if (!controlOn) return
+        if (isPasteKey(e.nativeEvent)) lastPasteShiftInsertRef.current = e.code === "Insert"
         const evs = keyEvents(e.nativeEvent, true)
         if (evs.length) e.preventDefault()
         evs.forEach((ev) => inputRef.current?.add(ev))
@@ -918,13 +954,14 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
         evs.forEach((ev) => inputRef.current?.add(ev))
       }}
       onPaste={(e) => {
-        // Вставка буфера обмена — текстом, а не набором клавиш: раскладка на
-        // машине сотрудника своя, и «нажать те же кнопки» дало бы другие символы.
+        // Вставка как у RustDesk: буфер оператора → буфер сотрудника, затем та же клавиша
+        // вставки на его машине (pasteEvents). Агенты старее 2.6.22 событие clipboard
+        // пропускают — у них вставится то, что было в буфере сотрудника.
         if (!controlOn) return
         const text = e.clipboardData.getData("text/plain")
-        if (!text) return
         e.preventDefault()
-        inputRef.current?.add({ kind: "text", text })
+        if (!text) return
+        pasteEvents(text, lastPasteShiftInsertRef.current).forEach((ev) => inputRef.current?.add(ev))
       }}
     />
   )
@@ -982,6 +1019,22 @@ export function ScreenSessionPanel({ deviceId, attachId, windowed = false }: Pro
                 </option>
               ))}
             </select>
+          )}
+          {clipPending && (
+            <Button
+              size="sm"
+              variant="outline"
+              className={btn}
+              title={clipPending.slice(0, 200)}
+              onClick={() => {
+                void navigator.clipboard
+                  .writeText(clipPending)
+                  .then(() => setClipPending(""))
+                  .catch(() => {})
+              }}
+            >
+              {t("screenSession.copyRemoteClipboard")}
+            </Button>
           )}
           {controlOn && (
             <Button size="sm" variant="outline" className={btn} onClick={() => void returnControl()}>

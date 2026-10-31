@@ -6,6 +6,7 @@ import (
 	"context"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Floodww/RoutineOps/internal/screenframe"
 	pb "github.com/Floodww/RoutineOps/proto"
@@ -47,6 +48,8 @@ type hub struct {
 	wake      chan struct{} // закрывается и заменяется на каждое изменение
 	lastPoll  time.Time
 	paused    bool // агент приостановил выдачу кадров (FrameFlow)
+	clipSeq   uint64
+	clipText  string
 	pauseWhy  string
 
 	keyframe chan struct{} // → стрим: попросить агента о ключевом кадре
@@ -152,6 +155,7 @@ func (b *hub) close(reason string) {
 
 // liveResult — ответ одному опросу.
 type liveResult struct {
+	ClipSeq   uint64 // номер текста буфера обмена сотрудника (0 — не было)
 	Body      []byte
 	Next      uint64
 	W, H      uint16
@@ -174,7 +178,7 @@ func (b *hub) poll(ctx context.Context, since uint64, wait time.Duration) liveRe
 	if since == 0 && time.Since(b.kfAt) > keyframeOnJoinAfter {
 		b.requestKeyframe()
 	}
-	paused0 := b.paused
+	paused0, clip0 := b.paused, b.clipSeq
 	b.mu.Unlock()
 
 	for {
@@ -184,7 +188,7 @@ func (b *hub) poll(ctx context.Context, since uint64, wait time.Duration) liveRe
 			// Отстал или пришёл с чужим курсором — с начала буфера (ключевой кадр).
 			since = b.base
 		}
-		if since < end || b.closed || b.paused != paused0 {
+		if since < end || b.closed || b.paused != paused0 || b.clipSeq != clip0 {
 			res := b.resultLocked(since)
 			b.mu.Unlock()
 			return res
@@ -207,7 +211,7 @@ func (b *hub) poll(ctx context.Context, since uint64, wait time.Duration) liveRe
 
 // resultLocked собирает ответ с записи since (since уже в [base, end]).
 func (b *hub) resultLocked(since uint64) liveResult {
-	res := liveResult{W: b.w, H: b.h, Closed: b.closed, EndReason: b.endReason, Paused: b.paused, PauseWhy: b.pauseWhy}
+	res := liveResult{ClipSeq: b.clipSeq, W: b.w, H: b.h, Closed: b.closed, EndReason: b.endReason, Paused: b.paused, PauseWhy: b.pauseWhy}
 	end := b.base + uint64(len(b.recs))
 	i := since - b.base
 	for ; i < uint64(len(b.recs)); i++ {
@@ -267,6 +271,25 @@ func (hs *hubs) remove(id string, b *hub) {
 }
 
 // setFlow — агент сообщил о паузе/возобновлении кадров (заголовок X-Screen-Frames).
+// setClipboard — сотрудник скопировал текст (сеанс с управлением): браузер узнает по
+// X-Screen-Clipboard в /live и заберёт текст отдельным запросом.
+func (b *hub) setClipboard(text string) {
+	if text == "" || len(text) > maxClipboardBytes || !utf8.ValidString(text) {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.clipSeq++
+	b.clipText = text
+	b.broadcastLocked()
+}
+
+func (b *hub) clipboard() (uint64, string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.clipSeq, b.clipText
+}
+
 func (b *hub) setFlow(paused bool, why string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

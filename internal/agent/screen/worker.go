@@ -151,6 +151,12 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 	if cfg.Displays != nil {
 		nDisp = max(1, cfg.Displays())
 	}
+	// Буфер обмена сотрудника — только в сеансе с управлением (см. clipboard.go).
+	var clip *clipboardWatch
+	if inj != nil {
+		clip = newClipboardWatch()
+	}
+	lastClip := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -202,6 +208,14 @@ func RunWorker(ctx context.Context, cfg WorkerConfig, in io.Reader, out io.Write
 				return ReasonWorkerLost
 			}
 		case <-tick.C:
+			if clip != nil && time.Since(lastClip) >= 500*time.Millisecond {
+				lastClip = time.Now()
+				if b := clip.poll(); b != nil {
+					if err := writeMsg(out, msgSignal, b); err != nil {
+						return ReasonWorkerLost
+					}
+				}
+			}
 			pix, stride, err := capt.Capture()
 			if err != nil {
 				return end(reasonOf(err, ReasonCaptureFailed), err.Error())

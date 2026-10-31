@@ -54,6 +54,7 @@ func (s *Service) Routes() []api.RouterOption {
 			r.Post("/screen-sessions/{id}/input", s.httpInput)
 			r.Post("/screen-sessions/{id}/display", s.httpDisplay)
 			r.Post("/screen-sessions/{id}/offer", s.httpOffer)
+			r.Get("/screen-sessions/{id}/clipboard", s.httpClipboard)
 			r.Get("/agent-builds/windows-vpx", s.httpVPXBuildInfo)
 			r.Post("/agent-builds/windows-vpx", s.httpVPXBuildUpload)
 			r.Post("/screen-sessions/{id}/profile", s.httpProfile)
@@ -423,6 +424,9 @@ func (s *Service) httpLive(w http.ResponseWriter, r *http.Request) {
 		hd.Set("X-Screen-Frames", "paused")
 	default:
 		hd.Set("X-Screen-Frames", "flowing")
+	}
+	if res.ClipSeq > 0 {
+		hd.Set("X-Screen-Clipboard", strconv.FormatUint(res.ClipSeq, 10))
 	}
 	if res.Closed {
 		hd.Set("X-Screen-Closed", "1")

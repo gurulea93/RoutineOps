@@ -46,8 +46,11 @@ func newVP8Frames(srcW, srcH int, profile string) (*vp8Frames, error) {
 		return nil, fmt.Errorf("screen: geometry %dx%d", srcW, srcH)
 	}
 	threads := 1 // агент делит машину с сотрудником
-	if w*h > 1920*1080 {
-		threads = 2 // 4K за один поток не успевает в 30 к/с
+	switch {
+	case w*h > 1920*1080:
+		threads = 4 // 4K в 60 к/с один-два потока не вытягивают
+	case fps >= 30:
+		threads = 2
 	}
 	enc, err := NewVideoEncoder("vp8", EncoderConfig{Width: w, Height: h, FPS: fps, BitrateKbps: kbps, Threads: threads})
 	if err != nil {

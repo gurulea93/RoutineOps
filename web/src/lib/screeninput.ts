@@ -19,7 +19,7 @@
 
 // Событие ввода в том виде, в каком его принимает сервер.
 export interface InputEvent {
-  kind: "mouse_move" | "mouse_down" | "mouse_up" | "wheel" | "key_down" | "key_up" | "text"
+  kind: "mouse_move" | "mouse_down" | "mouse_up" | "wheel" | "key_down" | "key_up" | "text" | "clipboard"
   x?: number
   y?: number
   button?: number
@@ -176,6 +176,9 @@ export function inputOutcome(status: number | undefined): InputOutcome {
 // Возвращает пустой список для клавиш, которые оставлены браузеру (см. PASSTHROUGH).
 export function keyEvents(e: KeyboardEvent, down: boolean): InputEvent[] {
   if (PASSTHROUGH.has(e.key)) return []
+  // Вставка (Ctrl/Cmd+V, Shift+Insert) на нажатии остаётся браузеру: он вызовет событие
+  // paste, и оттуда уедет текст буфера оператора + те же клавиши (см. pasteEvents).
+  if (down && isPasteKey(e)) return []
 
   const combo = e.ctrlKey || e.altKey || e.metaKey
   const printable = e.key.length === 1 || e.key === "Unidentified"
@@ -188,4 +191,22 @@ export function keyEvents(e: KeyboardEvent, down: boolean): InputEvent[] {
   }
   if (!e.code) return []
   return [{ kind: down ? "key_down" : "key_up", code: e.code }]
+}
+
+// isPasteKey — сочетание вставки: Ctrl+V / Cmd+V / Shift+Insert.
+export function isPasteKey(e: KeyboardEvent): boolean {
+  return ((e.ctrlKey || e.metaKey) && e.code === "KeyV") || (e.shiftKey && e.code === "Insert")
+}
+
+// pasteEvents — вставка оператора на удалённой машине как у RustDesk: текст кладётся в
+// буфер обмена сотрудника, затем нажимается та же клавиша вставки — вставляет уже
+// приложение сотрудника, со своим форматированием и раскладкой. Модификатор (Ctrl/Shift)
+// к этому моменту уже зажат: его key_down ушёл своим событием.
+export function pasteEvents(text: string, shiftInsert: boolean): InputEvent[] {
+  const code = shiftInsert ? "Insert" : "KeyV"
+  return [
+    { kind: "clipboard", text },
+    { kind: "key_down", code },
+    { kind: "key_up", code },
+  ]
 }
