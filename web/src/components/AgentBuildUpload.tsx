@@ -99,7 +99,7 @@ export default function AgentBuildUpload() {
       <div className="flex flex-wrap items-center gap-2">
         <input
           className="h-9 w-32 rounded-md border bg-background px-2 text-sm"
-          placeholder="2.6.20"
+          placeholder="2.6.21"
           value={version}
           onChange={(e) => setVersion(e.target.value)}
           aria-label={t("screenAccess.build.version")}

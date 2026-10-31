@@ -336,7 +336,10 @@ docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
       echo "  → $OS/$ARCH"
       # VP8: Windows-агент с libvpx (CGO) в контейнере сервера не собрать — его собирают на ПК
       # скриптом scripts/build-windows-vpx.ps1 и кладут в build/windows/. Годится, только если
-      # версия и sha256 совпали с текущими; иначе публикуется обычная сборка (RSF1).
+      # версия и sha256 совпали с текущими. Если файл ЕСТЬ, но под другую версию, Windows НЕ
+      # публикуется вовсе: версии неизменяемы, и обычная сборка под этим номером навсегда
+      # заняла бы его — загруженный потом VP8-агент той же версии уже не опубликовать (так и
+      # было с 2.6.18 и 2.6.20). Нужна обычная сборка — удалите build/windows/agent_windows_amd64_vpx.exe*.
       VPX=build/windows/agent_windows_amd64_vpx.exe
       if [ "$OS" = "windows" ] && [ "$ARCH" = "amd64" ] && [ -f "$VPX" ]; then
         if [ "$(cat "$VPX.version" 2>/dev/null)" = "v${V}" ] && ( cd build/windows && sha256sum -c agent_windows_amd64_vpx.exe.sha256 >/dev/null 2>&1 ); then
@@ -345,7 +348,10 @@ docker run --rm --network "$NET" -v "$(pwd)":/app -w /app \
           go run ./cmd/publish-release -binary "$VPX" -version "v${V}" -os "$OS" -arch "$ARCH" -key release_ed25519.pem
           continue
         fi
-        echo "    ⚠ $VPX не соответствует v${V} (версия или sha256) — публикую обычную сборку без VP8"
+        echo "    ⚠ $VPX собран не под v${V} (версия или sha256) — Windows-агент v${V} НЕ публикуется."
+        echo "      Соберите VP8-агента v${V} (scripts/build-windows-vpx.ps1), загрузите его в панели"
+        echo "      («Наблюдение за экраном») и запустите ./install.sh ещё раз."
+        continue
       fi
       EXTRA_LDFLAGS=""
       if [ "$OS" = "windows" ]; then
